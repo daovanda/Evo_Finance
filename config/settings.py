@@ -62,7 +62,7 @@ RESTART_PROB: float = 0.0001       # 0.01 % — restart from raw OHLCV
 
 # ─── Archive ──────────────────────────────────────────────────────────────────
 
-ARCHIVE_SIZE: int = 50             # max individuals kept
+ARCHIVE_SIZE: int = 30             # max individuals kept
 
 # ─── LightGBM ─────────────────────────────────────────────────────────────────
 

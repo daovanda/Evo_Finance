@@ -63,19 +63,34 @@ def _bin_labels(labels: pd.Series, ref_df: pd.DataFrame) -> pd.Series:
 
 # ─── Feature matrix builder ───────────────────────────────────────────────────
 
+def _sanitize_col_name(formula: str) -> str:
+    """
+    LightGBM không chấp nhận ký tự đặc biệt trong feature name.
+    Thay thế tất cả ký tự không phải chữ/số/gạch dưới bằng '_'.
+    """
+    import re
+    return re.sub(r'[^a-zA-Z0-9_]', '_', formula)
+
+
 def build_feature_matrix(
     individual: Individual,
     df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
     Evaluate each gene formula on df and return a DataFrame of features.
-    Columns are named by their formula string.
+    Column names are sanitized for LightGBM compatibility.
     """
     cols = {}
+    col_map = {}   # sanitized_name → formula (for debug)
     for gene in individual.genes:
         try:
             series = evaluate(gene.formula, df)
-            cols[gene.formula] = series
+            safe_name = _sanitize_col_name(gene.formula)
+            # handle rare collision after sanitize
+            if safe_name in cols:
+                safe_name = safe_name + f"_{len(cols)}"
+            cols[safe_name] = series
+            col_map[safe_name] = gene.formula
         except Exception as exc:
             logger.warning("Gene eval failed: %r — %s", gene.formula, exc)
     feat_df = pd.DataFrame(cols, index=df.index)
