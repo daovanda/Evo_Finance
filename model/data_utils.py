@@ -5,60 +5,78 @@ Handles train/val/test splitting and label generation.
 
 Expected input DataFrame
   - MultiIndex (date, ticker) — dates must be sorted ascending.
-  - Columns: open, high, close, low, volume  (all numeric, no NaNs preferred).
+  - Columns: open, high, close, low, volume  (all numeric).
 
-All splits are **time-based** (no shuffling) to avoid look-ahead bias:
-  train  = first TRAIN_RATIO of dates
-  val    = next  VAL_RATIO  of dates
-  test   = remainder
+Split is **date-based** using explicit cutoff dates from config:
+  train  : [start of data]  →  VAL_START   (exclusive)
+  val    : VAL_START        →  TEST_START  (exclusive)
+  test   : TEST_START       →  TEST_END    (inclusive, None = end of data)
 """
 
 from __future__ import annotations
-from typing import Tuple, Callable
-
-import numpy as np
+from typing import Tuple, Callable, Optional
 import pandas as pd
 
-from config.settings import TRAIN_RATIO, VAL_RATIO, LABEL_FN, HOLDING_HORIZON
+from config.settings import (
+    VAL_START, TEST_START, TEST_END,
+    LABEL_FN, HOLDING_HORIZON,
+)
 
 
 def split_and_label(
     df: pd.DataFrame,
-    label_fn: Callable = LABEL_FN,
+    label_fn: Callable  = LABEL_FN,
     holding_horizon: int = HOLDING_HORIZON,
-    train_ratio: float = TRAIN_RATIO,
-    val_ratio: float = VAL_RATIO,
+    val_start:  str     = VAL_START,
+    test_start: str     = TEST_START,
+    test_end:   Optional[str] = TEST_END,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    1. Compute labels using label_fn — PER TICKER via groupby để tránh
-       cross-ticker shift leakage.
-    2. Split into train / val / test by date (time-based, no shuffle).
-    3. Drop rows where label is NaN (future not yet available).
+    1. Compute labels per-ticker (groupby) để tránh cross-ticker shift leakage.
+    2. Split thành train / val / test theo ngày cụ thể.
+    3. Drop rows không có label (cuối chuỗi, horizon chưa realised).
 
-    Returns
-    -------
-    train_df, val_df, test_df — each with a 'label' column added.
+    Parameters
+    ----------
+    val_start  : Ngày đầu tiên của val (= ngày kết thúc train).
+                 Ví dụ "2022-01-01"
+    test_start : Ngày đầu tiên của test (= ngày kết thúc val).
+                 Ví dụ "2023-07-01"
+    test_end   : Ngày cuối cùng của test (inclusive).
+                 None = lấy hết data còn lại.
     """
-    df = df.copy()
-
     if not isinstance(df.index, pd.MultiIndex):
+        raise ValueError("DataFrame phải có MultiIndex (date, ticker).")
+    if df.index.names != ["date", "ticker"]:
         raise ValueError(
-            "DataFrame must have a MultiIndex (date, ticker). "
-            "Flat DataFrames are not supported."
+            f"MultiIndex names phải là ['date', 'ticker'], got {df.index.names}"
         )
 
-    dates   = df.index.get_level_values("date").unique().sort_values()
-    n       = len(dates)
-    n_train = int(n * train_ratio)
-    n_val   = int(n * val_ratio)
+    val_start_ts  = pd.Timestamp(val_start)
+    test_start_ts = pd.Timestamp(test_start)
+    test_end_ts   = pd.Timestamp(test_end) if test_end else None
 
-    train_dates = dates[:n_train]
-    val_dates   = dates[n_train : n_train + n_val]
-    test_dates  = dates[n_train + n_val :]
+    # Validate
+    all_dates = df.index.get_level_values("date")
+    data_start = all_dates.min()
+    data_end   = all_dates.max()
 
-    # ── Label: tính riêng cho từng ticker để tránh cross-ticker leakage ───────
-    # shift(-h) trên full MultiIndex sẽ nhảy sang ticker khác ở cuối mỗi group.
-    # Groupby ticker đảm bảo shift chỉ chạy trong chuỗi thời gian của 1 ticker.
+    if val_start_ts <= data_start:
+        raise ValueError(
+            f"VAL_START ({val_start}) phải sau ngày đầu data ({data_start.date()})"
+        )
+    if test_start_ts <= val_start_ts:
+        raise ValueError(
+            f"TEST_START ({test_start}) phải sau VAL_START ({val_start})"
+        )
+    if test_end_ts is not None and test_end_ts < test_start_ts:
+        raise ValueError(
+            f"TEST_END ({test_end}) phải >= TEST_START ({test_start})"
+        )
+
+    df = df.copy()
+
+    # ── Label per-ticker (tránh cross-ticker shift leakage) ───────────────────
     def _label_per_ticker(group: pd.DataFrame) -> pd.Series:
         try:
             return label_fn(group, h=holding_horizon)
@@ -71,16 +89,35 @@ def split_and_label(
     )
     df["label"] = label_series
 
-    # ── Split theo date ────────────────────────────────────────────────────────
-    date_level   = df.index.get_level_values("date")
-    train_df = df.loc[date_level.isin(train_dates)].copy()
-    val_df   = df.loc[date_level.isin(val_dates)].copy()
-    test_df  = df.loc[date_level.isin(test_dates)].copy()
+    # ── Split theo ngày ───────────────────────────────────────────────────────
+    date_level = df.index.get_level_values("date")
 
-    # Bỏ các dòng chưa có label (cuối chuỗi, horizon chưa realised)
+    train_mask = date_level < val_start_ts
+    val_mask   = (date_level >= val_start_ts) & (date_level < test_start_ts)
+
+    if test_end_ts is not None:
+        test_mask = (date_level >= test_start_ts) & (date_level <= test_end_ts)
+    else:
+        test_mask = date_level >= test_start_ts
+
+    train_df = df[train_mask].copy()
+    val_df   = df[val_mask].copy()
+    test_df  = df[test_mask].copy()
+
+    # Drop dòng chưa có label
     train_df = train_df.dropna(subset=["label"])
     val_df   = val_df.dropna(subset=["label"])
     test_df  = test_df.dropna(subset=["label"])
+
+    # Log thông tin split
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(
+        "Split: train [%s → %s) %d rows | val [%s → %s) %d rows | test [%s → %s] %d rows",
+        data_start.date(), val_start,   len(train_df),
+        val_start,  test_start, len(val_df),
+        test_start, test_end or data_end.date(), len(test_df),
+    )
 
     return train_df, val_df, test_df
 
@@ -90,10 +127,10 @@ def validate_ohlcv(df: pd.DataFrame) -> None:
     required = {"open", "high", "close", "low", "volume"}
     missing  = required - set(df.columns)
     if missing:
-        raise ValueError(f"DataFrame missing columns: {missing}")
+        raise ValueError(f"DataFrame thiếu cột: {missing}")
     if not isinstance(df.index, pd.MultiIndex):
-        raise ValueError("DataFrame must have MultiIndex (date, ticker).")
+        raise ValueError("DataFrame phải có MultiIndex (date, ticker).")
     if df.index.names != ["date", "ticker"]:
         raise ValueError(
-            f"MultiIndex names must be ['date', 'ticker'], got {df.index.names}"
+            f"MultiIndex names phải là ['date', 'ticker'], got {df.index.names}"
         )

@@ -27,6 +27,7 @@ import pandas as pd
 # ── Project imports ────────────────────────────────────────────────────────────
 from config.settings import (
     DEFAULT_WINDOW, RESTART_PROB, TIME_BUDGET_SECONDS,
+    VAL_START, TEST_START, TEST_END,
 )
 from mutator.gene       import Individual
 from mutator.domain     import Domain
@@ -53,6 +54,9 @@ def run(
     restart_prob:    float = RESTART_PROB,
     seed:            int   = 42,
     save_archive:    Optional[Path] = None,
+    val_start:       str   = VAL_START,
+    test_start:      str   = TEST_START,
+    test_end:        Optional[str] = TEST_END,
 ) -> Archive:
     """
     Run the evolutionary loop and return the final Archive.
@@ -64,13 +68,21 @@ def run(
     restart_prob : Probability of restarting from raw OHLCV each iteration.
     seed         : Master RNG seed.
     save_archive : If provided, write archive summary JSON to this path.
+    val_start    : Ngày đầu val  (= kết thúc train). Ví dụ "2022-01-01"
+    test_start   : Ngày đầu test (= kết thúc val).  Ví dụ "2023-07-01"
+    test_end     : Ngày cuối test (None = hết data).
     """
     validate_ohlcv(df)
     rng = np.random.default_rng(seed)
 
     # ── Data split + labels ───────────────────────────────────────────────────
     logger.info("Splitting data into train / val / test …")
-    train_df, val_df, test_df = split_and_label(df)
+    train_df, val_df, test_df = split_and_label(
+        df,
+        val_start  = val_start,
+        test_start = test_start,
+        test_end   = test_end,
+    )
     logger.info(
         "Sizes — train: %d rows, val: %d rows, test: %d rows",
         len(train_df), len(val_df), len(test_df),
@@ -347,6 +359,38 @@ if __name__ == "__main__":
         help="Lưu kết quả archive ra file JSON. Ví dụ: --save results/archive.json",
     )
 
+    # ── Ngày split ───────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--val-start",
+        type=str,
+        default=VAL_START,
+        metavar="DATE",
+        help=(
+            "Ngày đầu tiên của val = kết thúc train (YYYY-MM-DD)\n"
+            f"Mặc định: {VAL_START}"
+        ),
+    )
+    parser.add_argument(
+        "--test-start",
+        type=str,
+        default=TEST_START,
+        metavar="DATE",
+        help=(
+            "Ngày đầu tiên của test = kết thúc val (YYYY-MM-DD)\n"
+            f"Mặc định: {TEST_START}"
+        ),
+    )
+    parser.add_argument(
+        "--test-end",
+        type=str,
+        default=TEST_END,
+        metavar="DATE",
+        help=(
+            "Ngày cuối test (YYYY-MM-DD). None = lấy hết data còn lại\n"
+            f"Mặc định: {TEST_END or 'hết data'}"
+        ),
+    )
+
     args = parser.parse_args()
 
     # ── Load data ─────────────────────────────────────────────────────────────
@@ -363,4 +407,7 @@ if __name__ == "__main__":
         restart_prob = args.restart,
         seed         = args.seed,
         save_archive = save_path,
+        val_start    = args.val_start,
+        test_start   = args.test_start,
+        test_end     = args.test_end,
     )

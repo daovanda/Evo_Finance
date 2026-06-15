@@ -8,11 +8,14 @@ from dataclasses import dataclass, field
 from typing import List, Callable
 import numpy as np
 
-# ─── Data ─────────────────────────────────────────────────────────────────────
+# ─── Data split — nhập ngày cụ thể ──────────────────────────────────────────
+# TRAIN : [đầu data]   → VAL_START   (exclusive)
+# VAL   : VAL_START    → TEST_START  (exclusive)
+# TEST  : TEST_START   → TEST_END    (inclusive, None = hết data)
 
-TRAIN_RATIO = 0.70
-VAL_RATIO   = 0.15
-TEST_RATIO  = 0.15   # remainder
+VAL_START:  str = "2023-05-12"   # ngày đầu tiên của val  = ngày kết thúc train
+TEST_START: str = "2024-07-29"   # ngày đầu tiên của test = ngày kết thúc val
+TEST_END:   str | None = None    # ngày cuối test (None = hết data)
 
 # ─── Holding horizon ──────────────────────────────────────────────────────────
 
@@ -32,7 +35,7 @@ LABEL_FN: Callable = default_label
 
 # ─── Feature limits ───────────────────────────────────────────────────────────
 
-FEATURE_MIN: int = 5
+FEATURE_MIN: int = 3
 FEATURE_MAX: int = 30
 
 # ─── Correlation threshold ────────────────────────────────────────────────────
@@ -62,7 +65,7 @@ RESTART_PROB: float = 0.0001       # 0.01 % — restart from raw OHLCV
 
 # ─── Archive ──────────────────────────────────────────────────────────────────
 
-ARCHIVE_SIZE: int = 30             # max individuals kept
+ARCHIVE_SIZE: int = 50             # max individuals kept
 
 # ─── LightGBM ─────────────────────────────────────────────────────────────────
 
@@ -97,8 +100,8 @@ HIT_RATE_TOP_K: int = 10
 # ─── Fitness weights ──────────────────────────────────────────────────────────
 
 FITNESS_WEIGHTS = {
-    "val_mean_ic":    0.35,
+    "val_mean_ic":    0.45,
     "val_icir":       0.25,
     "hit_rate":       0.20,
-    "overfit_gap":   -0.20,
+    "overfit_gap":   -0.10,
 }
