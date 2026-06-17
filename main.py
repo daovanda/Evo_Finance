@@ -28,13 +28,20 @@ import pandas as pd
 from config.settings import (
     DEFAULT_WINDOW, RESTART_PROB, TIME_BUDGET_SECONDS,
     VAL_START, TEST_START, TEST_END,
+    WF_END, WF_MIN_TRAIN_MONTHS, WF_VAL_MONTHS,
+    WF_STEP_MONTHS, WF_PURGE_DAYS, DOMAIN_PRECOMPUTE_ON_START,
 )
 from mutator.gene       import Individual
 from mutator.domain     import Domain
 from mutator.mutator    import Mutator
 from model.trainer      import Trainer
-from model.data_utils   import split_and_label, validate_ohlcv
-from fitness.fitness    import FitnessEvaluator
+from model.data_utils   import (
+    label_dataframe, make_walk_forward_folds,
+    split_labeled_by_dates, validate_ohlcv,
+)
+from fitness.fitness    import (
+    FitnessEvaluator, FoldPrediction, _hit_rate, _ic_per_date,
+)
 from archive.archive    import Archive
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -57,6 +64,11 @@ def run(
     val_start:       str   = VAL_START,
     test_start:      str   = TEST_START,
     test_end:        Optional[str] = TEST_END,
+    wf_end:          str   = WF_END,
+    wf_min_train_months: int = WF_MIN_TRAIN_MONTHS,
+    wf_val_months:   int   = WF_VAL_MONTHS,
+    wf_step_months:  int   = WF_STEP_MONTHS,
+    wf_purge_days:   int   = WF_PURGE_DAYS,
 ) -> Archive:
     """
     Run the evolutionary loop and return the final Archive.
@@ -76,23 +88,52 @@ def run(
     rng = np.random.default_rng(seed)
 
     # ── Data split + labels ───────────────────────────────────────────────────
-    logger.info("Splitting data into train / val / test …")
-    train_df, val_df, test_df = split_and_label(
-        df,
-        val_start  = val_start,
-        test_start = test_start,
-        test_end   = test_end,
+    logger.info("Labeling data and building walk-forward folds ...")
+    labeled_df = label_dataframe(df)
+    train_df, val_df, test_df = split_labeled_by_dates(
+        labeled_df,
+        val_start=val_start,
+        test_start=test_start,
+        test_end=test_end,
     )
     logger.info(
-        "Sizes — train: %d rows, val: %d rows, test: %d rows",
+        "Final sizes: train=%d rows | val=%d rows | test=%d rows",
         len(train_df), len(val_df), len(test_df),
     )
-    feature_df = pd.concat([train_df, val_df, test_df]).sort_index()
+    raw_dates = df.index.get_level_values("date")
+    wf_raw_df = df[raw_dates < pd.Timestamp(wf_end)].copy().sort_index()
+    wf_labeled_df = label_dataframe(wf_raw_df)
+    wf_folds = make_walk_forward_folds(
+        wf_labeled_df,
+        wf_end=wf_end,
+        min_train_months=wf_min_train_months,
+        val_months=wf_val_months,
+        step_months=wf_step_months,
+        purge_days=wf_purge_days,
+    )
+    for fold in wf_folds:
+        logger.info(
+            "WF %s: train [%s -> %s) %d rows | val [%s -> %s) %d rows",
+            fold.name,
+            fold.train_start.date(),
+            fold.train_end.date(),
+            len(fold.train_df),
+            fold.val_start.date(),
+            fold.val_end.date(),
+            len(fold.val_df),
+        )
+    wf_feature_df = wf_labeled_df.sort_index()
+    final_feature_df = labeled_df.sort_index()
 
     # ── Initialise components ─────────────────────────────────────────────────
     domain    = Domain()
     seed_genes = domain.seed(window=DEFAULT_WINDOW)
-    domain.precompute(train_df)
+    if DOMAIN_PRECOMPUTE_ON_START:
+        domain.precompute(wf_feature_df)
+    else:
+        logger.info(
+            "Domain precompute skipped; formula cache will be filled lazily."
+        )
 
     mutator   = Mutator(domain=domain, seed=int(rng.integers(1 << 31)))
     trainer   = Trainer()
@@ -102,9 +143,9 @@ def run(
     # ── First individual: raw OHLCV ───────────────────────────────────────────
     logger.info("Evaluating seed individual (raw OHLCV) …")
     seed_ind = Individual.seed(window=DEFAULT_WINDOW)
-    _evaluate_and_archive(
+    _evaluate_and_archive_wf(
         seed_ind, trainer, evaluator, archive,
-        train_df, val_df, feature_df,
+        wf_folds, wf_feature_df,
     )
 
     # ── Evolutionary loop ─────────────────────────────────────────────────────
@@ -122,14 +163,14 @@ def run(
             parent = Individual.seed(window=DEFAULT_WINDOW)
         elif archive.is_empty():
             parent = Individual.seed(window=DEFAULT_WINDOW)
-            _evaluate_and_archive(parent, trainer, evaluator, archive, train_df, val_df, feature_df)
+            _evaluate_and_archive_wf(parent, trainer, evaluator, archive, wf_folds, wf_feature_df)
             continue
         else:
             parent = archive.random_individual(rng)
 
         # mutate
         try:
-            child = mutator.mutate(parent, train_df)
+            child = mutator.mutate(parent, wf_feature_df)
         except Exception as exc:
             logger.warning("Mutation failed: %s — skipping iteration.", exc)
             continue
@@ -139,9 +180,9 @@ def run(
             continue
 
         # evaluate + archive
-        admitted = _evaluate_and_archive(
+        admitted = _evaluate_and_archive_wf(
             child, trainer, evaluator, archive,
-            train_df, val_df, feature_df,
+            wf_folds, wf_feature_df,
         )
 
         best_score = archive.best.score if archive.best else float("nan")
@@ -151,8 +192,10 @@ def run(
         )
 
     # ── Test-set evaluation for all archived individuals ──────────────────────
-    logger.info("=== Time budget exhausted. Running test-set evaluation … ===")
-    _test_evaluate_archive(archive, trainer, evaluator, test_df, feature_df)
+    logger.info("=== Time budget exhausted. Running final validation/test evaluation ... ===")
+    _final_evaluate_archive(
+        archive, trainer, train_df, val_df, test_df, final_feature_df
+    )
 
     # ── Output ────────────────────────────────────────────────────────────────
     _print_summary(archive, iteration, time.time() - t_start)
@@ -165,79 +208,135 @@ def run(
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
-def _evaluate_and_archive(
+def _evaluate_and_archive_wf(
     individual: Individual,
     trainer:    Trainer,
     evaluator:  FitnessEvaluator,
     archive:    Archive,
-    train_df:   pd.DataFrame,
-    val_df:     pd.DataFrame,
+    wf_folds,
     feature_df: pd.DataFrame,
 ) -> bool:
-    """Train, score, and optionally archive an individual. Returns admission bool."""
-    try:
-        booster, train_pred, val_pred, train_labels, val_labels = trainer.train(
-            individual, train_df, val_df, feature_df=feature_df
+    """Train and score an individual over all walk-forward folds."""
+    fold_predictions = []
+    last_booster = None
+
+    for fold in wf_folds:
+        try:
+            booster, train_pred, val_pred, train_labels, val_labels = trainer.train(
+                individual, fold.train_df, fold.val_df,
+                feature_df=feature_df, mode="wf"
+            )
+        except Exception as exc:
+            logger.warning("WF training failed on %s: %s", fold.name, exc)
+            return False
+        last_booster = booster
+        fold_predictions.append(
+            FoldPrediction(
+                name=fold.name,
+                train_pred=train_pred,
+                val_pred=val_pred,
+                train_labels=train_labels,
+                val_labels=val_labels,
+                train_df=fold.train_df,
+                val_df=fold.val_df,
+            )
         )
+
+    try:
+        evaluator.evaluate_walk_forward(individual, fold_predictions)
     except Exception as exc:
-        logger.warning("Training failed: %s", exc)
+        logger.warning("WF fitness evaluation failed: %s", exc)
         return False
 
-    try:
-        evaluator.evaluate(
-            individual,
-            train_pred, val_pred,
-            train_labels, val_labels,
-            train_df, val_df,
-        )
-    except Exception as exc:
-        logger.warning("Fitness evaluation failed: %s", exc)
-        return False
-
-    return archive.try_add(individual, booster)
+    return archive.try_add(individual, last_booster)
 
 
-def _test_evaluate_archive(
+def _final_evaluate_archive(
     archive:   Archive,
     trainer:   Trainer,
-    evaluator: FitnessEvaluator,
+    train_df:  pd.DataFrame,
+    val_df:    pd.DataFrame,
     test_df:   pd.DataFrame,
     feature_df: pd.DataFrame,
 ) -> None:
-    """Run test-set predictions for every archived individual."""
+    """Retrain each archived individual on final split and evaluate val/test."""
     for entry in archive.entries:
         try:
+            booster, _, val_pred, _, val_labels = trainer.train(
+                entry.individual, train_df, val_df,
+                feature_df=feature_df, mode="final"
+            )
+            entry.booster = booster
+            entry.final_val_metrics = _prediction_metrics(
+                val_pred, val_labels, val_df.index, prefix="final_val"
+            )
+
             test_pred = trainer.predict(
-                entry.booster, entry.individual, test_df, feature_df=feature_df
+                booster, entry.individual, test_df, feature_df=feature_df
             )
             test_labels = test_df["label"]
-
-            # reuse fitness helpers for test metrics
-            from fitness.fitness import _ic_per_date, _hit_rate
-            test_ic = _ic_per_date(test_pred, test_labels, test_df.index)
-            test_mean_ic = float(test_ic.mean()) if len(test_ic) else float("nan")
-            test_icir    = (
-                test_mean_ic / (float(test_ic.std()) + 1e-9)
-                if len(test_ic) > 1
-                else float("nan")
+            entry.test_metrics = _prediction_metrics(
+                test_pred, test_labels, test_df.index, prefix="test"
             )
-            test_hit = _hit_rate(test_pred, test_labels, test_df.index)
-
-            entry.test_metrics = {
-                "test_mean_ic": test_mean_ic,
-                "test_icir":    test_icir,
-                "test_hit_rate":test_hit,
-            }
             logger.info(
-                "Test eval: score=%.4f | IC=%.4f | ICIR=%.4f | hit=%.4f",
-                entry.score, test_mean_ic, test_icir, test_hit,
+                "Final eval: score=%.4f | val_IC=%.4f | test_IC=%.4f | test_hit=%.4f",
+                entry.score,
+                entry.final_val_metrics.get("final_val_mean_ic", float("nan")),
+                entry.test_metrics.get("test_mean_ic", float("nan")),
+                entry.test_metrics.get("test_hit_rate", float("nan")),
             )
         except Exception as exc:
-            logger.warning("Test eval failed for entry: %s", exc)
+            logger.warning("Final eval failed for entry: %s", exc)
+
+
+def _prediction_metrics(
+    pred: pd.Series,
+    labels: pd.Series,
+    index: pd.Index,
+    prefix: str,
+) -> dict:
+    ic = _ic_per_date(pred, labels, index)
+    mean_ic = float(ic.mean()) if len(ic) else float("nan")
+    icir = (
+        mean_ic / (float(ic.std()) + 1e-9)
+        if len(ic) > 1
+        else float("nan")
+    )
+    hit = _hit_rate(pred, labels, index)
+    return {
+        f"{prefix}_mean_ic": mean_ic,
+        f"{prefix}_icir": icir,
+        f"{prefix}_hit_rate": hit,
+    }
 
 
 def _print_summary(archive: Archive, total_iters: int, elapsed: float) -> None:
     rows = archive.summary()
+    print(f"\n{'='*100}")
+    print(f"Evo_Finance - Final Archive  ({total_iters} iterations, {elapsed:.1f}s)")
+    print(f"{'='*100}")
+    header = f"{'Rank':>4}  {'Score':>7}  {'WF_IC':>7}  {'WF_IR':>7}  "
+    header += f"{'HitEx':>7}  {'Std':>6}  {'Bad':>5}  {'Gap':>6}  "
+    header += f"{'FValIC':>7}  {'TestIC':>7}  {'nGenes':>6}"
+    print(header)
+    print("-" * 100)
+    for r in rows:
+        tm = r.get("test_metrics", {})
+        fvm = r.get("final_val_metrics", {})
+        print(
+            f"{r['rank']:>4}  {r['score']:>7.4f}  "
+            f"{_fmt_metric(r.get('wf_mean_ic')):>7}  "
+            f"{_fmt_metric(r.get('wf_icir')):>7}  "
+            f"{_fmt_metric(r.get('wf_hit_excess')):>7}  "
+            f"{_fmt_metric(r.get('wf_ic_std')):>6}  "
+            f"{_fmt_metric(r.get('bad_fold_ratio')):>5}  "
+            f"{_fmt_metric(r.get('wf_overfit_gap')):>6}  "
+            f"{_fmt_metric(fvm.get('final_val_mean_ic')):>7}  "
+            f"{tm.get('test_mean_ic', float('nan')):>7.4f}  "
+            f"{r['n_genes']:>6}"
+        )
+    print(f"{'='*100}\n")
+    return
     print(f"\n{'='*70}")
     print(f"Evo_Finance — Final Archive  ({total_iters} iterations, {elapsed:.1f}s)")
     print(f"{'='*70}")
@@ -255,6 +354,15 @@ def _print_summary(archive: Archive, total_iters: int, elapsed: float) -> None:
             f"{r['n_genes']:>6}"
         )
     print(f"{'='*70}\n")
+
+
+def _fmt_metric(value) -> str:
+    if value is None:
+        return "nan"
+    try:
+        return f"{float(value):.4f}"
+    except (TypeError, ValueError):
+        return "nan"
 
 
 def _save_json(archive: Archive, path: Path) -> None:

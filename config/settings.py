@@ -33,6 +33,14 @@ def default_label(df, h: int = HOLDING_HORIZON):
 
 LABEL_FN: Callable = default_label
 
+# Walk-forward folds used inside the evolutionary loop. Final validation/test
+# still use VAL_START / TEST_START / TEST_END after the time budget ends.
+WF_END: str = TEST_START
+WF_MIN_TRAIN_MONTHS: int = 48
+WF_VAL_MONTHS: int = 12
+WF_STEP_MONTHS: int = 12
+WF_PURGE_DAYS: int = HOLDING_HORIZON
+
 # ─── Feature limits ───────────────────────────────────────────────────────────
 
 FEATURE_MIN: int = 3
@@ -41,6 +49,10 @@ FEATURE_MAX: int = 30
 # ─── Correlation threshold ────────────────────────────────────────────────────
 
 CORR_THRESHOLD: float = 0.70       # used for domain & individual dedup
+
+# Full startup precompute can be very slow once the domain contains many
+# sector/market primitives. Keep it lazy by default; set True for debugging.
+DOMAIN_PRECOMPUTE_ON_START: bool = True
 
 # ─── Window whitelist ─────────────────────────────────────────────────────────
 
@@ -78,25 +90,51 @@ ARCHIVE_SIZE: int = 50             # max individuals kept
 
 # ─── LightGBM ─────────────────────────────────────────────────────────────────
 
-LGBM_PARAMS: dict = {
+LGBM_WF_PARAMS: dict = {
     "objective":        "lambdarank",
     "metric":           "ndcg",
     "eval_at":          [10],
-    "learning_rate":    0.01,
-    "num_leaves":       31,
-    "max_depth":        6,
-    "feature_fraction": 0.7,
-    "bagging_fraction": 0.8,
-    "bagging_freq":     5,
-    "min_data_in_leaf": 100,
-    "lambda_l1":        1.0,
-    "lambda_l2":        1.0,
+    "learning_rate":    0.03,
+    "num_leaves":       15,
+    "max_depth":        4,
+    "feature_fraction": 0.6,
+    "bagging_fraction": 0.7,
+    "bagging_freq":     1,
+    "min_data_in_leaf": 300,
+    "lambda_l1":        5.0,
+    "lambda_l2":        20.0,
     "verbose":          -1,
     "seed":             42,
+    "feature_fraction_seed": 42,
+    "bagging_seed":     42,
+    "data_random_seed": 42,
 }
 
-LGBM_NUM_BOOST_ROUND: int  = 500
-LGBM_EARLY_STOPPING:  int  = 30    # stop if val NDCG@10 doesn't improve
+LGBM_WF_NUM_BOOST_ROUND: int = 250
+LGBM_WF_EARLY_STOPPING: int = 20    # stop if fold val NDCG@10 doesn't improve
+
+LGBM_FINAL_PARAMS: dict = {
+    "objective":        "lambdarank",
+    "metric":           "ndcg",
+    "eval_at":          [10],
+    "learning_rate":    0.02,
+    "num_leaves":       31,
+    "max_depth":        5,
+    "feature_fraction": 0.7,
+    "bagging_fraction": 0.8,
+    "bagging_freq":     3,
+    "min_data_in_leaf": 200,
+    "lambda_l1":        3.0,
+    "lambda_l2":        10.0,
+    "verbose":          -1,
+    "seed":             42,
+    "feature_fraction_seed": 42,
+    "bagging_seed":     42,
+    "data_random_seed": 42,
+}
+
+LGBM_FINAL_NUM_BOOST_ROUND: int = 400
+LGBM_FINAL_EARLY_STOPPING: int = 30
 
 # ─── Time budget ──────────────────────────────────────────────────────────────
 
@@ -109,8 +147,10 @@ HIT_RATE_TOP_K: int = 10
 # ─── Fitness weights ──────────────────────────────────────────────────────────
 
 FITNESS_WEIGHTS = {
-    "val_mean_ic":    0.25,
-    "val_icir":       0.15,
-    "hit_rate":       0.30,
-    "overfit_gap":   -0.30,
+    "wf_mean_ic":      0.38,
+    "wf_icir":         0.18,
+    "wf_hit_excess":   0.18,
+    "wf_ic_std":      -0.20,
+    "bad_fold_ratio": -0.18,
+    "wf_overfit_gap": -0.25,
 }

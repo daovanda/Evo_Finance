@@ -34,6 +34,7 @@ class ArchiveEntry:
     booster:    lgb.Booster
     score:      float
     metrics:    Dict[str, float] = field(default_factory=dict)
+    final_val_metrics: Dict[str, float] = field(default_factory=dict)
     test_metrics: Dict[str, float] = field(default_factory=dict)  # filled later
 
     def __repr__(self):
@@ -135,6 +136,15 @@ class Archive:
                     "val_icir":     e.metrics.get("val_icir"),
                     "hit_rate":     e.metrics.get("hit_rate"),
                     "overfit_gap":  e.metrics.get("overfit_gap"),
+                    "wf_mean_ic":   e.metrics.get("wf_mean_ic"),
+                    "wf_icir":      e.metrics.get("wf_icir"),
+                    "wf_hit_rate":  e.metrics.get("wf_hit_rate"),
+                    "wf_hit_excess": e.metrics.get("wf_hit_excess"),
+                    "wf_ic_std":    e.metrics.get("wf_ic_std"),
+                    "bad_fold_ratio": e.metrics.get("bad_fold_ratio"),
+                    "wf_overfit_gap": e.metrics.get("wf_overfit_gap"),
+                    "n_folds":      e.metrics.get("n_folds"),
+                    "final_val_metrics": e.final_val_metrics,
                     "test_metrics": e.test_metrics,
                     "genes":        e.individual.formulas,
                 }

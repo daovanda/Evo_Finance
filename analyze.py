@@ -138,7 +138,7 @@ def compute_series(
     try:
         # Early stopping CHỈ thấy val_df — đúng với cách main.py train thật
         booster, _, _, _, _ = trainer.train(
-            individual, train_df, val_df, feature_df=feature_df
+            individual, train_df, val_df, feature_df=feature_df, mode="final"
         )
     except Exception as exc:
         logger.warning("Train failed: %s", exc)

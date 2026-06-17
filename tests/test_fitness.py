@@ -4,7 +4,12 @@ import warnings
 import pandas as pd
 from scipy.stats import ConstantInputWarning
 
-from fitness.fitness import _ic_per_date
+from fitness.fitness import (
+    FitnessEvaluator,
+    FoldPrediction,
+    _ic_per_date,
+)
+from mutator.gene import Individual
 
 
 class FitnessMetricTests(unittest.TestCase):
@@ -29,6 +34,43 @@ class FitnessMetricTests(unittest.TestCase):
         self.assertEqual(constant_warnings, [])
         self.assertEqual(ic.loc[dates[0]], 0.0)
         self.assertEqual(ic.loc[dates[1]], 0.0)
+
+    def test_walk_forward_fitness_penalizes_fold_train_val_gap(self):
+        dates = pd.date_range("2024-01-01", periods=4)
+        tickers = ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"]
+        idx = pd.MultiIndex.from_product([dates, tickers], names=["date", "ticker"])
+        df = pd.DataFrame(index=idx)
+        labels = pd.Series(list(range(6)) * 4, index=idx, dtype=float)
+
+        good_pred = labels.copy()
+        bad_val_pred = -labels.copy()
+        folds = [
+            FoldPrediction(
+                name="wf_01",
+                train_pred=good_pred.loc[idx[:12]],
+                val_pred=good_pred.loc[idx[12:24]],
+                train_labels=labels.loc[idx[:12]],
+                val_labels=labels.loc[idx[12:24]],
+                train_df=df.loc[idx[:12]],
+                val_df=df.loc[idx[12:24]],
+            ),
+            FoldPrediction(
+                name="wf_02",
+                train_pred=good_pred.loc[idx[:12]],
+                val_pred=bad_val_pred.loc[idx[12:24]],
+                train_labels=labels.loc[idx[:12]],
+                val_labels=labels.loc[idx[12:24]],
+                train_df=df.loc[idx[:12]],
+                val_df=df.loc[idx[12:24]],
+            ),
+        ]
+
+        ind = Individual.seed()
+        result = FitnessEvaluator().evaluate_walk_forward(ind, folds)
+
+        self.assertGreater(result.extra["wf_overfit_gap"], 0.0)
+        self.assertGreater(result.extra["bad_fold_ratio"], 0.0)
+        self.assertIn("wf_mean_ic", ind.metrics)
 
 
 if __name__ == "__main__":

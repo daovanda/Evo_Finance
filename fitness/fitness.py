@@ -1,38 +1,16 @@
 """
-Evo_Finance — Fitness
-──────────────────────
-Computes the fitness score for an Individual given model predictions.
+Fitness metrics for Evo_Finance.
 
-score = 0.45 * val_mean_ic
-      + 0.25 * val_icir_scaled
-      + 0.20 * hit_rate
-      - 0.10 * overfit_gap
-
-Definitions
------------
-IC (Information Coefficient)
-    Spearman rank correlation between predicted score and realised label,
-    computed **per date** (cross-sectional), then averaged.
-
-ICIR (IC Information Ratio)
-    mean(IC) / std(IC)  — risk-adjusted signal quality.
-    Clipped to [-3, 3] then divided by 3 → [-1, 1].
-
-Hit Rate
-    On each date in the val set:
-        top-K predicted ∩ top-K actual label
-        ─────────────────────────────────────  × 1/K
-                         K
-    Then averaged across dates.  K = HIT_RATE_TOP_K (default 10).
-
-Overfit Gap
-    max(0, IC_mean_train − IC_mean_val)
+The evolutionary loop uses walk-forward fitness by default. The single-split
+evaluator is kept for final validation/test reporting and backwards
+compatibility.
 """
 
 from __future__ import annotations
+
 import logging
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Dict, Iterable, List
 
 import numpy as np
 import pandas as pd
@@ -44,20 +22,18 @@ from mutator.gene import Individual
 logger = logging.getLogger(__name__)
 
 
-# ─── Metric helpers ───────────────────────────────────────────────────────────
-
 def _ic_per_date(
     pred: pd.Series,
     label: pd.Series,
     df_index: pd.Index,
 ) -> pd.Series:
-    """
-    Compute Spearman IC for each date.
-    pred and label must have the same MultiIndex (date, ticker).
-    """
-    data = pd.DataFrame({"pred": pred, "label": label}).dropna()
+    """Compute Spearman IC for each date."""
+    data = (
+        pd.DataFrame({"pred": pred, "label": label})
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
 
-    # Extract date from the MultiIndex levels (avoid column name collision)
     if isinstance(data.index, pd.MultiIndex):
         dates_arr = data.index.get_level_values("date")
     else:
@@ -66,10 +42,13 @@ def _ic_per_date(
     ics = {}
     for date in np.unique(dates_arr):
         mask = dates_arr == date
-        grp  = data[mask]
+        grp = data[mask]
         if len(grp) < 5:
             continue
-        if grp["pred"].nunique(dropna=True) < 2 or grp["label"].nunique(dropna=True) < 2:
+        if (
+            grp["pred"].nunique(dropna=True) < 2
+            or grp["label"].nunique(dropna=True) < 2
+        ):
             ics[date] = 0.0
             continue
         corr, _ = spearmanr(grp["pred"], grp["label"])
@@ -84,7 +63,11 @@ def _hit_rate(
     df_index: pd.Index,
     top_k: int = HIT_RATE_TOP_K,
 ) -> float:
-    data = pd.DataFrame({"pred": pred, "label": label}).dropna()
+    data = (
+        pd.DataFrame({"pred": pred, "label": label})
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
 
     if isinstance(data.index, pd.MultiIndex):
         dates_arr = data.index.get_level_values("date")
@@ -94,103 +77,223 @@ def _hit_rate(
     hits = []
     for date in np.unique(dates_arr):
         mask = dates_arr == date
-        grp  = data[mask]
+        grp = data[mask]
         if len(grp) < top_k:
             continue
-        top_pred  = set(grp.nlargest(top_k, "pred").index)
+        top_pred = set(grp.nlargest(top_k, "pred").index)
         top_label = set(grp.nlargest(top_k, "label").index)
         hits.append(len(top_pred & top_label) / top_k)
 
     return float(np.mean(hits)) if hits else 0.0
 
 
-# ─── Fitness dataclass ────────────────────────────────────────────────────────
+def _random_hit_baseline(df: pd.DataFrame, top_k: int = HIT_RATE_TOP_K) -> float:
+    if isinstance(df.index, pd.MultiIndex):
+        n_tickers = int(df.index.get_level_values("ticker").nunique())
+    else:
+        n_tickers = len(df)
+    if n_tickers <= 0:
+        return 0.0
+    return min(1.0, float(top_k) / float(n_tickers))
+
+
+@dataclass
+class FoldPrediction:
+    name: str
+    train_pred: pd.Series
+    val_pred: pd.Series
+    train_labels: pd.Series
+    val_labels: pd.Series
+    train_df: pd.DataFrame
+    val_df: pd.DataFrame
+
 
 @dataclass
 class FitnessResult:
-    score:          float
-    val_mean_ic:    float
-    val_icir:       float
-    val_icir_scaled:float
-    hit_rate:       float
-    overfit_gap:    float
-    train_mean_ic:  float
-    val_ic_series:  pd.Series = field(default_factory=pd.Series)
+    score: float
+    val_mean_ic: float
+    val_icir: float
+    val_icir_scaled: float
+    hit_rate: float
+    overfit_gap: float
+    train_mean_ic: float
+    val_ic_series: pd.Series = field(default_factory=pd.Series)
+    extra: Dict[str, float] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, float]:
-        return {
-            "score":           self.score,
-            "val_mean_ic":     self.val_mean_ic,
-            "val_icir":        self.val_icir,
+        out = {
+            "score": self.score,
+            "val_mean_ic": self.val_mean_ic,
+            "val_icir": self.val_icir,
             "val_icir_scaled": self.val_icir_scaled,
-            "hit_rate":        self.hit_rate,
-            "overfit_gap":     self.overfit_gap,
-            "train_mean_ic":   self.train_mean_ic,
+            "hit_rate": self.hit_rate,
+            "overfit_gap": self.overfit_gap,
+            "train_mean_ic": self.train_mean_ic,
         }
+        out.update(self.extra)
+        return out
 
-
-# ─── Fitness evaluator ────────────────────────────────────────────────────────
 
 class FitnessEvaluator:
-
     def evaluate(
         self,
-        individual:    Individual,
-        train_pred:    pd.Series,
-        val_pred:      pd.Series,
-        train_labels:  pd.Series,
-        val_labels:    pd.Series,
-        train_df:      pd.DataFrame,
-        val_df:        pd.DataFrame,
+        individual: Individual,
+        train_pred: pd.Series,
+        val_pred: pd.Series,
+        train_labels: pd.Series,
+        val_labels: pd.Series,
+        train_df: pd.DataFrame,
+        val_df: pd.DataFrame,
     ) -> FitnessResult:
-        """
-        Compute and return the FitnessResult.  Also writes metrics into
-        individual.metrics and sets individual.score.
-        """
-        # ── IC series ─────────────────────────────────────────────────────────
+        """Evaluate one train/validation split."""
         train_ic_series = _ic_per_date(train_pred, train_labels, train_df.index)
-        val_ic_series   = _ic_per_date(val_pred,   val_labels,   val_df.index)
+        val_ic_series = _ic_per_date(val_pred, val_labels, val_df.index)
 
-        train_mean_ic = float(train_ic_series.mean()) if len(train_ic_series) else 0.0
-        val_mean_ic   = float(val_ic_series.mean())   if len(val_ic_series)   else 0.0
-
-        # ── ICIR ──────────────────────────────────────────────────────────────
-        val_ic_std    = float(val_ic_series.std()) if len(val_ic_series) > 1 else 1e-9
-        val_icir      = val_mean_ic / (val_ic_std + 1e-9)
+        train_mean_ic = _safe_mean(train_ic_series)
+        val_mean_ic = _safe_mean(val_ic_series)
+        val_ic_std = float(val_ic_series.std()) if len(val_ic_series) > 1 else 0.0
+        val_icir = val_mean_ic / (val_ic_std + 1e-9)
         val_icir_scaled = float(np.clip(val_icir, -3.0, 3.0)) / 3.0
-
-        # ── Hit rate ──────────────────────────────────────────────────────────
         hit_rate = _hit_rate(val_pred, val_labels, val_df.index)
-
-        # ── Overfit gap ───────────────────────────────────────────────────────
+        baseline = _random_hit_baseline(val_df)
+        hit_excess = hit_rate - baseline
         overfit_gap = max(0.0, train_mean_ic - val_mean_ic)
 
-        # ── Aggregate ─────────────────────────────────────────────────────────
         w = FITNESS_WEIGHTS
         score = (
-            w["val_mean_ic"] * val_mean_ic
-            + w["val_icir"]  * val_icir_scaled
-            + w["hit_rate"]  * hit_rate
-            + w["overfit_gap"] * overfit_gap   # weight is negative in config
+            w.get("val_mean_ic", w.get("wf_mean_ic", 0.0)) * val_mean_ic
+            + w.get("val_icir", w.get("wf_icir", 0.0)) * val_icir_scaled
+            + w.get("hit_rate", 0.0) * hit_rate
+            + w.get("wf_hit_excess", 0.0) * hit_excess
+            + w.get("overfit_gap", w.get("wf_overfit_gap", 0.0)) * overfit_gap
         )
 
         result = FitnessResult(
-            score           = score,
-            val_mean_ic     = val_mean_ic,
-            val_icir        = val_icir,
-            val_icir_scaled = val_icir_scaled,
-            hit_rate        = hit_rate,
-            overfit_gap     = overfit_gap,
-            train_mean_ic   = train_mean_ic,
-            val_ic_series   = val_ic_series,
+            score=score,
+            val_mean_ic=val_mean_ic,
+            val_icir=val_icir,
+            val_icir_scaled=val_icir_scaled,
+            hit_rate=hit_rate,
+            overfit_gap=overfit_gap,
+            train_mean_ic=train_mean_ic,
+            val_ic_series=val_ic_series,
+            extra={"hit_excess": hit_excess},
+        )
+        individual.score = score
+        individual.metrics = result.as_dict()
+        return result
+
+    def evaluate_walk_forward(
+        self,
+        individual: Individual,
+        folds: Iterable[FoldPrediction],
+    ) -> FitnessResult:
+        """Aggregate fold metrics into the configured walk-forward score."""
+        fold_metrics: List[Dict[str, float]] = []
+        val_ic_series_parts: List[pd.Series] = []
+
+        for fold in folds:
+            train_ic = _ic_per_date(
+                fold.train_pred,
+                fold.train_labels,
+                fold.train_df.index,
+            )
+            val_ic = _ic_per_date(
+                fold.val_pred,
+                fold.val_labels,
+                fold.val_df.index,
+            )
+            train_mean_ic = _safe_mean(train_ic)
+            val_mean_ic = _safe_mean(val_ic)
+            hit_rate = _hit_rate(fold.val_pred, fold.val_labels, fold.val_df.index)
+            baseline = _random_hit_baseline(fold.val_df)
+            fold_metrics.append(
+                {
+                    "train_mean_ic": train_mean_ic,
+                    "val_mean_ic": val_mean_ic,
+                    "hit_rate": hit_rate,
+                    "hit_excess": hit_rate - baseline,
+                    "overfit_gap": max(0.0, train_mean_ic - val_mean_ic),
+                }
+            )
+            if len(val_ic):
+                val_ic_series_parts.append(val_ic.rename(fold.name))
+
+        if not fold_metrics:
+            raise ValueError("No fold metrics available for walk-forward fitness.")
+
+        fold_df = pd.DataFrame(fold_metrics)
+        all_val_ic = (
+            pd.concat(val_ic_series_parts)
+            if val_ic_series_parts
+            else pd.Series(dtype=float)
         )
 
-        # write back into individual
-        individual.score   = score
-        individual.metrics = result.as_dict()
+        wf_mean_ic = float(fold_df["val_mean_ic"].mean())
+        wf_ic_std = float(fold_df["val_mean_ic"].std(ddof=0))
+        wf_hit_rate = float(fold_df["hit_rate"].mean())
+        wf_hit_excess = float(fold_df["hit_excess"].mean())
+        wf_overfit_gap = float(fold_df["overfit_gap"].mean())
+        train_mean_ic = float(fold_df["train_mean_ic"].mean())
+        bad_fold_ratio = float((fold_df["val_mean_ic"] <= 0.0).mean())
 
+        if len(all_val_ic) > 1:
+            wf_icir = float(all_val_ic.mean()) / (float(all_val_ic.std()) + 1e-9)
+        else:
+            wf_icir = 0.0
+        wf_icir_scaled = float(np.clip(wf_icir, -3.0, 3.0)) / 3.0
+
+        w = FITNESS_WEIGHTS
+        score = (
+            w["wf_mean_ic"] * wf_mean_ic
+            + w["wf_icir"] * wf_icir_scaled
+            + w["wf_hit_excess"] * wf_hit_excess
+            + w["wf_ic_std"] * wf_ic_std
+            + w["bad_fold_ratio"] * bad_fold_ratio
+            + w["wf_overfit_gap"] * wf_overfit_gap
+        )
+
+        extra = {
+            "wf_mean_ic": wf_mean_ic,
+            "wf_icir": wf_icir,
+            "wf_icir_scaled": wf_icir_scaled,
+            "wf_hit_rate": wf_hit_rate,
+            "wf_hit_excess": wf_hit_excess,
+            "wf_ic_std": wf_ic_std,
+            "bad_fold_ratio": bad_fold_ratio,
+            "wf_overfit_gap": wf_overfit_gap,
+            "wf_train_mean_ic": train_mean_ic,
+            "n_folds": float(len(fold_metrics)),
+        }
+        result = FitnessResult(
+            score=score,
+            val_mean_ic=wf_mean_ic,
+            val_icir=wf_icir,
+            val_icir_scaled=wf_icir_scaled,
+            hit_rate=wf_hit_rate,
+            overfit_gap=wf_overfit_gap,
+            train_mean_ic=train_mean_ic,
+            val_ic_series=all_val_ic,
+            extra=extra,
+        )
+
+        individual.score = score
+        individual.metrics = result.as_dict()
         logger.info(
-            "Fitness: score=%.4f | val_IC=%.4f | ICIR=%.4f | hit=%.4f | gap=%.4f",
-            score, val_mean_ic, val_icir, hit_rate, overfit_gap,
+            "WF fitness: score=%.4f | IC=%.4f | ICIR=%.4f | hit_excess=%.4f | "
+            "std=%.4f | bad=%.2f | gap=%.4f | folds=%d",
+            score,
+            wf_mean_ic,
+            wf_icir,
+            wf_hit_excess,
+            wf_ic_std,
+            bad_fold_ratio,
+            wf_overfit_gap,
+            len(fold_metrics),
         )
         return result
+
+
+def _safe_mean(series: pd.Series) -> float:
+    clean = series.replace([np.inf, -np.inf], np.nan).dropna()
+    return float(clean.mean()) if len(clean) else 0.0

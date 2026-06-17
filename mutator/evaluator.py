@@ -107,6 +107,11 @@ _TERMINAL_RE = re.compile(r'^([a-z_]+)_(\d+)$')
 DIV_ZERO_EPS = 1e-12
 
 
+def _finite_series(series: pd.Series) -> pd.Series:
+    """Return a numeric Series where +/-inf are treated as missing values."""
+    return pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+
 # ─── Public ───────────────────────────────────────────────────────────────────
 
 def evaluate(formula: str, df: pd.DataFrame) -> pd.Series:
@@ -475,12 +480,14 @@ def _division_zero_count(formula: str, df: pd.DataFrame) -> int:
 # ─── Operations ───────────────────────────────────────────────────────────────
 
 def _ts_apply(series: pd.Series, fn: str, w: int, df: pd.DataFrame) -> pd.Series:
+    series = _finite_series(series)
     if isinstance(df.index, pd.MultiIndex):
         return series.groupby(level="ticker").transform(lambda s: _roll(s, fn, w))
     return _roll(series, fn, w)
 
 
 def _roll(s: pd.Series, fn: str, w: int) -> pd.Series:
+    s = _finite_series(s)
     if fn == "mean":  return s.rolling(w, min_periods=1).mean()
     if fn == "std":   return s.rolling(w, min_periods=2).std()
     if fn == "max":   return s.rolling(w, min_periods=1).max()
@@ -522,14 +529,14 @@ def _roll(s: pd.Series, fn: str, w: int) -> pd.Series:
 
 
 def _last_rank_pct(values: np.ndarray) -> float:
-    valid = values[~np.isnan(values)]
-    if len(valid) == 0 or np.isnan(values[-1]):
+    valid = values[np.isfinite(values)]
+    if len(valid) == 0 or not np.isfinite(values[-1]):
         return np.nan
     return float(pd.Series(valid).rank(pct=True).iloc[-1])
 
 
 def _decay_linear_value(values: np.ndarray) -> float:
-    valid = values[~np.isnan(values)]
+    valid = values[np.isfinite(values)]
     if len(valid) == 0:
         return np.nan
     weights = np.arange(1, len(valid) + 1, dtype=float)
@@ -537,7 +544,7 @@ def _decay_linear_value(values: np.ndarray) -> float:
 
 
 def _slope_value(values: np.ndarray) -> float:
-    valid_mask = ~np.isnan(values)
+    valid_mask = np.isfinite(values)
     y = values[valid_mask]
     if len(y) < 2:
         return np.nan
@@ -550,10 +557,10 @@ def _slope_value(values: np.ndarray) -> float:
 
 
 def _rolling_extreme_age_value(values: np.ndarray, mode: str) -> float:
-    if len(values) == 0 or np.isnan(values[-1]):
+    if len(values) == 0 or not np.isfinite(values[-1]):
         return np.nan
 
-    valid_mask = ~np.isnan(values)
+    valid_mask = np.isfinite(values)
     if not valid_mask.any():
         return np.nan
 
@@ -567,7 +574,7 @@ def _rolling_extreme_age_value(values: np.ndarray, mode: str) -> float:
 
 
 def _skew_value(values: np.ndarray) -> float:
-    valid = values[~np.isnan(values)]
+    valid = values[np.isfinite(values)]
     if len(valid) < 3:
         return np.nan
     centered = valid - valid.mean()
@@ -579,7 +586,7 @@ def _skew_value(values: np.ndarray) -> float:
 
 
 def _kurt_value(values: np.ndarray) -> float:
-    valid = values[~np.isnan(values)]
+    valid = values[np.isfinite(values)]
     if len(valid) < 3:
         return np.nan
     centered = valid - valid.mean()
@@ -610,7 +617,7 @@ def _ts_pair_apply(
     w: int,
     df: pd.DataFrame,
 ) -> pd.Series:
-    pair = pd.concat([left, right], axis=1)
+    pair = pd.concat([_finite_series(left), _finite_series(right)], axis=1)
     pair.columns = ["left", "right"]
     result = pd.Series(np.nan, index=left.index, dtype=float)
 
@@ -624,6 +631,8 @@ def _ts_pair_apply(
 
 
 def _pair_roll(left: pd.Series, right: pd.Series, fn: str, w: int) -> pd.Series:
+    left = _finite_series(left)
+    right = _finite_series(right)
     if fn == "ts_corr":
         return left.rolling(w, min_periods=3).corr(right)
     if fn == "ts_cov":
@@ -636,6 +645,7 @@ def _pair_roll(left: pd.Series, right: pd.Series, fn: str, w: int) -> pd.Series:
 
 
 def _cs_unary(op: str, series: pd.Series, df: pd.DataFrame) -> pd.Series:
+    series = _finite_series(series)
     if op == "rank":
         if isinstance(df.index, pd.MultiIndex):
             return series.groupby(level="date").rank(pct=True)
@@ -667,7 +677,10 @@ def _cs_unary(op: str, series: pd.Series, df: pd.DataFrame) -> pd.Series:
 
 
 def _cs_winsorize(series: pd.Series, df: pd.DataFrame) -> pd.Series:
+    series = _finite_series(series)
+
     def _clip_group(s: pd.Series) -> pd.Series:
+        s = _finite_series(s)
         lower = s.quantile(0.05)
         upper = s.quantile(0.95)
         return s.clip(lower, upper)
@@ -678,6 +691,7 @@ def _cs_winsorize(series: pd.Series, df: pd.DataFrame) -> pd.Series:
 
 
 def _cs_neutralize(series: pd.Series, df: pd.DataFrame) -> pd.Series:
+    series = _finite_series(series)
     if isinstance(df.index, pd.MultiIndex):
         return series.groupby(level="date").transform(lambda s: s - s.mean())
     return series - series.mean()
@@ -1208,6 +1222,7 @@ def _ticker_transform(series: pd.Series, func, df: pd.DataFrame) -> pd.Series:
 
 
 def _date_transform(series: pd.Series, func, df: pd.DataFrame) -> pd.Series:
+    series = _finite_series(series)
     if isinstance(df.index, pd.MultiIndex):
         return series.groupby(level="date", group_keys=False).transform(func)
     value = func(series)
@@ -1215,6 +1230,7 @@ def _date_transform(series: pd.Series, func, df: pd.DataFrame) -> pd.Series:
 
 
 def _date_sum(series: pd.Series, df: pd.DataFrame) -> pd.Series:
+    series = _finite_series(series)
     if isinstance(df.index, pd.MultiIndex):
         return series.groupby(level="date").transform("sum")
     return pd.Series(float(series.sum()), index=series.index)
@@ -1245,6 +1261,7 @@ def _sector_series(df: pd.DataFrame) -> pd.Series:
 
 
 def _sector_date_transform(series: pd.Series, func, df: pd.DataFrame) -> pd.Series:
+    series = _finite_series(series)
     if not isinstance(df.index, pd.MultiIndex):
         value = func(series)
         if isinstance(value, pd.Series):
@@ -1256,6 +1273,7 @@ def _sector_date_transform(series: pd.Series, func, df: pd.DataFrame) -> pd.Seri
 
 
 def _sector_date_sum(series: pd.Series, df: pd.DataFrame) -> pd.Series:
+    series = _finite_series(series)
     if not isinstance(df.index, pd.MultiIndex):
         return pd.Series(float(series.sum()), index=series.index)
     dates = df.index.get_level_values("date")
@@ -1379,9 +1397,11 @@ def _conditional(fn: str, args: tuple[str, str, str], df: pd.DataFrame) -> pd.Se
 
 
 def _binary(op: str, lv: pd.Series, rv: pd.Series) -> pd.Series:
-    if op == "+": return lv + rv
-    if op == "-": return lv - rv
-    if op == "*": return lv * rv
+    lv = _finite_series(lv)
+    rv = _finite_series(rv)
+    if op == "+": return _finite_series(lv + rv)
+    if op == "-": return _finite_series(lv - rv)
+    if op == "*": return _finite_series(lv * rv)
     if op == "/": return _safe_div(lv, rv)
     raise ValueError(op)
 
@@ -1663,7 +1683,10 @@ def _cumulative_noarg_zero_count(fn: str, df: pd.DataFrame) -> int:
 
 
 def _safe_div(lv: pd.Series, rv: pd.Series) -> pd.Series:
-    return lv / rv.mask(_zero_denominator_mask(rv), np.nan)
+    lv = _finite_series(lv)
+    rv = _finite_series(rv)
+    out = lv / rv.mask(_zero_denominator_mask(rv), np.nan)
+    return _finite_series(out)
 
 
 def _zero_denominator_mask(series: pd.Series) -> pd.Series:

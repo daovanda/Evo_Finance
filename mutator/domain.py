@@ -11,6 +11,7 @@ Thread-safety: single-process assumed; no locking needed.
 
 from __future__ import annotations
 import logging
+import time
 from typing import List, Optional
 import numpy as np
 import pandas as pd
@@ -137,21 +138,70 @@ class Domain:
         logger.debug("Domain ← %r  (size=%d)", gene.formula, len(self._formulas))
         return True
 
-    def precompute(self, train_df: pd.DataFrame) -> None:
-        """Materialise all domain formulas on train_df (call once after seeding)."""
-        for f in self._formulas:
+    def precompute(
+        self,
+        train_df: pd.DataFrame,
+        progress_every: int = 50,
+        slow_sec: float = 1.0,
+    ) -> None:
+        """Materialise all domain formulas on train_df with progress logging."""
+        total = len(self._formulas)
+        start = time.perf_counter()
+        computed = skipped = failed = 0
+        logger.info(
+            "Domain.precompute: start %d formulas on %d rows.",
+            total,
+            len(train_df),
+        )
+
+        for i, f in enumerate(self._formulas, 1):
+            t0 = time.perf_counter()
             if f not in self._cache:
                 try:
                     self._cache[f] = self._compute(f, train_df)
+                    computed += 1
                 except Exception as exc:
+                    failed += 1
                     logger.warning("Domain.precompute: %r failed — %s", f, exc)
+
+            else:
+                skipped += 1
+
+            elapsed_formula = time.perf_counter() - t0
+            if slow_sec > 0 and elapsed_formula >= slow_sec:
+                logger.info(
+                    "Domain.precompute: slow %.2fs | %s",
+                    elapsed_formula,
+                    f,
+                )
+
+            if progress_every > 0 and i % progress_every == 0:
+                logger.info(
+                    "Domain.precompute: %d/%d | computed=%d skipped=%d "
+                    "failed=%d | elapsed=%.1fs",
+                    i,
+                    total,
+                    computed,
+                    skipped,
+                    failed,
+                    time.perf_counter() - start,
+                )
+
+        logger.info(
+            "Domain.precompute: done | computed=%d skipped=%d failed=%d "
+            "elapsed=%.1fs",
+            computed,
+            skipped,
+            failed,
+            time.perf_counter() - start,
+        )
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _compute(self, formula: str, df: pd.DataFrame) -> pd.Series:
         if formula in self._cache:
             return self._cache[formula]
-        series = evaluate(formula, df).dropna()
+        series = evaluate(formula, df).replace([np.inf, -np.inf], np.nan).dropna()
         self._cache[formula] = series
         return series
 
@@ -370,7 +420,11 @@ def _safe_corr(a: pd.Series, b: pd.Series) -> float:
     Trả về 0.0 nếu có exception khác.
     """
     try:
-        aligned = pd.concat([a, b], axis=1).dropna()
+        aligned = (
+            pd.concat([a, b], axis=1)
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+        )
         if len(aligned) < 10:
             return 1.0  # quá ít data → coi như duplicate, reject
         # Hằng số → corr = NaN → nếu không chặn sẽ pass threshold
@@ -410,7 +464,11 @@ def individual_corr_check(
         return False
 
     try:
-        new_series = evaluate(new_gene.formula, train_df).dropna()
+        new_series = (
+            evaluate(new_gene.formula, train_df)
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+        )
     except Exception as exc:
         logger.warning("corr_check eval failed for %r: %s", new_gene.formula, exc)
         return False
@@ -422,7 +480,11 @@ def individual_corr_check(
 
     for g in existing_genes:
         try:
-            ex_series = evaluate(g.formula, train_df).dropna()
+            ex_series = (
+                evaluate(g.formula, train_df)
+                .replace([np.inf, -np.inf], np.nan)
+                .dropna()
+            )
         except Exception:
             continue
         corr = _safe_corr(new_series, ex_series)

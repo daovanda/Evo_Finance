@@ -15,14 +15,19 @@ The caller (main loop) is responsible for supplying pre-split DataFrames:
 
 from __future__ import annotations
 import logging
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
 
 from config.settings import (
-    LGBM_PARAMS, LGBM_NUM_BOOST_ROUND, LGBM_EARLY_STOPPING,
+    LGBM_FINAL_EARLY_STOPPING,
+    LGBM_FINAL_NUM_BOOST_ROUND,
+    LGBM_FINAL_PARAMS,
+    LGBM_WF_EARLY_STOPPING,
+    LGBM_WF_NUM_BOOST_ROUND,
+    LGBM_WF_PARAMS,
 )
 from mutator.gene import Individual
 from mutator.evaluator import evaluate
@@ -127,6 +132,19 @@ def _group_sizes(df: pd.DataFrame) -> List[int]:
         return [len(df)]
 
 
+def _training_config(mode: str) -> tuple[dict, int, int]:
+    """Return LightGBM params for walk-forward or final retraining."""
+    if mode == "wf":
+        return LGBM_WF_PARAMS, LGBM_WF_NUM_BOOST_ROUND, LGBM_WF_EARLY_STOPPING
+    if mode == "final":
+        return (
+            LGBM_FINAL_PARAMS,
+            LGBM_FINAL_NUM_BOOST_ROUND,
+            LGBM_FINAL_EARLY_STOPPING,
+        )
+    raise ValueError(f"Unknown training mode: {mode!r}. Use 'wf' or 'final'.")
+
+
 # ─── Trainer ──────────────────────────────────────────────────────────────────
 
 class Trainer:
@@ -138,6 +156,7 @@ class Trainer:
         train_df: pd.DataFrame,
         val_df: pd.DataFrame,
         feature_df: pd.DataFrame | None = None,
+        mode: str = "final",
     ) -> Tuple["lgb.Booster", pd.Series, pd.Series, pd.Series, pd.Series]:
         """
         Train LightGBM on *individual*'s features.
@@ -151,6 +170,8 @@ class Trainer:
         val_labels     : ground-truth labels (val)
         """
         # ── Build feature matrices ────────────────────────────────────────────
+        params, num_boost_round, early_stopping_rounds = _training_config(mode)
+
         context_df = feature_df if feature_df is not None else _feature_context(
             train_df, val_df
         )
@@ -195,16 +216,16 @@ class Trainer:
         # ── Train ─────────────────────────────────────────────────────────────
         callbacks = [
             lgb.early_stopping(
-                stopping_rounds=LGBM_EARLY_STOPPING,
+                stopping_rounds=early_stopping_rounds,
                 verbose=False,
             ),
             lgb.log_evaluation(period=-1),   # silence per-round output
         ]
 
         booster = lgb.train(
-            params            = LGBM_PARAMS,
+            params            = dict(params),
             train_set         = lgb_train,
-            num_boost_round   = LGBM_NUM_BOOST_ROUND,
+            num_boost_round   = num_boost_round,
             valid_sets        = [lgb_val],
             callbacks         = callbacks,
         )
