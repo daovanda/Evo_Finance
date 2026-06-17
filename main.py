@@ -87,6 +87,7 @@ def run(
         "Sizes — train: %d rows, val: %d rows, test: %d rows",
         len(train_df), len(val_df), len(test_df),
     )
+    feature_df = pd.concat([train_df, val_df, test_df]).sort_index()
 
     # ── Initialise components ─────────────────────────────────────────────────
     domain    = Domain()
@@ -103,7 +104,7 @@ def run(
     seed_ind = Individual.seed(window=DEFAULT_WINDOW)
     _evaluate_and_archive(
         seed_ind, trainer, evaluator, archive,
-        train_df, val_df,
+        train_df, val_df, feature_df,
     )
 
     # ── Evolutionary loop ─────────────────────────────────────────────────────
@@ -121,7 +122,7 @@ def run(
             parent = Individual.seed(window=DEFAULT_WINDOW)
         elif archive.is_empty():
             parent = Individual.seed(window=DEFAULT_WINDOW)
-            _evaluate_and_archive(parent, trainer, evaluator, archive, train_df, val_df)
+            _evaluate_and_archive(parent, trainer, evaluator, archive, train_df, val_df, feature_df)
             continue
         else:
             parent = archive.random_individual(rng)
@@ -140,7 +141,7 @@ def run(
         # evaluate + archive
         admitted = _evaluate_and_archive(
             child, trainer, evaluator, archive,
-            train_df, val_df,
+            train_df, val_df, feature_df,
         )
 
         best_score = archive.best.score if archive.best else float("nan")
@@ -151,7 +152,7 @@ def run(
 
     # ── Test-set evaluation for all archived individuals ──────────────────────
     logger.info("=== Time budget exhausted. Running test-set evaluation … ===")
-    _test_evaluate_archive(archive, trainer, evaluator, test_df)
+    _test_evaluate_archive(archive, trainer, evaluator, test_df, feature_df)
 
     # ── Output ────────────────────────────────────────────────────────────────
     _print_summary(archive, iteration, time.time() - t_start)
@@ -171,11 +172,12 @@ def _evaluate_and_archive(
     archive:    Archive,
     train_df:   pd.DataFrame,
     val_df:     pd.DataFrame,
+    feature_df: pd.DataFrame,
 ) -> bool:
     """Train, score, and optionally archive an individual. Returns admission bool."""
     try:
         booster, train_pred, val_pred, train_labels, val_labels = trainer.train(
-            individual, train_df, val_df
+            individual, train_df, val_df, feature_df=feature_df
         )
     except Exception as exc:
         logger.warning("Training failed: %s", exc)
@@ -200,11 +202,14 @@ def _test_evaluate_archive(
     trainer:   Trainer,
     evaluator: FitnessEvaluator,
     test_df:   pd.DataFrame,
+    feature_df: pd.DataFrame,
 ) -> None:
     """Run test-set predictions for every archived individual."""
     for entry in archive.entries:
         try:
-            test_pred = trainer.predict(entry.booster, entry.individual, test_df)
+            test_pred = trainer.predict(
+                entry.booster, entry.individual, test_df, feature_df=feature_df
+            )
             test_labels = test_df["label"]
 
             # reuse fitness helpers for test metrics

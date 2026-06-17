@@ -48,6 +48,15 @@ WINDOWS: List[int] = [3, 5, 10, 14, 20, 30, 60, 120]
 
 DEFAULT_WINDOW: int = 1            # initial {O,H,C,L,V} window
 
+# Edit this mapping before each run if you want a different sector universe.
+# Tickers are matched case-insensitively by the evaluator.
+SECTORS: dict[str, list[str]] = {
+    "Banking":     ["ACB", "BID", "CTG", "HDB", "MBB", "STB", "TCB", "VCB", "VPB", "TPB"],
+    "Real_Estate": ["KDH", "NVL", "VHM", "VIC", "VRE"],
+    "Industry":    ["FPT", "GAS", "GVR", "HPG", "MSN", "PDR", "PLX", "POW"],
+    "Consumer":    ["BVH", "MWG", "PNJ", "SAB", "SSI", "VJC", "VNM"],
+}
+
 # ─── Mutator probabilities ────────────────────────────────────────────────────
 
 MUTATOR_PROBS = {
@@ -79,7 +88,7 @@ LGBM_PARAMS: dict = {
     "feature_fraction": 0.7,
     "bagging_fraction": 0.8,
     "bagging_freq":     5,
-    "min_data_in_leaf": 50,
+    "min_data_in_leaf": 100,
     "lambda_l1":        1.0,
     "lambda_l2":        1.0,
     "verbose":          -1,
@@ -100,8 +109,8 @@ HIT_RATE_TOP_K: int = 10
 # ─── Fitness weights ──────────────────────────────────────────────────────────
 
 FITNESS_WEIGHTS = {
-    "val_mean_ic":    0.45,
-    "val_icir":       0.25,
-    "hit_rate":       0.20,
-    "overfit_gap":   -0.10,
+    "val_mean_ic":    0.25,
+    "val_icir":       0.15,
+    "hit_rate":       0.30,
+    "overfit_gap":   -0.30,
 }

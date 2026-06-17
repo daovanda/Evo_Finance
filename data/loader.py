@@ -39,6 +39,7 @@ def load_from_dir(
     tickers:   Optional[List[str]] = None,
     min_rows:  int = 100,
     ffill_prices: bool = True,
+    include_vnindex: bool = True,
 ) -> pd.DataFrame:
     """
     Load và merge tất cả file CSV trong data_dir thành MultiIndex DataFrame.
@@ -63,7 +64,8 @@ def load_from_dir(
 
     # ── Tìm files ─────────────────────────────────────────────────────────────
     if tickers is not None:
-        csv_files = [data_dir / f"{t}.csv" for t in tickers]
+        stock_tickers = [t for t in tickers if t.upper() != "VNINDEX"]
+        csv_files = [data_dir / f"{t}.csv" for t in stock_tickers]
         missing   = [f for f in csv_files if not f.exists()]
         if missing:
             logger.warning("Không tìm thấy file cho: %s", [f.stem for f in missing])
@@ -91,10 +93,23 @@ def load_from_dir(
 
     logger.info("Load thành công %d / %d ticker.", len(frames), len(csv_files))
 
+    vnindex_df: Optional[pd.DataFrame] = None
+    if include_vnindex:
+        vnindex_df = load_vnindex(data_dir)
+        if vnindex_df is not None:
+            logger.info(
+                "Load VNINDEX: %d rows, %s -> %s",
+                len(vnindex_df),
+                vnindex_df.index.min().date(),
+                vnindex_df.index.max().date(),
+            )
+
     # ── INTERSECTION: chỉ giữ ngày TẤT CẢ ticker đều có giao dịch thực ──────
     # UNION sẽ tạo ffill noise ở ngày 1 ticker bị suspend/halted
     # INTERSECTION đảm bảo mỗi hàng là dữ liệu thực, không có giá giả
     date_sets = [set(df.index) for df in frames.values()]
+    if vnindex_df is not None:
+        date_sets.append(set(vnindex_df.index))
     all_dates = sorted(set.intersection(*date_sets))
     all_dates = pd.DatetimeIndex(all_dates)
 
@@ -148,6 +163,12 @@ def load_from_dir(
     combined = pd.concat(merged, names=["ticker"])          # (ticker, date)
     combined = combined.swaplevel().sort_index()             # (date, ticker)
     combined.index.names = ["date", "ticker"]
+
+    if vnindex_df is not None:
+        market_df = vnindex_df.reindex(all_dates).add_prefix("market_")
+        if market_df["market_close"].isna().any():
+            raise ValueError("VNINDEX con NaN sau khi intersection theo ngay.")
+        combined = combined.join(market_df, on="date")
 
     # Drop các dòng vẫn còn NaN ở close (đầu chuỗi trước khi ticker có data)
     before = len(combined)

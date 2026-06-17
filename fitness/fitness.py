@@ -69,6 +69,9 @@ def _ic_per_date(
         grp  = data[mask]
         if len(grp) < 5:
             continue
+        if grp["pred"].nunique(dropna=True) < 2 or grp["label"].nunique(dropna=True) < 2:
+            ics[date] = 0.0
+            continue
         corr, _ = spearmanr(grp["pred"], grp["label"])
         ics[date] = float(corr) if not np.isnan(corr) else 0.0
 

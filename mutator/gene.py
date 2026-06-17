@@ -20,23 +20,96 @@ Formula examples
 
 from __future__ import annotations
 import copy
+import re
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-# Unary cross-sectional ops (no window)
-CS_UNARY_OPS = ("rank", "zscore", "abs", "signed_log")
+# Unary ops (no window)
+SECTOR_CS_OPS = ("sector_rank", "sector_zscore", "sector_neutralize")
+
+CS_UNARY_OPS = (
+    "rank", "zscore", "abs", "signed_log",
+    "sign", "clip", "pos_part", "neg_part",
+    "winsorize", "neutralize",
+) + SECTOR_CS_OPS
 
 # Rolling time-series ops (require a window argument)
-TS_ROLLING_OPS = ("std", "max", "min", "shift")
+TS_ROLLING_OPS = (
+    "std", "max", "min", "shift", "sum", "ema",
+    "median", "q25", "q75", "iqr", "skew", "kurt",
+    "ts_rank", "ts_zscore", "decay_linear", "slope",
+    "days_since_rolling_high", "days_since_rolling_low",
+)
+PAIR_TS_OPS = ("ts_corr", "ts_cov", "ts_beta")
+
+# Finance transforms applied to an existing expression (require a window).
+FINANCE_TS_OPS = (
+    "ret", "logret", "delta", "vol", "drawdown", "breakout", "ma_ratio",
+    "bb_pos", "bb_width", "rsi", "vol_scale", "efficiency_ratio", "ulcer_index",
+)
+
+# Finance features computed directly from OHLCV context.
+FINANCE_WINDOW_OPS = (
+    "pos", "volume_ratio", "liquidity", "atr", "stoch", "obv", "mfi", "cmf",
+    "adx", "cci", "willr", "keltner_pos", "keltner_width", "donchian_width",
+    "vwap", "vwap_pos", "amihud", "parkinson_vol", "gk_vol", "rs_vol",
+    "aroon_up", "aroon_down", "aroon_osc", "choppiness",
+)
+MARKET_WINDOW_OPS = (
+    "market_ret", "market_vol", "market_drawdown", "market_ma_ratio",
+    "market_rsi", "market_pos", "market_volume_ratio",
+    "rel_ret", "rel_strength", "market_corr", "market_beta", "market_alpha",
+    "idiosyncratic_vol", "up_capture", "down_capture",
+)
+BREADTH_NOARG_OPS = (
+    "advance_count", "decline_count", "unchanged_count",
+    "advance_ratio", "decline_ratio", "advance_decline_ratio",
+    "advance_decline_spread", "advance_decline_net_pct", "cs_dispersion",
+)
+BREADTH_WINDOW_OPS = ("pct_above_ma", "breadth_momentum")
+SECTOR_NOARG_OPS = (
+    "sector_code", "sector_size",
+    "sector_advance_count", "sector_decline_count", "sector_unchanged_count",
+    "sector_advance_ratio", "sector_decline_ratio",
+    "sector_advance_decline_ratio", "sector_advance_decline_spread",
+    "sector_advance_decline_net_pct", "sector_dispersion",
+)
+SECTOR_WINDOW_OPS = (
+    "sector_ret", "sector_vol", "sector_drawdown", "sector_ma_ratio",
+    "sector_rsi", "sector_pos", "sector_volume_ratio",
+    "rel_sector_ret", "sector_rel_strength", "sector_corr", "sector_beta",
+    "sector_alpha", "sector_idiosyncratic_vol",
+    "sector_up_capture", "sector_down_capture",
+    "sector_pct_above_ma", "sector_breadth_momentum",
+)
+FINANCE_TWO_WINDOW_OPS = ("stoch_d",)
+FINANCE_NOARG_OPS = (
+    "body", "range", "gap", "upper_wick", "lower_wick", "dollar_volume",
+    "signed_volume", "typical_price", "money_flow",
+)
+CUMULATIVE_TS_OPS = (
+    "cummax", "cummin", "cumret", "expanding_drawdown", "expanding_runup",
+    "days_since_high", "days_since_low", "cum_sum", "up_streak", "down_streak",
+)
+CUMULATIVE_NOARG_OPS = ("cum_obv", "cum_adl", "cum_pvt")
+COMPARISON_OPS = ("gt", "lt", "cross_above", "cross_below")
+CONDITIONAL_OPS = ("where", "rule_signal")
+CONSTANT_VALUES = (
+    -2.0, -1.0, -0.5, 0.0, 0.01, 0.05, 0.1, 0.2, 0.5,
+    1.0, 1.2, 1.5, 2.0, 2.5, 3.0, 5.0, 10.0, 20.0,
+    30.0, 50.0, 70.0,
+)
+CONSTANT_FORMULAS = tuple(f"const({value:g})" for value in CONSTANT_VALUES)
 
 # All unary ops visible to the mutator
-ALL_UNARY_OPS = CS_UNARY_OPS + TS_ROLLING_OPS
+ALL_UNARY_OPS = CS_UNARY_OPS + TS_ROLLING_OPS + FINANCE_TS_OPS + CUMULATIVE_TS_OPS
 
 # Binary element-wise ops
 BINARY_OPS = ("+", "-", "*", "/")
+_CONST_RE = re.compile(r'const\((-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\)')
 
 
 # ─── Gene ─────────────────────────────────────────────────────────────────────
@@ -54,6 +127,10 @@ class Gene:
         return Gene(formula=f"{base}_{window}")
 
     @staticmethod
+    def constant(value: float) -> "Gene":
+        return Gene(formula=f"const({_format_number(value)})")
+
+    @staticmethod
     def transform(gene: "Gene", op: str, window: int = 20) -> "Gene":
         """
         Apply a unary operator to a gene.
@@ -67,9 +144,12 @@ class Gene:
         if op in CS_UNARY_OPS:
             new_formula = f"{op}({gene.formula})"
             tag = f"cs_transform:{op}"
-        elif op in TS_ROLLING_OPS:
+        elif op in CUMULATIVE_TS_OPS:
+            new_formula = f"{op}({gene.formula})"
+            tag = f"cumulative_transform:{op}"
+        elif op in TS_ROLLING_OPS or op in FINANCE_TS_OPS:
             new_formula = f"{op}({gene.formula}, {window})"
-            tag = f"ts_transform:{op}_{window}"
+            tag = f"window_transform:{op}_{window}"
         else:
             raise ValueError(f"Unknown op: {op!r}")
 
@@ -88,6 +168,69 @@ class Gene:
             formula=new_formula,
             history=gene_x.history + [
                 f"combine:{gene_x.formula}{op}{gene_y.formula}"
+            ],
+        )
+
+    @staticmethod
+    def compare(gene_x: "Gene", gene_y: "Gene", op: str) -> "Gene":
+        if op not in COMPARISON_OPS:
+            raise ValueError(f"Unknown comparison op: {op!r}")
+        new_formula = f"{op}({gene_x.formula}, {gene_y.formula})"
+        return Gene(
+            formula=new_formula,
+            history=gene_x.history + [
+                f"compare:{op}({gene_x.formula},{gene_y.formula})"
+            ],
+        )
+
+    @staticmethod
+    def pair_ts(gene_x: "Gene", gene_y: "Gene", op: str, window: int) -> "Gene":
+        if op not in PAIR_TS_OPS:
+            raise ValueError(f"Unknown pair time-series op: {op!r}")
+        new_formula = f"{op}({gene_x.formula}, {gene_y.formula}, {window})"
+        return Gene(
+            formula=new_formula,
+            history=gene_x.history + [
+                f"pair_ts:{op}_{window}({gene_x.formula},{gene_y.formula})"
+            ],
+        )
+
+    @staticmethod
+    def where(cond: "Gene", true_gene: "Gene", false_gene: "Gene") -> "Gene":
+        new_formula = (
+            f"where({cond.formula}, {true_gene.formula}, {false_gene.formula})"
+        )
+        return Gene(
+            formula=new_formula,
+            history=cond.history + [f"where:{new_formula}"],
+        )
+
+    @staticmethod
+    def rule_signal(expr: "Gene", low: "Gene", high: "Gene") -> "Gene":
+        new_formula = f"rule_signal({expr.formula}, {low.formula}, {high.formula})"
+        return Gene(
+            formula=new_formula,
+            history=expr.history + [f"rule_signal:{new_formula}"],
+        )
+
+    @staticmethod
+    def mutate_constant(gene: "Gene", rng) -> Optional["Gene"]:
+        matches = list(_CONST_RE.finditer(gene.formula))
+        if not matches:
+            return None
+
+        match = matches[int(rng.integers(len(matches)))]
+        old_value = float(match.group(1))
+        scale = max(abs(old_value) * 0.15, 0.005 if abs(old_value) < 0.1 else 0.05)
+        new_value = old_value + float(rng.normal(0.0, scale))
+        if abs(new_value) < 1e-9:
+            new_value = 0.0
+        new_const = f"const({_format_number(new_value)})"
+        new_formula = gene.formula[:match.start()] + new_const + gene.formula[match.end():]
+        return Gene(
+            formula=new_formula,
+            history=gene.history + [
+                f"mutate_const:{old_value:g}->{_format_number(new_value)}"
             ],
         )
 
@@ -112,7 +255,8 @@ class Gene:
             )
 
         # Case 2: rolling fn  op(inner, N)
-        m = re.match(r'^(std|max|min|shift)\((.+),\s*\d+\)$', gene.formula)
+        window_fns = "|".join(TS_ROLLING_OPS + FINANCE_TS_OPS)
+        m = re.match(rf'^({window_fns})\((.+),\s*\d+\)$', gene.formula)
         if m:
             fn, inner = m.group(1), m.group(2)
             new_formula = f"{fn}({inner}, {new_window})"
@@ -122,6 +266,42 @@ class Gene:
             )
 
         # Case 2b: already window-tagged  (expr)_wN → replace N
+        context_fns = "|".join(
+            FINANCE_WINDOW_OPS + MARKET_WINDOW_OPS
+            + BREADTH_WINDOW_OPS + SECTOR_WINDOW_OPS
+        )
+        m_ctx = re.match(rf'^({context_fns})\(\s*\d+\s*\)$', gene.formula)
+        if m_ctx:
+            fn = m_ctx.group(1)
+            new_formula = f"{fn}({new_window})"
+            return Gene(
+                formula=new_formula,
+                history=gene.history + [f"window:{gene.formula}â†’{new_formula}"],
+            )
+
+        two_window_fns = "|".join(FINANCE_TWO_WINDOW_OPS)
+        m_two_ctx = re.match(
+            rf'^({two_window_fns})\(\s*\d+\s*,\s*(\d+)\s*\)$',
+            gene.formula,
+        )
+        if m_two_ctx:
+            fn, smooth_window = m_two_ctx.group(1), m_two_ctx.group(2)
+            new_formula = f"{fn}({new_window}, {smooth_window})"
+            return Gene(
+                formula=new_formula,
+                history=gene.history + [f"window:{gene.formula}->{new_formula}"],
+            )
+
+        pair_window_fns = "|".join(PAIR_TS_OPS)
+        m_pair = re.match(rf'^({pair_window_fns})\((.+),\s*\d+\)$', gene.formula)
+        if m_pair:
+            fn, inner = m_pair.group(1), m_pair.group(2)
+            new_formula = f"{fn}({inner}, {new_window})"
+            return Gene(
+                formula=new_formula,
+                history=gene.history + [f"window:{gene.formula}->{new_formula}"],
+            )
+
         m2 = re.match(r'^\((.+)\)_w\d+$', gene.formula)
         if m2:
             inner = m2.group(1)
@@ -156,16 +336,12 @@ def _is_fully_wrapped(formula: str) -> bool:
                 return False
     return depth == 0
 
-    # ── Utils ─────────────────────────────────────────────────────────────────
 
-    def __eq__(self, other):
-        return isinstance(other, Gene) and self.formula == other.formula
+def _format_number(value: float) -> str:
+    if abs(value) < 1e-12:
+        value = 0.0
+    return f"{value:.6g}"
 
-    def __hash__(self):
-        return hash(self.formula)
-
-    def __repr__(self):
-        return f"Gene({self.formula!r})"
 
 
 # ─── Individual ───────────────────────────────────────────────────────────────

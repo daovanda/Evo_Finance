@@ -75,6 +75,7 @@ def _sanitize_col_name(formula: str) -> str:
 def build_feature_matrix(
     individual: Individual,
     df: pd.DataFrame,
+    target_index: pd.Index | None = None,
 ) -> pd.DataFrame:
     """
     Evaluate each gene formula on df and return a DataFrame of features.
@@ -94,7 +95,22 @@ def build_feature_matrix(
         except Exception as exc:
             logger.warning("Gene eval failed: %r — %s", gene.formula, exc)
     feat_df = pd.DataFrame(cols, index=df.index)
+    if target_index is not None:
+        feat_df = feat_df.loc[target_index]
     return feat_df
+
+
+def clean_feature_matrix(feat_df: pd.DataFrame) -> pd.DataFrame:
+    """Keep LightGBM-compatible missing values without dropping rows."""
+    return feat_df.replace([np.inf, -np.inf], np.nan)
+
+
+def _feature_context(*dfs: pd.DataFrame) -> pd.DataFrame:
+    """Combine splits only as past/current feature context; labels are unused."""
+    frames = [df for df in dfs if df is not None and not df.empty]
+    if not frames:
+        raise ValueError("No data available for feature context.")
+    return pd.concat(frames).sort_index()
 
 
 def _group_sizes(df: pd.DataFrame) -> List[int]:
@@ -121,6 +137,7 @@ class Trainer:
         individual: Individual,
         train_df: pd.DataFrame,
         val_df: pd.DataFrame,
+        feature_df: pd.DataFrame | None = None,
     ) -> Tuple["lgb.Booster", pd.Series, pd.Series, pd.Series, pd.Series]:
         """
         Train LightGBM on *individual*'s features.
@@ -134,15 +151,23 @@ class Trainer:
         val_labels     : ground-truth labels (val)
         """
         # ── Build feature matrices ────────────────────────────────────────────
-        X_train = build_feature_matrix(individual, train_df)
-        X_val   = build_feature_matrix(individual, val_df)
+        context_df = feature_df if feature_df is not None else _feature_context(
+            train_df, val_df
+        )
+        X_all = clean_feature_matrix(build_feature_matrix(individual, context_df))
+        X_train = X_all.loc[train_df.index]
+        X_val   = X_all.loc[val_df.index]
+
+        if X_train.shape[1] == 0 or X_val.shape[1] == 0:
+            raise ValueError("Empty feature matrix: no valid gene columns.")
 
         train_labels = train_df["label"]
         val_labels   = val_df["label"]
 
-        # drop rows where any feature or label is NaN
-        train_mask = X_train.notna().all(axis=1) & train_labels.notna()
-        val_mask   = X_val.notna().all(axis=1)   & val_labels.notna()
+        # LightGBM handles NaN features natively. Only drop rows without labels
+        # so each date keeps the full stock universe whenever labels exist.
+        train_mask = train_labels.notna()
+        val_mask   = val_labels.notna()
 
         X_train, y_train = X_train[train_mask], train_labels[train_mask]
         X_val,   y_val   = X_val[val_mask],     val_labels[val_mask]
@@ -198,11 +223,13 @@ class Trainer:
         booster: "lgb.Booster",
         individual: Individual,
         df: pd.DataFrame,
+        feature_df: pd.DataFrame | None = None,
     ) -> pd.Series:
         """Run inference on an arbitrary split (e.g. test set)."""
-        X = build_feature_matrix(individual, df)
-        mask = X.notna().all(axis=1)
-        preds = booster.predict(X[mask])
-        out = pd.Series(np.nan, index=df.index, name="pred")
-        out[mask] = preds
-        return out
+        context_df = feature_df if feature_df is not None else df
+        X = clean_feature_matrix(
+            build_feature_matrix(individual, context_df, target_index=df.index)
+        )
+        if X.shape[1] == 0:
+            raise ValueError("Empty feature matrix: no valid gene columns.")
+        return pd.Series(booster.predict(X), index=df.index, name="pred")
