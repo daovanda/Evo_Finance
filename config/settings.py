@@ -36,9 +36,9 @@ LABEL_FN: Callable = default_label
 # Walk-forward folds used inside the evolutionary loop. Final validation/test
 # still use VAL_START / TEST_START / TEST_END after the time budget ends.
 WF_END: str = TEST_START
-WF_MIN_TRAIN_MONTHS: int = 48
-WF_VAL_MONTHS: int = 12
-WF_STEP_MONTHS: int = 12
+WF_MIN_TRAIN_MONTHS: int = 36
+WF_VAL_MONTHS: int = 6
+WF_STEP_MONTHS: int = 6
 WF_PURGE_DAYS: int = HOLDING_HORIZON
 
 # ─── Feature limits ───────────────────────────────────────────────────────────

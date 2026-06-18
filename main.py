@@ -31,7 +31,7 @@ from config.settings import (
     WF_END, WF_MIN_TRAIN_MONTHS, WF_VAL_MONTHS,
     WF_STEP_MONTHS, WF_PURGE_DAYS, DOMAIN_PRECOMPUTE_ON_START,
 )
-from mutator.gene       import Individual
+from mutator.gene       import Gene, Individual
 from mutator.domain     import Domain
 from mutator.mutator    import Mutator
 from model.trainer      import Trainer
@@ -69,6 +69,7 @@ def run(
     wf_val_months:   int   = WF_VAL_MONTHS,
     wf_step_months:  int   = WF_STEP_MONTHS,
     wf_purge_days:   int   = WF_PURGE_DAYS,
+    resume_archive:  Optional[Path] = None,
 ) -> Archive:
     """
     Run the evolutionary loop and return the final Archive.
@@ -140,13 +141,29 @@ def run(
     evaluator = FitnessEvaluator()
     archive   = Archive()
 
+    if resume_archive is not None:
+        _load_archive_json_into_archive(
+            resume_archive,
+            archive,
+            trainer,
+            evaluator,
+            wf_folds,
+            wf_feature_df,
+        )
+
     # ── First individual: raw OHLCV ───────────────────────────────────────────
-    logger.info("Evaluating seed individual (raw OHLCV) …")
-    seed_ind = Individual.seed(window=DEFAULT_WINDOW)
-    _evaluate_and_archive_wf(
-        seed_ind, trainer, evaluator, archive,
-        wf_folds, wf_feature_df,
-    )
+    if archive.is_empty():
+        logger.info("Evaluating seed individual (raw OHLCV) ...")
+        seed_ind = Individual.seed(window=DEFAULT_WINDOW)
+        _evaluate_and_archive_wf(
+            seed_ind, trainer, evaluator, archive,
+            wf_folds, wf_feature_df,
+        )
+    else:
+        logger.info(
+            "Resume archive loaded with %d entries; continuing evolution.",
+            len(archive),
+        )
 
     # ── Evolutionary loop ─────────────────────────────────────────────────────
     iteration = 0
@@ -249,6 +266,66 @@ def _evaluate_and_archive_wf(
         return False
 
     return archive.try_add(individual, last_booster)
+
+
+def _load_archive_json_into_archive(
+    path: Path,
+    archive: Archive,
+    trainer: Trainer,
+    evaluator: FitnessEvaluator,
+    wf_folds,
+    feature_df: pd.DataFrame,
+) -> None:
+    """Re-evaluate archive JSON genes so evolution can continue from them."""
+    path = Path(path)
+    with open(path, "r") as f:
+        rows = json.load(f)
+    if not isinstance(rows, list):
+        raise ValueError(f"Resume archive must be a JSON list: {path}")
+
+    loaded = 0
+    skipped = 0
+    logger.info(
+        "Loading resume archive from %s (%d entries); re-evaluating with current WF ...",
+        path,
+        len(rows),
+    )
+
+    for row in rows:
+        try:
+            individual = _archive_row_to_individual(row)
+            admitted = _evaluate_and_archive_wf(
+                individual,
+                trainer,
+                evaluator,
+                archive,
+                wf_folds,
+                feature_df,
+            )
+            loaded += int(admitted)
+        except Exception as exc:
+            skipped += 1
+            logger.warning("Resume: skipped invalid archive entry: %s", exc)
+
+    logger.info(
+        "Resume archive ready: loaded=%d skipped=%d archive_size=%d best=%.4f",
+        loaded,
+        skipped,
+        len(archive),
+        archive.best.score if archive.best else float("nan"),
+    )
+
+
+def _archive_row_to_individual(row: dict) -> Individual:
+    formulas = row.get("genes")
+    if not isinstance(formulas, list) or not formulas:
+        raise ValueError("archive row has no genes list")
+    genes = [Gene(formula=str(formula)) for formula in formulas]
+    generation = int(row.get("generation") or 0)
+    return Individual(
+        genes=genes,
+        generation=generation,
+    )
 
 
 def _final_evaluate_archive(
@@ -474,6 +551,13 @@ if __name__ == "__main__":
 
     # ── Ngày split ───────────────────────────────────────────────────────────
     parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Load archive JSON da luu, danh gia lai bang WF hien tai, roi chay tiep.",
+    )
+    parser.add_argument(
         "--val-start",
         type=str,
         default=VAL_START,
@@ -514,6 +598,7 @@ if __name__ == "__main__":
         df = _load_data(args.data)
 
     save_path = Path(args.save) if args.save else None
+    resume_path = Path(args.resume) if args.resume else None
     run(
         df           = df,
         time_budget  = args.budget,
@@ -523,4 +608,5 @@ if __name__ == "__main__":
         val_start    = args.val_start,
         test_start   = args.test_start,
         test_end     = args.test_end,
+        resume_archive = resume_path,
     )

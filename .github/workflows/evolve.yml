@@ -1,0 +1,108 @@
+name: Evo Finance Evolution
+
+on:
+  workflow_dispatch:
+    inputs:
+      budget_seconds:
+        description: "Evolution time budget in seconds. Keep <= 20400 on GitHub-hosted runners."
+        required: true
+        default: "16200"
+      seed:
+        description: "Random seed for evolution."
+        required: true
+        default: "42"
+      resume_archive:
+        description: "Optional archive JSON path to resume from, for example results/archive_test8_test7_wf_resumex2.json"
+        required: false
+        default: ""
+      output_name:
+        description: "Output archive file name under results/. Leave empty for archive_<run_id>.json"
+        required: false
+        default: ""
+      run_tests:
+        description: "Run unit tests before evolution"
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  evolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Prepare output paths
+        env:
+          OUTPUT_NAME_INPUT: ${{ inputs.output_name }}
+        run: |
+          mkdir -p results
+          if [ -n "$OUTPUT_NAME_INPUT" ]; then
+            output_name="$OUTPUT_NAME_INPUT"
+          else
+            output_name="archive_${GITHUB_RUN_ID}.json"
+          fi
+          echo "OUTPUT_NAME=$output_name" >> "$GITHUB_ENV"
+          echo "OUTPUT_PATH=results/$output_name" >> "$GITHUB_ENV"
+
+      - name: Validate runtime budget
+        env:
+          BUDGET_SECONDS: ${{ inputs.budget_seconds }}
+          SEED: ${{ inputs.seed }}
+        run: |
+          if ! [[ "$BUDGET_SECONDS" =~ ^[0-9]+$ ]]; then
+            echo "::error::budget_seconds must be an integer number of seconds."
+            exit 1
+          fi
+          if [ "$BUDGET_SECONDS" -gt 20400 ]; then
+            echo "::error::budget_seconds must be <= 20400 so final evaluation and artifact upload have time before the 6-hour job limit."
+            exit 1
+          fi
+          if ! [[ "$SEED" =~ ^[0-9]+$ ]]; then
+            echo "::error::seed must be a non-negative integer."
+            exit 1
+          fi
+
+      - name: Run tests
+        if: ${{ inputs.run_tests }}
+        run: python -m unittest discover -s tests
+
+      - name: Run evolution
+        env:
+          BUDGET_SECONDS: ${{ inputs.budget_seconds }}
+          SEED: ${{ inputs.seed }}
+          RESUME_ARCHIVE: ${{ inputs.resume_archive }}
+        run: |
+          cmd=(python main.py --data-dir data/raw --budget "$BUDGET_SECONDS" --seed "$SEED" --save "$OUTPUT_PATH")
+          if [ -n "$RESUME_ARCHIVE" ]; then
+            cmd+=(--resume "$RESUME_ARCHIVE")
+          fi
+          printf 'Running:'
+          printf ' %q' "${cmd[@]}"
+          printf '\n'
+          set -o pipefail
+          "${cmd[@]}" 2>&1 | tee results/evolution.log
+
+      - name: Upload archive artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evo-finance-results-${{ github.run_id }}
+          path: |
+            ${{ env.OUTPUT_PATH }}
+            results/evolution.log
+          if-no-files-found: warn
+          retention-days: 14
