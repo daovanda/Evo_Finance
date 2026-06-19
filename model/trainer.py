@@ -15,7 +15,7 @@ The caller (main loop) is responsible for supplying pre-split DataFrames:
 
 from __future__ import annotations
 import logging
-from typing import List, Tuple
+from typing import Hashable, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -81,6 +81,8 @@ def build_feature_matrix(
     individual: Individual,
     df: pd.DataFrame,
     target_index: pd.Index | None = None,
+    feature_cache: dict[tuple[Hashable, str], pd.Series] | None = None,
+    context_key: Hashable | None = None,
 ) -> pd.DataFrame:
     """
     Evaluate each gene formula on df and return a DataFrame of features.
@@ -90,7 +92,16 @@ def build_feature_matrix(
     col_map = {}   # sanitized_name → formula (for debug)
     for gene in individual.genes:
         try:
-            series = evaluate(gene.formula, df)
+            cache_key = (
+                (context_key, gene.formula)
+                if feature_cache is not None and context_key is not None
+                else None
+            )
+            series = feature_cache.get(cache_key) if cache_key is not None else None
+            if series is None:
+                series = evaluate(gene.formula, df)
+                if cache_key is not None:
+                    feature_cache[cache_key] = series
             safe_name = _sanitize_col_name(gene.formula)
             # handle rare collision after sanitize
             if safe_name in cols:
@@ -103,6 +114,32 @@ def build_feature_matrix(
     if target_index is not None:
         feat_df = feat_df.loc[target_index]
     return feat_df
+
+
+def _index_boundary_key(index: pd.Index):
+    if len(index) == 0:
+        return None, None
+    return index[0], index[-1]
+
+
+def _dataframe_context_key(df: pd.DataFrame) -> tuple:
+    """
+    Key feature cache by DataFrame identity and index shape.
+
+    The evolutionary pipeline treats these context frames as immutable. Including
+    the object and index identities prevents WF/full-final contexts from sharing
+    cached feature values even when their date ranges overlap.
+    """
+    first, last = _index_boundary_key(df.index)
+    return (
+        id(df),
+        id(df.index),
+        len(df),
+        tuple(df.index.names),
+        tuple(df.columns),
+        first,
+        last,
+    )
 
 
 def clean_feature_matrix(feat_df: pd.DataFrame) -> pd.DataFrame:
@@ -150,6 +187,63 @@ def _training_config(mode: str) -> tuple[dict, int, int]:
 class Trainer:
     """Stateless helper; instantiate per evolutionary run or share across runs."""
 
+    def __init__(
+        self,
+        enable_feature_cache: bool = True,
+        enable_split_cache: bool = True,
+    ):
+        self.enable_feature_cache = enable_feature_cache
+        self.enable_split_cache = enable_split_cache
+        self._feature_cache: dict[tuple[Hashable, str], pd.Series] = {}
+        self._split_cache: dict[tuple, tuple[pd.Series, List[int]]] = {}
+
+    def clear_caches(self) -> None:
+        """Drop cached feature values and split metadata."""
+        self._feature_cache.clear()
+        self._split_cache.clear()
+
+    def _build_feature_matrix(
+        self,
+        individual: Individual,
+        context_df: pd.DataFrame,
+        target_index: pd.Index | None = None,
+    ) -> pd.DataFrame:
+        context_key = _dataframe_context_key(context_df)
+        feature_cache = self._feature_cache if self.enable_feature_cache else None
+        return build_feature_matrix(
+            individual,
+            context_df,
+            target_index=target_index,
+            feature_cache=feature_cache,
+            context_key=context_key,
+        )
+
+    def _labels_and_groups(
+        self,
+        split_df: pd.DataFrame,
+        labels: pd.Series,
+        mask: pd.Series,
+    ) -> tuple[pd.Series, List[int]]:
+        split_key = (
+            id(split_df),
+            id(split_df.index),
+            len(split_df),
+            int(mask.sum()),
+            _index_boundary_key(split_df.index),
+        )
+        if self.enable_split_cache:
+            cached = self._split_cache.get(split_key)
+            if cached is not None:
+                return cached
+
+        masked_df = split_df[mask]
+        masked_labels = labels[mask]
+        y_int = _bin_labels(masked_labels, masked_df)
+        groups = _group_sizes(masked_df)
+        if self.enable_split_cache:
+            self._split_cache[split_key] = (y_int, groups)
+        return y_int, groups
+
     def train(
         self,
         individual: Individual,
@@ -175,7 +269,7 @@ class Trainer:
         context_df = feature_df if feature_df is not None else _feature_context(
             train_df, val_df
         )
-        X_all = clean_feature_matrix(build_feature_matrix(individual, context_df))
+        X_all = clean_feature_matrix(self._build_feature_matrix(individual, context_df))
         X_train = X_all.loc[train_df.index]
         X_val   = X_all.loc[val_df.index]
 
@@ -199,11 +293,12 @@ class Trainer:
         # ── LightGBM datasets ─────────────────────────────────────────────────
         # lambdarank requires integer relevance labels (0, 1, 2, …)
         # We bin continuous returns into N_RELEVANCE_BINS grades per date.
-        y_train_int = _bin_labels(y_train, train_df[train_mask])
-        y_val_int   = _bin_labels(y_val,   val_df[val_mask])
-
-        train_groups = _group_sizes(train_df[train_mask])
-        val_groups   = _group_sizes(val_df[val_mask])
+        y_train_int, train_groups = self._labels_and_groups(
+            train_df, train_labels, train_mask
+        )
+        y_val_int, val_groups = self._labels_and_groups(
+            val_df, val_labels, val_mask
+        )
 
         lgb_train = lgb.Dataset(
             X_train, label=y_train_int, group=train_groups, free_raw_data=False
@@ -249,7 +344,7 @@ class Trainer:
         """Run inference on an arbitrary split (e.g. test set)."""
         context_df = feature_df if feature_df is not None else df
         X = clean_feature_matrix(
-            build_feature_matrix(individual, context_df, target_index=df.index)
+            self._build_feature_matrix(individual, context_df, target_index=df.index)
         )
         if X.shape[1] == 0:
             raise ValueError("Empty feature matrix: no valid gene columns.")
