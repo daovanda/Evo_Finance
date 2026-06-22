@@ -173,7 +173,7 @@ def run(
     checkpoint_path = _checkpoint_path(save_archive)
     last_checkpoint = t_start
     if checkpoint_path is not None and not archive.is_empty():
-        _try_save_checkpoint(archive, checkpoint_path, "initial")
+        _try_save_checkpoint(archive, checkpoint_path, "initial", trainer)
 
     while time.time() - t_start < time_budget:
         iteration += 1
@@ -219,11 +219,12 @@ def run(
             last_checkpoint,
             checkpoint_every,
             time.time(),
+            trainer,
         )
 
     # ── Test-set evaluation for all archived individuals ──────────────────────
     if checkpoint_path is not None and not archive.is_empty():
-        _try_save_checkpoint(archive, checkpoint_path, "pre-final")
+        _try_save_checkpoint(archive, checkpoint_path, "pre-final", trainer)
 
     logger.info("=== Time budget exhausted. Running final validation/test evaluation ... ===")
     _final_evaluate_archive(
@@ -473,20 +474,29 @@ def _maybe_save_checkpoint(
     last_checkpoint: float,
     checkpoint_every: float,
     now: float,
+    trainer: Optional[Trainer] = None,
 ) -> float:
     if path is None or checkpoint_every <= 0 or archive.is_empty():
         return last_checkpoint
     if now - last_checkpoint < checkpoint_every:
         return last_checkpoint
-    if _try_save_checkpoint(archive, path, "periodic"):
+    if _try_save_checkpoint(archive, path, "periodic", trainer):
         return now
     return last_checkpoint
 
 
-def _try_save_checkpoint(archive: Archive, path: Path, reason: str) -> bool:
+def _try_save_checkpoint(
+    archive: Archive,
+    path: Path,
+    reason: str,
+    trainer: Optional[Trainer] = None,
+) -> bool:
     try:
         _save_json(archive, path)
         logger.info("Checkpoint saved (%s) to %s", reason, path)
+        if trainer is not None:
+            trainer.clear_caches()
+            logger.info("Trainer caches cleared after checkpoint (%s).", reason)
         return True
     except Exception as exc:
         logger.warning("Checkpoint save failed (%s): %s", reason, exc)

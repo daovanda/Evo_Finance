@@ -5,6 +5,7 @@ from pathlib import Path
 
 from archive.archive import Archive
 from main import _checkpoint_path, _maybe_save_checkpoint
+from model.trainer import Trainer
 from mutator.gene import Individual
 
 
@@ -36,6 +37,9 @@ class CheckpointTests(unittest.TestCase):
 
     def test_maybe_save_checkpoint_respects_interval(self):
         archive = _archive_with_one_entry()
+        trainer = Trainer()
+        trainer._feature_cache[("ctx", "close_1")] = object()
+        trainer._split_cache[("split",)] = (object(), [1])
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "archive.checkpoint.json"
 
@@ -45,9 +49,12 @@ class CheckpointTests(unittest.TestCase):
                 last_checkpoint=0.0,
                 checkpoint_every=100.0,
                 now=50.0,
+                trainer=trainer,
             )
             self.assertEqual(last, 0.0)
             self.assertFalse(path.exists())
+            self.assertEqual(len(trainer._feature_cache), 1)
+            self.assertEqual(len(trainer._split_cache), 1)
 
             last = _maybe_save_checkpoint(
                 archive,
@@ -55,9 +62,12 @@ class CheckpointTests(unittest.TestCase):
                 last_checkpoint=0.0,
                 checkpoint_every=100.0,
                 now=100.0,
+                trainer=trainer,
             )
             self.assertEqual(last, 100.0)
             self.assertTrue(path.exists())
+            self.assertEqual(trainer._feature_cache, {})
+            self.assertEqual(trainer._split_cache, {})
 
             rows = json.loads(path.read_text())
             self.assertEqual(len(rows), 1)
