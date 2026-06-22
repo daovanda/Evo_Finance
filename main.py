@@ -30,6 +30,7 @@ from config.settings import (
     VAL_START, TEST_START, TEST_END,
     WF_END, WF_MIN_TRAIN_MONTHS, WF_VAL_MONTHS,
     WF_STEP_MONTHS, WF_PURGE_DAYS, DOMAIN_PRECOMPUTE_ON_START,
+    CHECKPOINT_EVERY_SECONDS,
 )
 from mutator.gene       import Gene, Individual
 from mutator.domain     import Domain
@@ -70,6 +71,7 @@ def run(
     wf_step_months:  int   = WF_STEP_MONTHS,
     wf_purge_days:   int   = WF_PURGE_DAYS,
     resume_archive:  Optional[Path] = None,
+    checkpoint_every: float = CHECKPOINT_EVERY_SECONDS,
 ) -> Archive:
     """
     Run the evolutionary loop and return the final Archive.
@@ -168,6 +170,10 @@ def run(
     # ── Evolutionary loop ─────────────────────────────────────────────────────
     iteration = 0
     t_start   = time.time()
+    checkpoint_path = _checkpoint_path(save_archive)
+    last_checkpoint = t_start
+    if checkpoint_path is not None and not archive.is_empty():
+        _try_save_checkpoint(archive, checkpoint_path, "initial")
 
     while time.time() - t_start < time_budget:
         iteration += 1
@@ -207,8 +213,18 @@ def run(
             "Result: score=%.4f | admitted=%s | archive_size=%d | best=%.4f",
             child.score or float("nan"), admitted, len(archive), best_score,
         )
+        last_checkpoint = _maybe_save_checkpoint(
+            archive,
+            checkpoint_path,
+            last_checkpoint,
+            checkpoint_every,
+            time.time(),
+        )
 
     # ── Test-set evaluation for all archived individuals ──────────────────────
+    if checkpoint_path is not None and not archive.is_empty():
+        _try_save_checkpoint(archive, checkpoint_path, "pre-final")
+
     logger.info("=== Time budget exhausted. Running final validation/test evaluation ... ===")
     _final_evaluate_archive(
         archive, trainer, train_df, val_df, test_df, final_feature_df
@@ -442,6 +458,41 @@ def _fmt_metric(value) -> str:
         return "nan"
 
 
+def _checkpoint_path(save_archive: Optional[Path]) -> Optional[Path]:
+    if save_archive is None:
+        return None
+    path = Path(save_archive)
+    if path.suffix:
+        return path.with_name(f"{path.stem}.checkpoint{path.suffix}")
+    return path.with_name(f"{path.name}.checkpoint.json")
+
+
+def _maybe_save_checkpoint(
+    archive: Archive,
+    path: Optional[Path],
+    last_checkpoint: float,
+    checkpoint_every: float,
+    now: float,
+) -> float:
+    if path is None or checkpoint_every <= 0 or archive.is_empty():
+        return last_checkpoint
+    if now - last_checkpoint < checkpoint_every:
+        return last_checkpoint
+    if _try_save_checkpoint(archive, path, "periodic"):
+        return now
+    return last_checkpoint
+
+
+def _try_save_checkpoint(archive: Archive, path: Path, reason: str) -> bool:
+    try:
+        _save_json(archive, path)
+        logger.info("Checkpoint saved (%s) to %s", reason, path)
+        return True
+    except Exception as exc:
+        logger.warning("Checkpoint save failed (%s): %s", reason, exc)
+        return False
+
+
 def _save_json(archive: Archive, path: Path) -> None:
     rows = archive.summary()
     # make serialisable
@@ -548,6 +599,17 @@ if __name__ == "__main__":
         metavar="PATH",
         help="Lưu kết quả archive ra file JSON. Ví dụ: --save results/archive.json",
     )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=float,
+        default=CHECKPOINT_EVERY_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "Luu checkpoint archive dinh ky neu co --save. "
+            f"Mac dinh: {CHECKPOINT_EVERY_SECONDS:.0f} giay (12 gio). "
+            "Dat 0 de tat."
+        ),
+    )
 
     # ── Ngày split ───────────────────────────────────────────────────────────
     parser.add_argument(
@@ -609,4 +671,5 @@ if __name__ == "__main__":
         test_start   = args.test_start,
         test_end     = args.test_end,
         resume_archive = resume_path,
+        checkpoint_every = args.checkpoint_every,
     )

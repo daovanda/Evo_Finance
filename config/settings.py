@@ -139,6 +139,7 @@ LGBM_FINAL_EARLY_STOPPING: int = 30
 # ─── Time budget ──────────────────────────────────────────────────────────────
 
 TIME_BUDGET_SECONDS: float = 3600.0   # 1 hour default
+CHECKPOINT_EVERY_SECONDS: float = 12 * 60 * 60  # autosave archive every 12h
 
 # ─── Hit-rate ─────────────────────────────────────────────────────────────────
 
