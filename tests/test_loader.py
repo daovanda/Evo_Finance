@@ -45,6 +45,24 @@ class LoaderVNIndexTests(unittest.TestCase):
                 self.assertFalse(df[col].isna().any())
             self.assertNotIn("VNINDEX", df.index.get_level_values("ticker"))
 
+    def test_load_from_dir_can_use_configurable_market_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stock_dates = pd.date_range("2024-01-01", periods=12)
+            market_dates = pd.date_range("2024-01-03", periods=10)
+            _write_ohlcv(root / "AAA.csv", stock_dates, 10.0)
+            _write_ohlcv(root / "BBB.csv", stock_dates, 20.0)
+            _write_ohlcv(root / "VNINDEX.csv", market_dates, 1000.0)
+            _write_ohlcv(root / "VN30.csv", market_dates, 2000.0)
+
+            df = load_from_dir(root, min_rows=1, market_index_ticker="VN30")
+
+            tickers = df.index.get_level_values("ticker").unique().tolist()
+            self.assertEqual(tickers, ["AAA", "BBB"])
+            self.assertNotIn("VNINDEX", tickers)
+            self.assertNotIn("VN30", tickers)
+            self.assertAlmostEqual(float(df["market_close"].iloc[0]), 2000.5)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,7 +14,7 @@ import numpy as np
 # TEST  : TEST_START   → TEST_END    (inclusive, None = hết data)
 
 VAL_START:  str = "2023-05-12"   # ngày đầu tiên của val  = ngày kết thúc train
-TEST_START: str = "2024-07-29"   # ngày đầu tiên của test = ngày kết thúc val
+TEST_START: str = "2025-01-01"   # 2024-07-29 ngày đầu tiên của test = ngày kết thúc val
 TEST_END:   str | None = None    # ngày cuối test (None = hết data)
 
 # ─── Holding horizon ──────────────────────────────────────────────────────────
@@ -59,6 +59,10 @@ DOMAIN_PRECOMPUTE_ON_START: bool = True
 WINDOWS: List[int] = [3, 5, 10, 14, 20, 30, 60, 120]
 
 DEFAULT_WINDOW: int = 1            # initial {O,H,C,L,V} window
+
+# CSV ticker used as the broad market benchmark. The loader reads
+# data/raw/{MARKET_INDEX_TICKER}.csv and exposes it as market_* columns.
+MARKET_INDEX_TICKER: str = "VNINDEX"
 
 # Edit this mapping before each run if you want a different sector universe.
 # Tickers are matched case-insensitively by the evaluator.

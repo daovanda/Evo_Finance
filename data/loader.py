@@ -23,6 +23,8 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 
+from config.settings import MARKET_INDEX_TICKER
+
 logger = logging.getLogger(__name__)
 
 # Ticker bị drop nếu tỉ lệ ngày thiếu vượt ngưỡng này
@@ -30,6 +32,7 @@ MISSING_DAY_THRESHOLD: float = 0.90   # 30 %
 
 # Cột OHLCV bắt buộc (không tính is_trading_day)
 _REQUIRED_COLS = ["open", "high", "low", "close", "volume"]
+_KNOWN_INDEX_TICKERS = {"VNINDEX", "VN30", "VN30INDEX", "HNXINDEX", "UPCOMINDEX"}
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
@@ -40,6 +43,7 @@ def load_from_dir(
     min_rows:  int = 100,
     ffill_prices: bool = True,
     include_vnindex: bool = True,
+    market_index_ticker: str | None = None,
 ) -> pd.DataFrame:
     """
     Load và merge tất cả file CSV trong data_dir thành MultiIndex DataFrame.
@@ -63,8 +67,14 @@ def load_from_dir(
         raise FileNotFoundError(f"data_dir không tồn tại: {data_dir}")
 
     # ── Tìm files ─────────────────────────────────────────────────────────────
+    market_ticker = _normalize_market_index_ticker(market_index_ticker)
+    index_tickers = _index_tickers_to_exclude(market_ticker)
+
     if tickers is not None:
-        stock_tickers = [t for t in tickers if t.upper() != "VNINDEX"]
+        stock_tickers = [
+            t for t in tickers
+            if t.upper() not in index_tickers
+        ]
         csv_files = [data_dir / f"{t}.csv" for t in stock_tickers]
         missing   = [f for f in csv_files if not f.exists()]
         if missing:
@@ -73,7 +83,7 @@ def load_from_dir(
     else:
         csv_files = sorted(data_dir.glob("*.csv"))
         # Loại VNINDEX khỏi universe cổ phiếu (dùng riêng nếu cần)
-        csv_files = [f for f in csv_files if f.stem.upper() != "VNINDEX"]
+        csv_files = [f for f in csv_files if f.stem.upper() not in index_tickers]
 
     if not csv_files:
         raise ValueError(f"Không tìm thấy file CSV nào trong {data_dir}")
@@ -93,23 +103,24 @@ def load_from_dir(
 
     logger.info("Load thành công %d / %d ticker.", len(frames), len(csv_files))
 
-    vnindex_df: Optional[pd.DataFrame] = None
-    if include_vnindex:
-        vnindex_df = load_vnindex(data_dir)
-        if vnindex_df is not None:
+    market_index_df: Optional[pd.DataFrame] = None
+    if include_vnindex and market_ticker is not None:
+        market_index_df = load_market_index(data_dir, market_ticker)
+        if market_index_df is not None:
             logger.info(
-                "Load VNINDEX: %d rows, %s -> %s",
-                len(vnindex_df),
-                vnindex_df.index.min().date(),
-                vnindex_df.index.max().date(),
+                "Load market index %s: %d rows, %s -> %s",
+                market_ticker,
+                len(market_index_df),
+                market_index_df.index.min().date(),
+                market_index_df.index.max().date(),
             )
 
     # ── INTERSECTION: chỉ giữ ngày TẤT CẢ ticker đều có giao dịch thực ──────
     # UNION sẽ tạo ffill noise ở ngày 1 ticker bị suspend/halted
     # INTERSECTION đảm bảo mỗi hàng là dữ liệu thực, không có giá giả
     date_sets = [set(df.index) for df in frames.values()]
-    if vnindex_df is not None:
-        date_sets.append(set(vnindex_df.index))
+    if market_index_df is not None:
+        date_sets.append(set(market_index_df.index))
     all_dates = sorted(set.intersection(*date_sets))
     all_dates = pd.DatetimeIndex(all_dates)
 
@@ -164,10 +175,10 @@ def load_from_dir(
     combined = combined.swaplevel().sort_index()             # (date, ticker)
     combined.index.names = ["date", "ticker"]
 
-    if vnindex_df is not None:
-        market_df = vnindex_df.reindex(all_dates).add_prefix("market_")
+    if market_index_df is not None:
+        market_df = market_index_df.reindex(all_dates).add_prefix("market_")
         if market_df["market_close"].isna().any():
-            raise ValueError("VNINDEX con NaN sau khi intersection theo ngay.")
+            raise ValueError(f"{market_ticker} con NaN sau khi intersection theo ngay.")
         combined = combined.join(market_df, on="date")
 
     # Drop các dòng vẫn còn NaN ở close (đầu chuỗi trước khi ticker có data)
@@ -234,6 +245,37 @@ def _load_single(
 
 
 # ─── Convenience: load VNINDEX riêng ─────────────────────────────────────────
+
+def _normalize_market_index_ticker(ticker: str | None = None) -> str | None:
+    ticker = MARKET_INDEX_TICKER if ticker is None else ticker
+    if ticker is None:
+        return None
+    ticker = str(ticker).strip().upper()
+    return ticker or None
+
+
+def _index_tickers_to_exclude(market_ticker: str | None) -> set[str]:
+    tickers = set(_KNOWN_INDEX_TICKERS)
+    if market_ticker is not None:
+        tickers.add(market_ticker)
+    return tickers
+
+
+def load_market_index(
+    data_dir: str | Path,
+    ticker: str | None = None,
+) -> Optional[pd.DataFrame]:
+    """Load the configured market benchmark as a flat date-indexed DataFrame."""
+    market_ticker = _normalize_market_index_ticker(ticker)
+    if market_ticker is None:
+        return None
+
+    fpath = Path(data_dir) / f"{market_ticker}.csv"
+    if not fpath.exists():
+        logger.warning("%s.csv khong ton tai tai %s", market_ticker, data_dir)
+        return None
+    return _load_single(fpath, market_ticker, min_rows=10)
+
 
 def load_vnindex(data_dir: str | Path) -> Optional[pd.DataFrame]:
     """
