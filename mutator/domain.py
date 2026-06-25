@@ -2,9 +2,9 @@
 Evo_Finance — Domain
 ─────────────────────
 The Domain is the ever-growing pool of formula strings that the Mutator
-can draw from.  A new formula is admitted only if its Pearson correlation
-with every existing formula in the domain is < CORR_THRESHOLD (computed on
-the training set).
+can draw from. A new formula is admitted only if its absolute Pearson
+correlation with every existing formula in the domain is < CORR_THRESHOLD
+(computed on the training set).
 
 Thread-safety: single-process assumed; no locking needed.
 """
@@ -25,6 +25,7 @@ from mutator.gene import (
     SECTOR_CS_OPS, SECTOR_NOARG_OPS, SECTOR_WINDOW_OPS, TS_ROLLING_OPS,
 )
 from mutator.evaluator import evaluate, has_division_by_zero
+from mutator.formula_guard import const_threshold_violation
 
 logger = logging.getLogger(__name__)
 
@@ -51,14 +52,24 @@ class Domain:
         for g in genes:
             self._formulas.append(g.formula)
 
-        finance_formulas = _finance_seed_formulas()
+        finance_formulas = []
+        skipped_unsafe = 0
+        for formula in _finance_seed_formulas():
+            violation = const_threshold_violation(formula)
+            if violation is not None:
+                skipped_unsafe += 1
+                logger.debug("Domain.seed: skip unsafe formula %r - %s", formula, violation)
+                continue
+            finance_formulas.append(formula)
         for formula in finance_formulas:
             if formula not in self._formulas:
                 self._formulas.append(formula)
 
         logger.info(
-            "Domain seeded with %d raw features + %d finance primitives.",
-            len(genes), len(finance_formulas),
+            "Domain seeded with %d raw features + %d finance primitives%s.",
+            len(genes),
+            len(finance_formulas),
+            f" ({skipped_unsafe} unsafe skipped)" if skipped_unsafe else "",
         )
         return genes
 
@@ -87,8 +98,8 @@ class Domain:
 
         A gene is added only if:
           - Its formula is not already in the domain, AND
-          - Its correlation with every existing domain member < CORR_THRESHOLD
-            (evaluated on train_df).
+          - Its absolute correlation with every existing domain member is
+            below CORR_THRESHOLD (evaluated on train_df).
 
         Parameters
         ----------
@@ -99,6 +110,15 @@ class Domain:
         Returns True if the gene was added.
         """
         if gene.formula in self._formulas:
+            return False
+
+        violation = const_threshold_violation(gene.formula)
+        if violation is not None:
+            logger.debug(
+                "Domain.try_add: reject unsafe const threshold %r - %s",
+                gene.formula,
+                violation,
+            )
             return False
 
         if not force:
@@ -128,7 +148,7 @@ class Domain:
                 if ex_series is None:
                     continue
                 corr = _safe_corr(new_series, ex_series)
-                if corr >= CORR_THRESHOLD:
+                if abs(corr) >= CORR_THRESHOLD:
                     return False
 
             # passed — cache it
@@ -449,6 +469,15 @@ def individual_corr_check(
     Returns True nếu new_gene có corr < threshold với TẤT CẢ existing_genes
     VÀ new_gene không phải hằng số (std > 1e-8).
     """
+    violation = const_threshold_violation(new_gene.formula)
+    if violation is not None:
+        logger.debug(
+            "corr_check: reject unsafe const threshold %r - %s",
+            new_gene.formula,
+            violation,
+        )
+        return False
+
     try:
         if has_division_by_zero(new_gene.formula, train_df):
             logger.debug(

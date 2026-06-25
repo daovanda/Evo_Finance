@@ -10,6 +10,7 @@ Usage
 
     # Chỉ vẽ top-N individuals
     python analyze.py --data-dir data/raw --archive results/archive.json --top 10
+    python analyze.py --data-dir data/raw --archive results/archive_test6_morongdomain.json --top 10    
 
     # Custom ngày split (phải khớp với lúc train)
     python analyze.py --data-dir data/raw --archive results/archive.json \\
@@ -40,9 +41,16 @@ from scipy.stats import spearmanr
 
 from config.settings import (
     VAL_START, TEST_START, TEST_END, HIT_RATE_TOP_K,
+    WF_END, WF_MIN_TRAIN_MONTHS, WF_VAL_MONTHS,
+    WF_STEP_MONTHS, WF_PURGE_DAYS, FITNESS_WEIGHTS,
 )
 from data.loader       import load_from_dir
-from model.data_utils  import split_and_label, validate_ohlcv
+from model.data_utils  import (
+    label_dataframe,
+    make_walk_forward_folds,
+    split_labeled_by_dates,
+    validate_ohlcv,
+)
 from model.trainer     import Trainer
 from mutator.gene      import Gene, Individual
 from fitness.fitness   import _ic_per_date
@@ -70,9 +78,8 @@ def json_to_individual(entry: dict) -> Individual:
     genes = [Gene(formula=f) for f in entry["genes"]]
     return Individual(
         genes      = genes,
-        score      = entry.get("score"),
-        metrics    = {k: v for k, v in entry.items()
-                      if k in ("val_mean_ic","val_icir","hit_rate","overfit_gap")},
+        score      = None,
+        metrics    = {},
         generation = entry.get("generation", 0),
     )
 
@@ -173,9 +180,96 @@ def compute_series(
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
+def compute_walk_forward_metrics(
+    individual: Individual,
+    wf_folds: list,
+    feature_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.DatetimeIndex]:
+    """
+    Re-run the individual on every walk-forward fold used by evolution.
+
+    Returns one row per fold plus daily validation IC/hit-rate series.
+    """
+    trainer = Trainer()
+    fold_rows: list[dict] = []
+    ic_parts: list[pd.Series] = []
+    hr_parts: list[pd.Series] = []
+    date_parts: list[pd.DatetimeIndex] = []
+
+    for fold in wf_folds:
+        try:
+            _, train_pred, val_pred, train_labels, val_labels = trainer.train(
+                individual,
+                fold.train_df,
+                fold.val_df,
+                feature_df=feature_df,
+                mode="wf",
+            )
+        except Exception as exc:
+            logger.warning("WF train failed on %s: %s", fold.name, exc)
+            continue
+
+        train_ic_series = _ic_per_date(
+            train_pred, train_labels, fold.train_df.index
+        )
+        val_ic_series = _ic_per_date(
+            val_pred, val_labels, fold.val_df.index
+        )
+        hr_series = _hitrate_per_date(val_pred, val_labels)
+
+        train_mean_ic = _safe_mean(train_ic_series)
+        val_mean_ic = _safe_mean(val_ic_series)
+        hit_rate = _safe_mean(hr_series)
+        baseline = _random_hit_rate_baseline(
+            fold.val_df.index.get_level_values("ticker").nunique()
+        )
+
+        fold_rows.append(
+            {
+                "name": fold.name,
+                "train_start": fold.train_start,
+                "train_end": fold.train_end,
+                "val_start": fold.val_start,
+                "val_end": fold.val_end,
+                "train_mean_ic": train_mean_ic,
+                "val_mean_ic": val_mean_ic,
+                "hit_rate": hit_rate,
+                "hit_excess": hit_rate - baseline,
+                "overfit_gap": max(0.0, train_mean_ic - val_mean_ic),
+                "ic_dates": int(val_ic_series.notna().sum()),
+                "hr_dates": int(hr_series.notna().sum()),
+            }
+        )
+
+        if not val_ic_series.empty:
+            ic_parts.append(val_ic_series.sort_index())
+        if not hr_series.empty:
+            hr_parts.append(hr_series.sort_index())
+        date_parts.append(_date_index_from_frames(fold.val_df))
+
+    fold_metrics = pd.DataFrame(fold_rows)
+    wf_ic_series = (
+        pd.concat(ic_parts).sort_index()
+        if ic_parts
+        else pd.Series(dtype=float)
+    )
+    wf_hr_series = (
+        pd.concat(hr_parts).sort_index()
+        if hr_parts
+        else pd.Series(dtype=float)
+    )
+    wf_dates = _combine_date_indexes(date_parts)
+    return fold_metrics, wf_ic_series, wf_hr_series, wf_dates
+
+
 def _add_period_shading(ax, xmin, xmax, test_ts, val_ts=None):
     """Tô vùng val (xanh nhạt) và test (vàng nhạt), kẻ đường phân cách."""
-    ax.axvspan(xmin,    test_ts, alpha=0.06, color="#3B82F6")
+    if val_ts is not None and xmin < val_ts:
+        ax.axvspan(xmin, val_ts, alpha=0.035, color="#94A3B8")
+        ax.axvspan(val_ts, test_ts, alpha=0.06, color="#3B82F6")
+        ax.axvline(val_ts, color="#3B82F6", linewidth=1.0, linestyle=":", alpha=0.8)
+    else:
+        ax.axvspan(xmin, test_ts, alpha=0.06, color="#3B82F6")
     ax.axvspan(test_ts, xmax,   alpha=0.06, color="#F59E0B")
     ax.axvline(test_ts, color="#F59E0B", linewidth=1.2, linestyle=":", alpha=0.9)
     ax.axhline(0,       color="#6B7280", linewidth=0.7, linestyle="--", alpha=0.5)
@@ -191,6 +285,22 @@ def _period_means(series, test_ts):
     val_mean  = series[series.index < test_ts].mean()
     test_mean = series[series.index >= test_ts].mean()
     return val_mean, test_mean
+
+
+def _safe_mean(series: pd.Series) -> float:
+    clean = series.replace([np.inf, -np.inf], np.nan).dropna()
+    return float(clean.mean()) if len(clean) else float("nan")
+
+
+def _combine_date_indexes(indexes: list[pd.DatetimeIndex]) -> pd.DatetimeIndex:
+    valid = [idx for idx in indexes if idx is not None and len(idx) > 0]
+    if not valid:
+        return pd.DatetimeIndex([])
+
+    out = valid[0]
+    for idx in valid[1:]:
+        out = out.append(idx)
+    return out.unique().sort_values()
 
 
 def _date_index_from_frames(*dfs: pd.DataFrame) -> pd.DatetimeIndex:
@@ -253,6 +363,137 @@ def _period_counts(
 
 # ─── Plot individual (IC + Hit Rate) ─────────────────────────────────────────
 
+def _as_finite_float(value) -> Optional[float]:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if np.isfinite(out) else None
+
+
+def _aggregate_wf_metrics(
+    wf_metrics: Optional[pd.DataFrame],
+    wf_ic_series: Optional[pd.Series],
+) -> dict[str, float]:
+    if wf_metrics is None or wf_metrics.empty:
+        return {}
+
+    clean_ic = (
+        wf_ic_series.replace([np.inf, -np.inf], np.nan).dropna()
+        if wf_ic_series is not None
+        else pd.Series(dtype=float)
+    )
+    if len(clean_ic) > 1:
+        wf_icir = float(clean_ic.mean()) / (float(clean_ic.std()) + 1e-9)
+    else:
+        wf_icir = 0.0
+    wf_icir_scaled = float(np.clip(wf_icir, -3.0, 3.0)) / 3.0
+
+    out = {
+        "wf_mean_ic": float(wf_metrics["val_mean_ic"].mean()),
+        "wf_icir": wf_icir,
+        "wf_icir_scaled": wf_icir_scaled,
+        "wf_hit_rate": float(wf_metrics["hit_rate"].mean()),
+        "wf_hit_excess": float(wf_metrics["hit_excess"].mean()),
+        "wf_ic_std": float(wf_metrics["val_mean_ic"].std(ddof=0)),
+        "bad_fold_ratio": float((wf_metrics["val_mean_ic"] <= 0.0).mean()),
+        "wf_overfit_gap": float(wf_metrics["overfit_gap"].mean()),
+        "wf_train_mean_ic": float(wf_metrics["train_mean_ic"].mean()),
+        "n_folds": float(len(wf_metrics)),
+    }
+
+    w = FITNESS_WEIGHTS
+    out["score"] = (
+        w["wf_mean_ic"] * out["wf_mean_ic"]
+        + w["wf_icir"] * out["wf_icir_scaled"]
+        + w["wf_hit_excess"] * out["wf_hit_excess"]
+        + w["wf_ic_std"] * out["wf_ic_std"]
+        + w["bad_fold_ratio"] * out["bad_fold_ratio"]
+        + w["wf_overfit_gap"] * out["wf_overfit_gap"]
+    )
+    return out
+
+
+def _wf_metric_summary_text(wf_aggregate: Optional[dict[str, float]]) -> str:
+    values = wf_aggregate or {}
+    if not values:
+        return "WF metrics: n/a"
+
+    def _fmt(key: str, spec: str) -> str:
+        value = values.get(key)
+        return "nan" if value is None else format(value, spec)
+
+    return (
+        "WF metrics: "
+        f"wf_mean_ic={_fmt('wf_mean_ic', '+.4f')} | "
+        f"wf_icir={_fmt('wf_icir', '+.4f')} | "
+        f"wf_hit_rate={_fmt('wf_hit_rate', '.3f')} | "
+        f"wf_hit_excess={_fmt('wf_hit_excess', '+.3f')} | "
+        f"wf_ic_std={_fmt('wf_ic_std', '.4f')} | "
+        f"bad_fold_ratio={_fmt('bad_fold_ratio', '.2f')} | "
+        f"wf_overfit_gap={_fmt('wf_overfit_gap', '.4f')}"
+    )
+
+
+def _add_wf_fold_table(
+    ax,
+    wf_metrics: pd.DataFrame,
+    wf_aggregate: Optional[dict[str, float]] = None,
+) -> None:
+    ax.axis("off")
+    if wf_metrics is None or wf_metrics.empty:
+        ax.text(
+            0.5, 0.5, "WF fold metrics are not available",
+            ha="center", va="center", fontsize=9, color="#6B7280",
+        )
+        return
+
+    cols = ["Fold", "Val window", "Train IC", "Val IC", "Hit", "Gap", "Days"]
+    rows = []
+    for _, row in wf_metrics.iterrows():
+        val_start = pd.Timestamp(row["val_start"]).strftime("%Y-%m-%d")
+        val_end = pd.Timestamp(row["val_end"]).strftime("%Y-%m-%d")
+        rows.append(
+            [
+                row["name"],
+                f"{val_start} -> {val_end}",
+                f"{row['train_mean_ic']:+.3f}",
+                f"{row['val_mean_ic']:+.3f}",
+                f"{row['hit_rate']:.3f}",
+                f"{row['overfit_gap']:.3f}",
+                f"{int(row['ic_dates'])}/{int(row['hr_dates'])}",
+            ]
+        )
+
+    ax.set_title(
+        _wf_metric_summary_text(wf_aggregate),
+        fontsize=8,
+        loc="left",
+        pad=6,
+    )
+    table = ax.table(
+        cellText=rows,
+        colLabels=cols,
+        cellLoc="center",
+        colLoc="center",
+        loc="center",
+        colWidths=[0.08, 0.25, 0.11, 0.11, 0.10, 0.10, 0.10],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(7)
+    table.scale(1.0, 1.18)
+
+    for (row_idx, col_idx), cell in table.get_celld().items():
+        if row_idx == 0:
+            cell.set_facecolor("#E5E7EB")
+            cell.set_text_props(weight="bold", color="#111827")
+            continue
+        val_ic = float(wf_metrics.iloc[row_idx - 1]["val_mean_ic"])
+        cell.set_edgecolor("#D1D5DB")
+        if col_idx == 3:
+            cell.set_facecolor("#DCFCE7" if val_ic > 0 else "#FEE2E2")
+
+
 def plot_individual(
     ic_series:  pd.Series,
     hr_series:  pd.Series,
@@ -261,7 +502,12 @@ def plot_individual(
     test_start: str,
     out_path:   Path,
     date_index: Optional[pd.DatetimeIndex] = None,
+    final_date_index: Optional[pd.DatetimeIndex] = None,
     n_tickers:  Optional[int] = None,
+    wf_metrics: Optional[pd.DataFrame] = None,
+    wf_aggregate: Optional[dict[str, float]] = None,
+    wf_ic_series: Optional[pd.Series] = None,
+    wf_hr_series: Optional[pd.Series] = None,
 ) -> None:
     """
     2 subplot trong cùng 1 figure:
@@ -285,36 +531,46 @@ def plot_individual(
     val_ic,   test_ic   = _period_means(ic_series, test_ts)
     val_hr,   test_hr   = _period_means(hr_series, test_ts) if not hr_series.empty else (float("nan"), float("nan"))
     n_ticker_baseline = _random_hit_rate_baseline(n_tickers)
+    if final_date_index is None or len(final_date_index) == 0:
+        final_date_index = date_index
     val_hr_obs, val_hr_total, test_hr_obs, test_hr_total = _period_counts(
-        hr_series, date_index, test_ts
+        hr_series, final_date_index, test_ts
     )
 
     # ── Layout ───────────────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(15, 9))
+    show_wf_table = wf_metrics is not None and not wf_metrics.empty
+    fig_height = 9.0 + (min(3.0, 0.35 * len(wf_metrics)) if show_wf_table else 0.0)
+    height_ratios = (
+        [1, 1, 0.30 + 0.05 * len(wf_metrics)]
+        if show_wf_table
+        else [1, 1]
+    )
+    fig = plt.figure(figsize=(15, fig_height))
     gs  = gridspec.GridSpec(
-        2, 1, figure=fig,
-        hspace=0.38,
-        height_ratios=[1, 1],
+        len(height_ratios), 1, figure=fig,
+        hspace=0.42,
+        height_ratios=height_ratios,
     )
     ax_ic = fig.add_subplot(gs[0])
     ax_hr = fig.add_subplot(gs[1])
+    ax_wf = fig.add_subplot(gs[2]) if show_wf_table else None
 
     # ── Suptitle ─────────────────────────────────────────────────────────────
     rank   = entry["rank"]
-    score  = entry["score"]
+    score  = _as_finite_float((wf_aggregate or {}).get("score"))
     n_gene = entry["n_genes"]
     genes_str = " | ".join(entry["genes"][:3])
     if len(entry["genes"]) > 3:
         genes_str += f"  … (+{len(entry['genes'])-3} more)"
 
     fig.suptitle(
-        f"Rank #{rank}  •  Score={score:.4f}  •  n_genes={n_gene}\n"
+        f"Rank #{rank}  |  Recomputed WF Score={(score if score is not None else float('nan')):.4f}  |  n_genes={n_gene}\n"
         f"Genes: {genes_str}",
         fontsize=10, fontweight="bold", y=0.98,
     )
 
     # ── Panel 1: IC ───────────────────────────────────────────────────────────
-    _add_period_shading(ax_ic, xmin, xmax, test_ts)
+    _add_period_shading(ax_ic, xmin, xmax, test_ts, val_ts=val_ts)
 
     ax_ic.bar(
         ic_series.index, ic_series.values,
@@ -326,6 +582,13 @@ def plot_individual(
         color="#1D4ED8", linewidth=2.0,
         label=f"IC rolling-{ROLLING_WINDOW}",
     )
+    if wf_ic_series is not None and not wf_ic_series.empty:
+        wf_ic_roll = _rolling_for_plot(wf_ic_series, date_index)
+        ax_ic.plot(
+            wf_ic_roll.index, wf_ic_roll.values,
+            color="#7C3AED", linewidth=1.4, linestyle="--", alpha=0.85,
+            label=f"WF val IC rolling-{ROLLING_WINDOW}",
+        )
 
     # Annotation IC
     ax_ic.set_title(
@@ -343,7 +606,7 @@ def plot_individual(
 
     # ── Panel 2: Hit Rate ─────────────────────────────────────────────────────
     if not hr_series.empty:
-        _add_period_shading(ax_hr, xmin, xmax, test_ts)
+        _add_period_shading(ax_hr, xmin, xmax, test_ts, val_ts=val_ts)
 
         # Random baseline
         ax_hr.axhline(
@@ -362,6 +625,13 @@ def plot_individual(
             color="#059669", linewidth=2.0,
             label=f"Hit rate rolling-{ROLLING_WINDOW}",
         )
+        if wf_hr_series is not None and not wf_hr_series.empty:
+            wf_hr_roll = _rolling_for_plot(wf_hr_series, date_index)
+            ax_hr.plot(
+                wf_hr_roll.index, wf_hr_roll.values,
+                color="#7C3AED", linewidth=1.4, linestyle="--", alpha=0.85,
+                label=f"WF val hit rolling-{ROLLING_WINDOW}",
+            )
 
         # Annotation hit rate
         lift_val  = val_hr  / n_ticker_baseline if n_ticker_baseline else float("nan")
@@ -387,6 +657,13 @@ def plot_individual(
                    fontsize=10, color="#6B7280")
 
     ax_hr.set_xlabel("Date", fontsize=8)
+
+    if ax_wf is not None:
+        _add_wf_fold_table(
+            ax_wf,
+            wf_metrics,
+            wf_aggregate=wf_aggregate,
+        )
 
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -433,10 +710,7 @@ def _plot_summary_generic(
         plt.close(fig)
         return
 
-    ax.axvspan(xmin,    test_ts, alpha=0.05, color="#3B82F6")
-    ax.axvspan(test_ts, xmax,   alpha=0.05, color="#F59E0B")
-    ax.axvline(test_ts, color="#F59E0B", linewidth=1.5, linestyle=":", alpha=0.9)
-    ax.axhline(0,       color="#6B7280", linewidth=0.8, linestyle="--", alpha=0.4)
+    _add_period_shading(ax, xmin, xmax, test_ts, val_ts=pd.Timestamp(val_start))
 
     if baseline is not None:
         ax.axhline(baseline, color="#9CA3AF", linewidth=1.2,
@@ -478,6 +752,11 @@ def analyze(
     val_start:    str           = VAL_START,
     test_start:   str           = TEST_START,
     test_end:     Optional[str] = TEST_END,
+    wf_end:       str           = WF_END,
+    wf_min_train_months: int    = WF_MIN_TRAIN_MONTHS,
+    wf_val_months: int          = WF_VAL_MONTHS,
+    wf_step_months: int         = WF_STEP_MONTHS,
+    wf_purge_days: int          = WF_PURGE_DAYS,
     top:          Optional[int] = None,
     out_dir:      str           = "results/chart",
     tickers:      Optional[list[str]] = None,
@@ -491,14 +770,51 @@ def analyze(
     validate_ohlcv(df)
 
     # ── Split ─────────────────────────────────────────────────────────────────
-    train_df, val_df, test_df = split_and_label(
-        df, val_start=val_start, test_start=test_start, test_end=test_end,
+    labeled_df = label_dataframe(df)
+    train_df, val_df, test_df = split_labeled_by_dates(
+        labeled_df,
+        val_start=val_start,
+        test_start=test_start,
+        test_end=test_end,
     )
-    feature_df = pd.concat([train_df, val_df, test_df]).sort_index()
+    feature_df = labeled_df.sort_index()
     logger.info(
         "train=%d rows | val=%d rows | test=%d rows",
         len(train_df), len(val_df), len(test_df),
     )
+
+    raw_dates = df.index.get_level_values("date")
+    wf_raw_df = df[raw_dates < pd.Timestamp(wf_end)].copy().sort_index()
+    wf_labeled_df = label_dataframe(wf_raw_df)
+    wf_folds = make_walk_forward_folds(
+        wf_labeled_df,
+        wf_end=wf_end,
+        min_train_months=wf_min_train_months,
+        val_months=wf_val_months,
+        step_months=wf_step_months,
+        purge_days=wf_purge_days,
+    )
+    wf_feature_df = wf_labeled_df.sort_index()
+    logger.info(
+        "WF folds=%d | end=%s | min_train=%dm | val=%dm | step=%dm | purge=%dd",
+        len(wf_folds),
+        wf_end,
+        wf_min_train_months,
+        wf_val_months,
+        wf_step_months,
+        wf_purge_days,
+    )
+    for fold in wf_folds:
+        logger.info(
+            "WF %s: train [%s -> %s) %d rows | val [%s -> %s) %d rows",
+            fold.name,
+            fold.train_start.date(),
+            fold.train_end.date(),
+            len(fold.train_df),
+            fold.val_start.date(),
+            fold.val_end.date(),
+            len(fold.val_df),
+        )
 
     # ── Load archive ──────────────────────────────────────────────────────────
     entries = load_archive_json(Path(archive_path))
@@ -512,13 +828,23 @@ def analyze(
 
     for entry in entries:
         rank = entry["rank"]
-        logger.info("── Rank #%d (score=%.4f, genes=%d) ──",
-                    rank, entry["score"], entry["n_genes"])
+        logger.info("── Rank #%d (genes=%d) ──", rank, entry["n_genes"])
 
         ind = json_to_individual(entry)
         ic_series, hr_series, eval_dates = compute_series(
             ind, train_df, val_df, test_df, feature_df=feature_df
         )
+        wf_metrics, wf_ic_series, wf_hr_series, wf_dates = compute_walk_forward_metrics(
+            ind, wf_folds, wf_feature_df
+        )
+        wf_aggregate = _aggregate_wf_metrics(wf_metrics, wf_ic_series)
+        recomputed_score = _as_finite_float(wf_aggregate.get("score"))
+        if recomputed_score is not None:
+            entry["score"] = recomputed_score
+        entry.update(wf_aggregate)
+        plot_dates = _combine_date_indexes([wf_dates, eval_dates])
+        if len(plot_dates) == 0:
+            plot_dates = eval_dates
 
         if ic_series.empty:
             logger.warning("  Rank #%d: empty — skip", rank)
@@ -539,11 +865,27 @@ def analyze(
             test_hr, test_hr / baseline,
             len(hr_series), len(eval_dates),
         )
+        if not wf_metrics.empty:
+            logger.info(
+                "  WF recomputed score=%.4f | folds=%d | meanIC=%.4f | ICIR=%.4f | hit=%.3f | gap=%.4f | bad=%.0f%%",
+                recomputed_score if recomputed_score is not None else float("nan"),
+                int(wf_aggregate.get("n_folds", len(wf_metrics))),
+                wf_aggregate.get("wf_mean_ic", float("nan")),
+                wf_aggregate.get("wf_icir", float("nan")),
+                wf_aggregate.get("wf_hit_rate", float("nan")),
+                wf_aggregate.get("wf_overfit_gap", float("nan")),
+                100.0 * wf_aggregate.get("bad_fold_ratio", float("nan")),
+            )
 
-        fname = f"rank_{rank:02d}_score_{entry['score']:.4f}.png"
+        fname = f"rank_{rank:02d}_score_{(recomputed_score if recomputed_score is not None else float('nan')):.4f}.png"
         plot_individual(ic_series, hr_series, entry, val_start, test_start,
-                        out_path / fname, date_index=eval_dates,
-                        n_tickers=n_tickers_est)
+                        out_path / fname, date_index=plot_dates,
+                        final_date_index=eval_dates,
+                        n_tickers=n_tickers_est,
+                        wf_metrics=wf_metrics,
+                        wf_aggregate=wf_aggregate,
+                        wf_ic_series=wf_ic_series,
+                        wf_hr_series=wf_hr_series)
 
     # ── Summary charts ────────────────────────────────────────────────────────
     if all_ic:
@@ -579,6 +921,13 @@ if __name__ == "__main__":
     parser.add_argument("--test-start", default=TEST_START, metavar="DATE",
                         help=f"default: {TEST_START}")
     parser.add_argument("--test-end",   default=TEST_END,   metavar="DATE")
+    parser.add_argument("--wf-end",     default=WF_END,     metavar="DATE",
+                        help=f"default: {WF_END}")
+    parser.add_argument("--wf-min-train-months", type=int,
+                        default=WF_MIN_TRAIN_MONTHS)
+    parser.add_argument("--wf-val-months", type=int, default=WF_VAL_MONTHS)
+    parser.add_argument("--wf-step-months", type=int, default=WF_STEP_MONTHS)
+    parser.add_argument("--wf-purge-days", type=int, default=WF_PURGE_DAYS)
     parser.add_argument("--top",        type=int, default=None, metavar="N")
     parser.add_argument("--out-dir",    default="results/chart", metavar="DIR")
     parser.add_argument("--tickers",    nargs="+", default=None, metavar="TICKER")
@@ -590,6 +939,11 @@ if __name__ == "__main__":
         val_start    = args.val_start,
         test_start   = args.test_start,
         test_end     = args.test_end,
+        wf_end       = args.wf_end,
+        wf_min_train_months = args.wf_min_train_months,
+        wf_val_months       = args.wf_val_months,
+        wf_step_months      = args.wf_step_months,
+        wf_purge_days       = args.wf_purge_days,
         top          = args.top,
         out_dir      = args.out_dir,
         tickers      = args.tickers,

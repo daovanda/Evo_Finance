@@ -6,6 +6,13 @@ Entry point for the evolutionary feature-selection loop.
 Usage
 -----
     python main.py --data path/to/ohlcv.parquet --budget 3600
+    python main.py --data-dir data/raw --budget 10800 --save results/archive_test7_wf.json
+    python main.py --data-dir data/raw --budget 10800 --seed 101 --save results/archive_seed101.json
+
+Resume
+------
+    python main.py --data path/to/ohlcv.parquet --budget 3600 --resume-archive path/to/archive.json
+    python main.py --data-dir data/raw --budget 10800 --resume results/archive_test7_wf.json --save results/archive_test7_wf.json
 
 The input file must be a Parquet (or CSV) with a MultiIndex (date, ticker)
 and columns [open, high, close, low, volume].
@@ -34,6 +41,7 @@ from config.settings import (
 )
 from mutator.gene       import Gene, Individual
 from mutator.domain     import Domain
+from mutator.formula_guard import const_threshold_violation
 from mutator.mutator    import Mutator
 from model.trainer      import Trainer
 from model.data_utils   import (
@@ -71,6 +79,7 @@ def run(
     wf_step_months:  int   = WF_STEP_MONTHS,
     wf_purge_days:   int   = WF_PURGE_DAYS,
     resume_archive:  Optional[Path] = None,
+    resume_recheck:  bool = False,
     checkpoint_every: float = CHECKPOINT_EVERY_SECONDS,
 ) -> Archive:
     """
@@ -151,6 +160,7 @@ def run(
             evaluator,
             wf_folds,
             wf_feature_df,
+            recheck=resume_recheck,
         )
 
     # ── First individual: raw OHLCV ───────────────────────────────────────────
@@ -170,10 +180,8 @@ def run(
     # ── Evolutionary loop ─────────────────────────────────────────────────────
     iteration = 0
     t_start   = time.time()
-    checkpoint_path = _checkpoint_path(save_archive)
+    checkpoint_file = _checkpoint_path(save_archive)
     last_checkpoint = t_start
-    if checkpoint_path is not None and not archive.is_empty():
-        _try_save_checkpoint(archive, checkpoint_path, "initial", trainer)
 
     while time.time() - t_start < time_budget:
         iteration += 1
@@ -215,17 +223,14 @@ def run(
         )
         last_checkpoint = _maybe_save_checkpoint(
             archive,
-            checkpoint_path,
-            last_checkpoint,
-            checkpoint_every,
-            time.time(),
-            trainer,
+            checkpoint_file,
+            last_checkpoint=last_checkpoint,
+            checkpoint_every=checkpoint_every,
+            now=time.time(),
+            trainer=trainer,
         )
 
     # ── Test-set evaluation for all archived individuals ──────────────────────
-    if checkpoint_path is not None and not archive.is_empty():
-        _try_save_checkpoint(archive, checkpoint_path, "pre-final", trainer)
-
     logger.info("=== Time budget exhausted. Running final validation/test evaluation ... ===")
     _final_evaluate_archive(
         archive, trainer, train_df, val_df, test_df, final_feature_df
@@ -292,8 +297,9 @@ def _load_archive_json_into_archive(
     evaluator: FitnessEvaluator,
     wf_folds,
     feature_df: pd.DataFrame,
+    recheck: bool = False,
 ) -> None:
-    """Re-evaluate archive JSON genes so evolution can continue from them."""
+    """Load archive JSON entries so evolution can continue from them."""
     path = Path(path)
     with open(path, "r") as f:
         rows = json.load(f)
@@ -303,23 +309,42 @@ def _load_archive_json_into_archive(
     loaded = 0
     skipped = 0
     logger.info(
-        "Loading resume archive from %s (%d entries); re-evaluating with current WF ...",
+        "Loading resume archive from %s (%d entries, recheck=%s) ...",
         path,
         len(rows),
+        recheck,
     )
 
     for row in rows:
         try:
             individual = _archive_row_to_individual(row)
-            admitted = _evaluate_and_archive_wf(
+            if recheck:
+                admitted = _evaluate_and_archive_wf(
+                    individual,
+                    trainer,
+                    evaluator,
+                    archive,
+                    wf_folds,
+                    feature_df,
+                )
+                loaded += int(admitted)
+                continue
+
+            score = _safe_float(row.get("score"))
+            if score is None:
+                skipped += 1
+                continue
+            metrics = _archive_metrics_from_row(row)
+            if archive.add_loaded(
                 individual,
-                trainer,
-                evaluator,
-                archive,
-                wf_folds,
-                feature_df,
-            )
-            loaded += int(admitted)
+                score=score,
+                metrics=metrics,
+                final_val_metrics=row.get("final_val_metrics") or {},
+                test_metrics=row.get("test_metrics") or {},
+            ):
+                loaded += 1
+            else:
+                skipped += 1
         except Exception as exc:
             skipped += 1
             logger.warning("Resume: skipped invalid archive entry: %s", exc)
@@ -337,12 +362,50 @@ def _archive_row_to_individual(row: dict) -> Individual:
     formulas = row.get("genes")
     if not isinstance(formulas, list) or not formulas:
         raise ValueError("archive row has no genes list")
+    for formula in formulas:
+        violation = const_threshold_violation(str(formula))
+        if violation is not None:
+            raise ValueError(f"archive row has unsafe const-threshold gene: {violation}")
     genes = [Gene(formula=str(formula)) for formula in formulas]
+    score = _safe_float(row.get("score"))
     generation = int(row.get("generation") or 0)
     return Individual(
         genes=genes,
+        score=score,
+        metrics=_archive_metrics_from_row(row),
         generation=generation,
     )
+
+
+def _archive_metrics_from_row(row: dict) -> dict:
+    ignored = {
+        "rank",
+        "n_genes",
+        "generation",
+        "genes",
+        "final_val_metrics",
+        "test_metrics",
+    }
+    metrics = {}
+    for key, value in row.items():
+        if key in ignored:
+            continue
+        numeric = _safe_float(value)
+        if numeric is not None:
+            metrics[key] = numeric
+    return metrics
+
+
+def _safe_float(value):
+    try:
+        if value is None:
+            return None
+        out = float(value)
+        if np.isnan(out):
+            return None
+        return out
+    except (TypeError, ValueError):
+        return None
 
 
 def _final_evaluate_archive(
@@ -459,13 +522,13 @@ def _fmt_metric(value) -> str:
         return "nan"
 
 
-def _checkpoint_path(save_archive: Optional[Path]) -> Optional[Path]:
-    if save_archive is None:
+def _checkpoint_path(path: Optional[Path]) -> Optional[Path]:
+    if path is None:
         return None
-    path = Path(save_archive)
+    path = Path(path)
     if path.suffix:
         return path.with_name(f"{path.stem}.checkpoint{path.suffix}")
-    return path.with_name(f"{path.name}.checkpoint.json")
+    return path.with_suffix(".checkpoint.json")
 
 
 def _maybe_save_checkpoint(
@@ -473,34 +536,21 @@ def _maybe_save_checkpoint(
     path: Optional[Path],
     last_checkpoint: float,
     checkpoint_every: float,
-    now: float,
-    trainer: Optional[Trainer] = None,
+    now: float | None = None,
+    trainer: Trainer | None = None,
 ) -> float:
-    if path is None or checkpoint_every <= 0 or archive.is_empty():
+    if path is None or checkpoint_every <= 0:
         return last_checkpoint
+
+    now = time.time() if now is None else now
     if now - last_checkpoint < checkpoint_every:
         return last_checkpoint
-    if _try_save_checkpoint(archive, path, "periodic", trainer):
-        return now
-    return last_checkpoint
 
-
-def _try_save_checkpoint(
-    archive: Archive,
-    path: Path,
-    reason: str,
-    trainer: Optional[Trainer] = None,
-) -> bool:
-    try:
-        _save_json(archive, path)
-        logger.info("Checkpoint saved (%s) to %s", reason, path)
-        if trainer is not None:
-            trainer.clear_caches()
-            logger.info("Trainer caches cleared after checkpoint (%s).", reason)
-        return True
-    except Exception as exc:
-        logger.warning("Checkpoint save failed (%s): %s", reason, exc)
-        return False
+    _save_json(archive, path)
+    if trainer is not None:
+        trainer.clear_caches()
+    logger.info("Checkpoint saved to %s; trainer caches cleared.", path)
+    return now
 
 
 def _save_json(archive: Archive, path: Path) -> None:
@@ -609,6 +659,8 @@ if __name__ == "__main__":
         metavar="PATH",
         help="Lưu kết quả archive ra file JSON. Ví dụ: --save results/archive.json",
     )
+
+    # ── Ngày split ───────────────────────────────────────────────────────────
     parser.add_argument(
         "--checkpoint-every",
         type=float,
@@ -616,18 +668,20 @@ if __name__ == "__main__":
         metavar="SECONDS",
         help=(
             "Luu checkpoint archive dinh ky neu co --save. "
-            f"Mac dinh: {CHECKPOINT_EVERY_SECONDS:.0f} giay (12 gio). "
-            "Dat 0 de tat."
+            f"Mac dinh: {CHECKPOINT_EVERY_SECONDS:g} giay. Dat 0 de tat."
         ),
     )
-
-    # ── Ngày split ───────────────────────────────────────────────────────────
     parser.add_argument(
         "--resume",
         type=str,
         default=None,
         metavar="PATH",
-        help="Load archive JSON da luu, danh gia lai bang WF hien tai, roi chay tiep.",
+        help="Load archive JSON da luu de chay tiep.",
+    )
+    parser.add_argument(
+        "--resume-recheck",
+        action="store_true",
+        help="Danh gia lai archive resume bang WF hien tai truoc khi chay tiep.",
     )
     parser.add_argument(
         "--val-start",
@@ -681,5 +735,6 @@ if __name__ == "__main__":
         test_start   = args.test_start,
         test_end     = args.test_end,
         resume_archive = resume_path,
+        resume_recheck = args.resume_recheck,
         checkpoint_every = args.checkpoint_every,
     )

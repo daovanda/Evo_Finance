@@ -232,6 +232,17 @@ def _sample_df(periods=80):
 
 
 class FinancePrimitiveTests(unittest.TestCase):
+    def test_domain_rejects_strong_negative_correlation(self):
+        df = _sample_df(periods=20)
+        domain = Domain()
+        base = Gene("close_1")
+        domain.try_add(base, df, force=True)
+        domain._compute(base.formula, df)
+
+        inverse = Gene("(const(0) - close_1)")
+        self.assertFalse(domain.try_add(inverse, df))
+        self.assertNotIn(inverse.formula, domain.formulas)
+
     def test_finance_primitives_evaluate(self):
         df = _sample_df()
 

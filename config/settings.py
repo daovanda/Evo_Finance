@@ -117,15 +117,15 @@ LGBM_FINAL_PARAMS: dict = {
     "objective":        "lambdarank",
     "metric":           "ndcg",
     "eval_at":          [10],
-    "learning_rate":    0.02,
-    "num_leaves":       31,
-    "max_depth":        5,
-    "feature_fraction": 0.7,
-    "bagging_fraction": 0.8,
-    "bagging_freq":     3,
-    "min_data_in_leaf": 200,
-    "lambda_l1":        3.0,
-    "lambda_l2":        10.0,
+    "learning_rate":    0.03,
+    "num_leaves":       15,
+    "max_depth":        4,
+    "feature_fraction": 0.6,
+    "bagging_fraction": 0.7,
+    "bagging_freq":     1,
+    "min_data_in_leaf": 300,
+    "lambda_l1":        5.0,
+    "lambda_l2":        20.0,
     "verbose":          -1,
     "seed":             42,
     "feature_fraction_seed": 42,
@@ -133,8 +133,8 @@ LGBM_FINAL_PARAMS: dict = {
     "data_random_seed": 42,
 }
 
-LGBM_FINAL_NUM_BOOST_ROUND: int = 400
-LGBM_FINAL_EARLY_STOPPING: int = 30
+LGBM_FINAL_NUM_BOOST_ROUND: int = 250
+LGBM_FINAL_EARLY_STOPPING: int = 20
 
 # ─── Time budget ──────────────────────────────────────────────────────────────
 
