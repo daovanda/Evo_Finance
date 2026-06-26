@@ -49,6 +49,7 @@ from model.data_utils  import (
     label_dataframe,
     make_walk_forward_folds,
     split_labeled_by_dates,
+    tickers_missing_sector,
     validate_ohlcv,
 )
 from model.trainer     import Trainer
@@ -106,11 +107,12 @@ def _hitrate_per_date(
     for date in np.unique(dates_arr):
         mask = dates_arr == date
         grp  = data[mask]
-        if len(grp) < top_k:
+        k = min(int(top_k), len(grp))
+        if k <= 0:
             continue
-        top_pred  = set(grp.nlargest(top_k, "pred").index)
-        top_label = set(grp.nlargest(top_k, "label").index)
-        hits[date] = len(top_pred & top_label) / top_k
+        top_pred  = set(grp.nlargest(k, "pred").index)
+        top_label = set(grp.nlargest(k, "label").index)
+        hits[date] = len(top_pred & top_label) / k
 
     return pd.Series(hits).sort_index()
 
@@ -768,6 +770,14 @@ def analyze(
     logger.info("Loading data from %s …", data_dir)
     df = load_from_dir(data_dir, tickers=tickers)
     validate_ohlcv(df)
+    missing_sector = tickers_missing_sector(df)
+    if missing_sector:
+        logger.warning(
+            "SECTORS mapping is missing %d tickers: %s. "
+            "Sector primitives will group them as Unknown.",
+            len(missing_sector),
+            missing_sector,
+        )
 
     # ── Split ─────────────────────────────────────────────────────────────────
     labeled_df = label_dataframe(df)
@@ -776,6 +786,7 @@ def analyze(
         val_start=val_start,
         test_start=test_start,
         test_end=test_end,
+        purge_days=wf_purge_days,
     )
     feature_df = labeled_df.sort_index()
     logger.info(
@@ -911,7 +922,7 @@ def analyze(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Evo_Finance Analyzer — IC + Hit Rate charts",
+        description="Evo_Finance Analyzer - IC + Hit Rate charts",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument("--data-dir",   required=True, metavar="DIR")

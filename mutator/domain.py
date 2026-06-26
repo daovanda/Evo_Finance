@@ -25,12 +25,21 @@ from mutator.gene import (
     SECTOR_CS_OPS, SECTOR_NOARG_OPS, SECTOR_WINDOW_OPS, TS_ROLLING_OPS,
 )
 from mutator.evaluator import evaluate, has_division_by_zero
-from mutator.formula_guard import const_threshold_violation
+from mutator.formula_guard import const_threshold_violation, raw_scale_violation
 
 logger = logging.getLogger(__name__)
 
 # Raw base columns (order preserved)
 _RAW_BASES = ["open", "high", "close", "low", "volume"]
+_BLOCKED_BREADTH_NOARG_OPS = {
+    "advance_count", "decline_count", "unchanged_count",
+    "advance_decline_spread",
+}
+_BLOCKED_SECTOR_NOARG_OPS = {
+    "sector_code", "sector_size",
+    "sector_advance_count", "sector_decline_count", "sector_unchanged_count",
+    "sector_advance_decline_spread",
+}
 
 
 class Domain:
@@ -41,8 +50,9 @@ class Domain:
 
     def __init__(self):
         self._formulas: List[str] = []
-        # Cache: formula → computed Series on train set
+        # Cache: formula -> computed Series for the current train context.
         self._cache: dict[str, pd.Series] = {}
+        self._cache_context_key: tuple | None = None
 
     # ── Initialisation ────────────────────────────────────────────────────────
 
@@ -120,6 +130,14 @@ class Domain:
                 violation,
             )
             return False
+        violation = raw_scale_violation(gene.formula)
+        if violation is not None:
+            logger.debug(
+                "Domain.try_add: reject raw-scale feature %r - %s",
+                gene.formula,
+                violation,
+            )
+            return False
 
         if not force:
             try:
@@ -146,7 +164,10 @@ class Domain:
             for existing_formula in self._formulas:
                 ex_series = self._cache.get(existing_formula)
                 if ex_series is None:
-                    continue
+                    try:
+                        ex_series = self._compute(existing_formula, train_df)
+                    except Exception:
+                        continue
                 corr = _safe_corr(new_series, ex_series)
                 if abs(corr) >= CORR_THRESHOLD:
                     return False
@@ -165,6 +186,7 @@ class Domain:
         slow_sec: float = 1.0,
     ) -> None:
         """Materialise all domain formulas on train_df with progress logging."""
+        self._ensure_cache_context(train_df)
         total = len(self._formulas)
         start = time.perf_counter()
         computed = skipped = failed = 0
@@ -219,14 +241,44 @@ class Domain:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _compute(self, formula: str, df: pd.DataFrame) -> pd.Series:
+        self._ensure_cache_context(df)
         if formula in self._cache:
             return self._cache[formula]
         series = evaluate(formula, df).replace([np.inf, -np.inf], np.nan).dropna()
         self._cache[formula] = series
         return series
 
+    def _ensure_cache_context(self, df: pd.DataFrame) -> None:
+        key = _dataframe_cache_key(df)
+        if self._cache_context_key == key:
+            return
+        if self._cache:
+            logger.debug(
+                "Domain cache context changed; clearing %d cached formulas.",
+                len(self._cache),
+            )
+            self._cache.clear()
+        self._cache_context_key = key
+
 
 # ─── Utility ──────────────────────────────────────────────────────────────────
+
+def _dataframe_cache_key(df: pd.DataFrame) -> tuple:
+    if len(df.index) == 0:
+        first = last = None
+    else:
+        first = df.index[0]
+        last = df.index[-1]
+    return (
+        id(df),
+        id(df.index),
+        len(df),
+        tuple(df.index.names),
+        tuple(df.columns),
+        first,
+        last,
+    )
+
 
 def _finance_seed_formulas() -> List[str]:
     formulas: List[str] = []
@@ -240,11 +292,17 @@ def _finance_seed_formulas() -> List[str]:
     for op in FINANCE_WINDOW_OPS:
         formulas.extend(f"{op}({w})" for w in WINDOWS)
 
-    formulas.extend(f"{op}()" for op in BREADTH_NOARG_OPS)
+    formulas.extend(
+        f"{op}()"
+        for op in BREADTH_NOARG_OPS
+        if op not in _BLOCKED_BREADTH_NOARG_OPS
+    )
     for op in BREADTH_WINDOW_OPS:
         formulas.extend(f"{op}({w})" for w in WINDOWS)
 
     for op in SECTOR_NOARG_OPS:
+        if op in _BLOCKED_SECTOR_NOARG_OPS:
+            continue
         formulas.append(f"{op}()")
     for op in SECTOR_WINDOW_OPS:
         formulas.extend(f"{op}({w})" for w in WINDOWS)
@@ -252,7 +310,7 @@ def _finance_seed_formulas() -> List[str]:
         formulas.extend(
             f"{op}({expr})"
             for expr in (
-                "close_1", "ret(close_1, 1)", "volume_ratio(20)",
+                "ret(close_1, 1)", "volume_ratio(20)",
                 "rsi(close_1, 14)", "rel_sector_ret(20)",
             )
         )
@@ -382,27 +440,17 @@ def _finance_seed_formulas() -> List[str]:
             "idiosyncratic_vol(20)",
             "up_capture(20)",
             "down_capture(20)",
-            "advance_count()",
-            "decline_count()",
-            "unchanged_count()",
             "advance_ratio()",
             "decline_ratio()",
             "advance_decline_ratio()",
-            "advance_decline_spread()",
             "advance_decline_net_pct()",
             "cs_dispersion()",
             "pct_above_ma(20)",
             "pct_above_ma(60)",
             "breadth_momentum(20)",
-            "sector_code()",
-            "sector_size()",
-            "sector_advance_count()",
-            "sector_decline_count()",
-            "sector_unchanged_count()",
             "sector_advance_ratio()",
             "sector_decline_ratio()",
             "sector_advance_decline_ratio()",
-            "sector_advance_decline_spread()",
             "sector_advance_decline_net_pct()",
             "sector_dispersion()",
             "sector_ret(20)",
@@ -473,6 +521,14 @@ def individual_corr_check(
     if violation is not None:
         logger.debug(
             "corr_check: reject unsafe const threshold %r - %s",
+            new_gene.formula,
+            violation,
+        )
+        return False
+    violation = raw_scale_violation(new_gene.formula)
+    if violation is not None:
+        logger.debug(
+            "corr_check: reject raw-scale feature %r - %s",
             new_gene.formula,
             violation,
         )

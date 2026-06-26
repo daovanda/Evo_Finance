@@ -78,23 +78,25 @@ def _hit_rate(
     for date in np.unique(dates_arr):
         mask = dates_arr == date
         grp = data[mask]
-        if len(grp) < top_k:
+        k = min(int(top_k), len(grp))
+        if k <= 0:
             continue
-        top_pred = set(grp.nlargest(top_k, "pred").index)
-        top_label = set(grp.nlargest(top_k, "label").index)
-        hits.append(len(top_pred & top_label) / top_k)
+        top_pred = set(grp.nlargest(k, "pred").index)
+        top_label = set(grp.nlargest(k, "label").index)
+        hits.append(len(top_pred & top_label) / k)
 
     return float(np.mean(hits)) if hits else 0.0
 
 
 def _random_hit_baseline(df: pd.DataFrame, top_k: int = HIT_RATE_TOP_K) -> float:
-    if isinstance(df.index, pd.MultiIndex):
-        n_tickers = int(df.index.get_level_values("ticker").nunique())
-    else:
-        n_tickers = len(df)
-    if n_tickers <= 0:
+    if len(df) == 0:
         return 0.0
-    return min(1.0, float(top_k) / float(n_tickers))
+    if isinstance(df.index, pd.MultiIndex):
+        per_date = df.groupby(level="date").size()
+        daily = [min(1.0, float(top_k) / float(n)) for n in per_date if n > 0]
+        return float(np.mean(daily)) if daily else 0.0
+    n_tickers = len(df)
+    return min(1.0, float(top_k) / float(n_tickers)) if n_tickers > 0 else 0.0
 
 
 @dataclass

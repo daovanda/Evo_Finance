@@ -243,6 +243,33 @@ class FinancePrimitiveTests(unittest.TestCase):
         self.assertFalse(domain.try_add(inverse, df))
         self.assertNotIn(inverse.formula, domain.formulas)
 
+    def test_domain_lazy_corr_checks_uncached_existing_formulas(self):
+        df = _sample_df(periods=20)
+        domain = Domain()
+        base = Gene("ret(close_1, 1)")
+        domain.try_add(base, df, force=True)
+        self.assertNotIn(base.formula, domain._cache)
+
+        inverse = Gene("(const(0) - ret(close_1, 1))")
+
+        self.assertFalse(domain.try_add(inverse, df))
+        self.assertNotIn(inverse.formula, domain.formulas)
+        self.assertIn(base.formula, domain._cache)
+
+    def test_domain_cache_is_scoped_to_dataframe_context(self):
+        df = _sample_df(periods=20)
+        shifted_df = df.copy()
+        shifted_df["close"] = shifted_df["close"] + 100.0
+        formula = "ret(close_1, 1)"
+        domain = Domain()
+
+        first = domain._compute(formula, df)
+        self.assertIn(formula, domain._cache)
+        second = domain._compute(formula, shifted_df)
+
+        self.assertIn(formula, domain._cache)
+        self.assertFalse(first.equals(second))
+
     def test_finance_primitives_evaluate(self):
         df = _sample_df()
 
@@ -548,14 +575,30 @@ class FinancePrimitiveTests(unittest.TestCase):
             self.assertIn(f"{op}(20)", domain.formulas)
         for op in MARKET_WINDOW_OPS:
             self.assertIn(f"{op}(20)", domain.formulas)
+        blocked_breadth_noarg = {
+            "advance_count", "decline_count", "unchanged_count",
+            "advance_decline_spread",
+        }
         for op in BREADTH_NOARG_OPS:
-            self.assertIn(f"{op}()", domain.formulas)
+            if op in blocked_breadth_noarg:
+                self.assertNotIn(f"{op}()", domain.formulas)
+            else:
+                self.assertIn(f"{op}()", domain.formulas)
         for op in BREADTH_WINDOW_OPS:
             self.assertIn(f"{op}(20)", domain.formulas)
         for op in SECTOR_CS_OPS:
             self.assertIn(f"{op}(ret(close_1, 1))", domain.formulas)
+        blocked_sector_noarg = {
+            "sector_code", "sector_size",
+            "sector_advance_count", "sector_decline_count",
+            "sector_unchanged_count",
+            "sector_advance_decline_spread",
+        }
         for op in SECTOR_NOARG_OPS:
-            self.assertIn(f"{op}()", domain.formulas)
+            if op in blocked_sector_noarg:
+                self.assertNotIn(f"{op}()", domain.formulas)
+            else:
+                self.assertIn(f"{op}()", domain.formulas)
         for op in SECTOR_WINDOW_OPS:
             self.assertIn(f"{op}(20)", domain.formulas)
         for op in FINANCE_TWO_WINDOW_OPS:
@@ -614,16 +657,12 @@ class FinancePrimitiveTests(unittest.TestCase):
             "rel_strength(20)", "market_corr(20)", "market_beta(20)",
             "market_alpha(20)", "idiosyncratic_vol(20)",
             "up_capture(20)", "down_capture(20)",
-            "advance_count()", "decline_count()", "unchanged_count()",
             "advance_ratio()", "decline_ratio()", "advance_decline_ratio()",
-            "advance_decline_spread()", "advance_decline_net_pct()",
+            "advance_decline_net_pct()",
             "cs_dispersion()", "pct_above_ma(20)", "pct_above_ma(60)",
             "breadth_momentum(20)",
-            "sector_code()", "sector_size()", "sector_advance_count()",
-            "sector_decline_count()", "sector_unchanged_count()",
             "sector_advance_ratio()", "sector_decline_ratio()",
             "sector_advance_decline_ratio()",
-            "sector_advance_decline_spread()",
             "sector_advance_decline_net_pct()", "sector_dispersion()",
             "sector_ret(20)", "sector_vol(20)", "sector_drawdown(20)",
             "sector_ma_ratio(20)", "sector_rsi(14)", "sector_pos(20)",

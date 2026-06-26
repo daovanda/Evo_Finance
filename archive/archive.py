@@ -9,8 +9,9 @@ Admission rule
     - Its score > the worst score in the archive.
   The worst individual is then evicted.
 
-Each stored entry also keeps the trained booster so we can run test-set
-evaluation at the end without retraining.
+Freshly evaluated entries keep their latest trained booster. Loaded resume
+entries do not contain boosters in JSON; final validation/test evaluation
+re-trains archived individuals before reporting out-of-sample metrics.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ArchiveEntry:
     individual: Individual
-    booster:    lgb.Booster
+    booster:    Optional[lgb.Booster]
     score:      float
     metrics:    Dict[str, float] = field(default_factory=dict)
     final_val_metrics: Dict[str, float] = field(default_factory=dict)
@@ -87,6 +88,44 @@ class Archive:
         logger.debug(
             "Archive: rejected score=%.4f (worst=%.4f)", score, worst.score
         )
+        return False
+
+    def add_loaded(
+        self,
+        individual: Individual,
+        score: float,
+        metrics: Optional[Dict[str, float]] = None,
+        final_val_metrics: Optional[Dict[str, float]] = None,
+        test_metrics: Optional[Dict[str, float]] = None,
+    ) -> bool:
+        """
+        Add an already-scored individual loaded from archive JSON.
+
+        Resume archives do not contain LightGBM boosters, so the booster is
+        intentionally left as None until a later evaluation retrains it.
+        """
+        individual.score = float(score)
+        individual.metrics = dict(metrics or {})
+        entry = ArchiveEntry(
+            individual=individual,
+            booster=None,
+            score=float(score),
+            metrics=dict(individual.metrics),
+            final_val_metrics=dict(final_val_metrics or {}),
+            test_metrics=dict(test_metrics or {}),
+        )
+
+        if len(self._entries) < self.max_size:
+            self._entries.append(entry)
+            self._entries.sort(key=lambda e: e.score, reverse=True)
+            return True
+
+        worst = self._entries[-1]
+        if entry.score > worst.score:
+            self._entries.pop()
+            self._entries.append(entry)
+            self._entries.sort(key=lambda e: e.score, reverse=True)
+            return True
         return False
 
     # ── Random selection (for mutation parent) ────────────────────────────────

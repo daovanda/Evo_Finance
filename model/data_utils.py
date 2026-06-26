@@ -15,6 +15,7 @@ import pandas as pd
 from config.settings import (
     HOLDING_HORIZON,
     LABEL_FN,
+    SECTORS,
     TEST_END,
     TEST_START,
     VAL_START,
@@ -64,8 +65,15 @@ def split_labeled_by_dates(
     val_start: str = VAL_START,
     test_start: str = TEST_START,
     test_end: Optional[str] = TEST_END,
+    purge_days: int = 0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Split an already-labeled dataframe into final train/val/test."""
+    """
+    Split an already-labeled dataframe into final train/val/test.
+
+    purge_days removes the last N trading dates before each split boundary from
+    the earlier split. This prevents labels near VAL_START/TEST_START from using
+    future prices from the next period.
+    """
     _validate_index(labeled_df)
     if "label" not in labeled_df.columns:
         raise ValueError("labeled_df must contain a 'label' column.")
@@ -91,8 +99,13 @@ def split_labeled_by_dates(
             f"TEST_END ({test_end}) must be >= TEST_START ({test_start})."
         )
 
-    train_mask = all_dates < val_start_ts
-    val_mask = (all_dates >= val_start_ts) & (all_dates < test_start_ts)
+    unique_dates = pd.DatetimeIndex(sorted(pd.unique(all_dates)))
+    purge_days = max(int(purge_days), 0)
+    train_end_ts = _purged_boundary(unique_dates, val_start_ts, purge_days)
+    val_end_ts = _purged_boundary(unique_dates, test_start_ts, purge_days)
+
+    train_mask = all_dates < train_end_ts
+    val_mask = (all_dates >= val_start_ts) & (all_dates < val_end_ts)
     if test_end_ts is not None:
         test_mask = (all_dates >= test_start_ts) & (all_dates <= test_end_ts)
     else:
@@ -107,16 +120,17 @@ def split_labeled_by_dates(
     logger = logging.getLogger(__name__)
     logger.info(
         "Final split: train [%s -> %s) %d rows | val [%s -> %s) %d rows | "
-        "test [%s -> %s] %d rows",
+        "test [%s -> %s] %d rows | purge=%d trading days",
         data_start.date(),
-        val_start,
+        train_end_ts.date(),
         len(train_df),
         val_start,
-        test_start,
+        val_end_ts.date(),
         len(val_df),
         test_start,
         test_end or data_end.date(),
         len(test_df),
+        purge_days,
     )
 
     return train_df, val_df, test_df
@@ -143,6 +157,7 @@ def split_and_label(
         val_start=val_start,
         test_start=test_start,
         test_end=test_end,
+        purge_days=holding_horizon,
     )
 
 
@@ -229,6 +244,21 @@ def validate_ohlcv(df: pd.DataFrame) -> None:
     _validate_index(df)
 
 
+def tickers_missing_sector(df: pd.DataFrame) -> list[str]:
+    """Return tickers present in df but absent from the SECTORS mapping."""
+    _validate_index(df)
+    mapped = {
+        str(ticker).upper()
+        for tickers in SECTORS.values()
+        for ticker in tickers
+    }
+    present = {
+        str(ticker).upper()
+        for ticker in df.index.get_level_values("ticker").unique()
+    }
+    return sorted(present - mapped)
+
+
 def _validate_index(df: pd.DataFrame) -> None:
     if not isinstance(df.index, pd.MultiIndex):
         raise ValueError("DataFrame must have MultiIndex (date, ticker).")
@@ -246,3 +276,16 @@ def _first_date_at_or_after(
     if pos >= len(dates):
         return None
     return dates[pos]
+
+
+def _purged_boundary(
+    dates: pd.DatetimeIndex,
+    boundary: pd.Timestamp,
+    purge_days: int,
+) -> pd.Timestamp:
+    """Return the exclusive end date for the previous split after purge."""
+    pos = int(dates.searchsorted(boundary, side="left"))
+    purged_pos = max(pos - max(int(purge_days), 0), 0)
+    if purged_pos >= len(dates):
+        return boundary
+    return dates[purged_pos]

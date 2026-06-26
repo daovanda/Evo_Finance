@@ -10,6 +10,7 @@ from datetime import datetime
 import os
 import numpy as np
 import time
+from config.settings import MARKET_INDEX_TICKER
 
 # =========================
 # CONFIG
@@ -66,28 +67,31 @@ for ticker in TICKERS:
     time.sleep(5)  # Giữ khoảng cách giữa các request để tránh bị rate limit
 
 # =========================
-# VNINDEX - FIXED
+# MARKET INDEX - FIXED
 # =========================
-print("📥 Loading VNINDEX")
+market_ticker = str(MARKET_INDEX_TICKER).strip().upper() if MARKET_INDEX_TICKER else ""
 
-stock = vn.stock(symbol="VNINDEX")
-df = stock.quote.history(
-    start=START_DATE,
-    end=END_DATE,
-    interval="1D"
-)
-df = df.rename(columns={"time": "date"})
-df["date"] = pd.to_datetime(df["date"])
-df = df[["date", "open", "high", "low", "close", "volume"]]
+if market_ticker:
+    print(f"📥 Loading {market_ticker}")
 
-# FIXED: Chỉ giữ ngày giao dịch
-df = df[df["volume"] > 0].copy()
+    stock = vn.stock(symbol=market_ticker)
+    df = stock.quote.history(
+        start=START_DATE,
+        end=END_DATE,
+        interval="1D"
+    )
+    df = df.rename(columns={"time": "date"})
+    df["date"] = pd.to_datetime(df["date"])
+    df = df[["date", "open", "high", "low", "close", "volume"]]
 
-# FIX duplicate last date
-df = df.drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
+    # FIXED: Chỉ giữ ngày giao dịch
+    df = df[df["volume"] > 0].copy()
 
-df["is_trading_day"] = 1
+    # FIX duplicate last date
+    df = df.drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
 
-df.to_csv(f"{OUTPUT_DIR}/VNINDEX.csv", index=False)
+    df["is_trading_day"] = 1
+
+    df.to_csv(f"{OUTPUT_DIR}/{market_ticker}.csv", index=False)
 
 print("✅ DONE - Only trading days saved")

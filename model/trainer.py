@@ -6,8 +6,8 @@ lambdarank model, and returns raw predictions for fitness evaluation.
 
 Data layout assumption
   df : pd.DataFrame with MultiIndex (date, ticker) or flat, containing
-       columns [open, high, close, low, volume] plus a 'label' column
-       (forward return) and a 'group_date' column for LightGBM group sizes.
+       columns [open, high, close, low, volume] plus a 'label' column.
+       LightGBM group sizes are derived from the date index/column.
 
 The caller (main loop) is responsible for supplying pre-split DataFrames:
   train_df, val_df, test_df — each already has 'label' computed.

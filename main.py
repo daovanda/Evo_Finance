@@ -11,7 +11,7 @@ Usage
 
 Resume
 ------
-    python main.py --data path/to/ohlcv.parquet --budget 3600 --resume-archive path/to/archive.json
+    python main.py --data path/to/ohlcv.parquet --budget 3600 --resume path/to/archive.json
     python main.py --data-dir data/raw --budget 10800 --resume results/archive_test7_wf.json --save results/archive_test7_wf.json
 
 The input file must be a Parquet (or CSV) with a MultiIndex (date, ticker)
@@ -37,16 +37,16 @@ from config.settings import (
     VAL_START, TEST_START, TEST_END,
     WF_END, WF_MIN_TRAIN_MONTHS, WF_VAL_MONTHS,
     WF_STEP_MONTHS, WF_PURGE_DAYS, DOMAIN_PRECOMPUTE_ON_START,
-    CHECKPOINT_EVERY_SECONDS,
+    CHECKPOINT_EVERY_SECONDS, FEATURE_MIN, FEATURE_MAX,
 )
 from mutator.gene       import Gene, Individual
 from mutator.domain     import Domain
-from mutator.formula_guard import const_threshold_violation
+from mutator.formula_guard import const_threshold_violation, raw_scale_violation
 from mutator.mutator    import Mutator
 from model.trainer      import Trainer
 from model.data_utils   import (
     label_dataframe, make_walk_forward_folds,
-    split_labeled_by_dates, validate_ohlcv,
+    split_labeled_by_dates, tickers_missing_sector, validate_ohlcv,
 )
 from fitness.fitness    import (
     FitnessEvaluator, FoldPrediction, _hit_rate, _ic_per_date,
@@ -60,6 +60,14 @@ logging.basicConfig(
     datefmt= "%H:%M:%S",
 )
 logger = logging.getLogger("evo_finance.main")
+
+SAFE_SEED_FORMULAS = (
+    "ret(close_1, 5)",
+    "ret(close_1, 20)",
+    "ma_ratio(close_1, 20)",
+    "volume_ratio(20)",
+    "rsi(close_1, 14)",
+)
 
 
 # ─── Core loop ────────────────────────────────────────────────────────────────
@@ -89,7 +97,7 @@ def run(
     ----------
     df           : OHLCV DataFrame with MultiIndex (date, ticker).
     time_budget  : Wall-clock seconds to run.
-    restart_prob : Probability of restarting from raw OHLCV each iteration.
+    restart_prob : Probability of restarting from normalized seed features.
     seed         : Master RNG seed.
     save_archive : If provided, write archive summary JSON to this path.
     val_start    : Ngày đầu val  (= kết thúc train). Ví dụ "2022-01-01"
@@ -97,6 +105,14 @@ def run(
     test_end     : Ngày cuối test (None = hết data).
     """
     validate_ohlcv(df)
+    missing_sector = tickers_missing_sector(df)
+    if missing_sector:
+        logger.warning(
+            "SECTORS mapping is missing %d tickers: %s. "
+            "Sector primitives will group them as Unknown.",
+            len(missing_sector),
+            missing_sector,
+        )
     rng = np.random.default_rng(seed)
 
     # ── Data split + labels ───────────────────────────────────────────────────
@@ -107,6 +123,7 @@ def run(
         val_start=val_start,
         test_start=test_start,
         test_end=test_end,
+        purge_days=wf_purge_days,
     )
     logger.info(
         "Final sizes: train=%d rows | val=%d rows | test=%d rows",
@@ -139,7 +156,7 @@ def run(
 
     # ── Initialise components ─────────────────────────────────────────────────
     domain    = Domain()
-    seed_genes = domain.seed(window=DEFAULT_WINDOW)
+    domain.seed(window=DEFAULT_WINDOW)
     if DOMAIN_PRECOMPUTE_ON_START:
         domain.precompute(wf_feature_df)
     else:
@@ -163,10 +180,10 @@ def run(
             recheck=resume_recheck,
         )
 
-    # ── First individual: raw OHLCV ───────────────────────────────────────────
+    # ── First individual: normalized seed features ────────────────────────────
     if archive.is_empty():
-        logger.info("Evaluating seed individual (raw OHLCV) ...")
-        seed_ind = Individual.seed(window=DEFAULT_WINDOW)
+        logger.info("Evaluating seed individual (normalized features) ...")
+        seed_ind = _safe_seed_individual()
         _evaluate_and_archive_wf(
             seed_ind, trainer, evaluator, archive,
             wf_folds, wf_feature_df,
@@ -190,14 +207,14 @@ def run(
 
         # restart?
         if rng.random() < restart_prob:
-            logger.info("RESTART: resetting to raw OHLCV individual.")
-            parent = Individual.seed(window=DEFAULT_WINDOW)
+            logger.info("RESTART: resetting to normalized seed individual.")
+            parent = _safe_seed_individual()
         elif archive.is_empty():
-            parent = Individual.seed(window=DEFAULT_WINDOW)
+            parent = _safe_seed_individual()
             _evaluate_and_archive_wf(parent, trainer, evaluator, archive, wf_folds, wf_feature_df)
             continue
         else:
-            parent = archive.random_individual(rng)
+            parent = _safe_parent_for_evolution(archive.random_individual(rng))
 
         # mutate
         try:
@@ -308,6 +325,8 @@ def _load_archive_json_into_archive(
 
     loaded = 0
     skipped = 0
+    unsafe_genes = 0
+    unsafe_examples: list[str] = []
     logger.info(
         "Loading resume archive from %s (%d entries, recheck=%s) ...",
         path,
@@ -318,6 +337,11 @@ def _load_archive_json_into_archive(
     for row in rows:
         try:
             individual = _archive_row_to_individual(row)
+            violations = _legacy_guard_violations(individual)
+            unsafe_genes += len(violations)
+            for formula, reason in violations:
+                if len(unsafe_examples) < 5:
+                    unsafe_examples.append(f"{formula} ({reason})")
             if recheck:
                 admitted = _evaluate_and_archive_wf(
                     individual,
@@ -356,16 +380,20 @@ def _load_archive_json_into_archive(
         len(archive),
         archive.best.score if archive.best else float("nan"),
     )
+    if unsafe_genes:
+        logger.warning(
+            "Resume archive contains %d legacy guard-violating genes. "
+            "They are kept for compatibility, but new mutations will reject "
+            "these patterns. Examples: %s",
+            unsafe_genes,
+            "; ".join(unsafe_examples),
+        )
 
 
 def _archive_row_to_individual(row: dict) -> Individual:
     formulas = row.get("genes")
     if not isinstance(formulas, list) or not formulas:
         raise ValueError("archive row has no genes list")
-    for formula in formulas:
-        violation = const_threshold_violation(str(formula))
-        if violation is not None:
-            raise ValueError(f"archive row has unsafe const-threshold gene: {violation}")
     genes = [Gene(formula=str(formula)) for formula in formulas]
     score = _safe_float(row.get("score"))
     generation = int(row.get("generation") or 0)
@@ -374,6 +402,52 @@ def _archive_row_to_individual(row: dict) -> Individual:
         score=score,
         metrics=_archive_metrics_from_row(row),
         generation=generation,
+    )
+
+
+def _legacy_guard_violations(individual: Individual) -> list[tuple[str, str]]:
+    violations: list[tuple[str, str]] = []
+    for formula in individual.formulas:
+        reason = const_threshold_violation(formula) or raw_scale_violation(formula)
+        if reason is not None:
+            violations.append((formula, reason))
+    return violations
+
+
+def _safe_seed_individual() -> Individual:
+    return Individual(
+        genes=[Gene(formula=formula) for formula in SAFE_SEED_FORMULAS],
+        generation=0,
+    )
+
+
+def _safe_parent_for_evolution(individual: Optional[Individual]) -> Individual:
+    """
+    Return a guard-safe parent for future mutations.
+
+    Loaded legacy archives are kept intact for compatibility and final
+    re-evaluation, but unsafe legacy genes should not keep reproducing into new
+    children. This helper filters them only at parent-selection time.
+    """
+    if individual is None:
+        return _safe_seed_individual()
+
+    safe_formulas: list[str] = []
+    for formula in individual.formulas:
+        reason = const_threshold_violation(formula) or raw_scale_violation(formula)
+        if reason is None and formula not in safe_formulas:
+            safe_formulas.append(formula)
+
+    for formula in SAFE_SEED_FORMULAS:
+        if len(safe_formulas) >= FEATURE_MIN:
+            break
+        if formula not in safe_formulas:
+            safe_formulas.append(formula)
+
+    safe_formulas = safe_formulas[:FEATURE_MAX]
+    return Individual(
+        genes=[Gene(formula=formula) for formula in safe_formulas],
+        generation=individual.generation,
     )
 
 
@@ -493,24 +567,6 @@ def _print_summary(archive: Archive, total_iters: int, elapsed: float) -> None:
             f"{r['n_genes']:>6}"
         )
     print(f"{'='*100}\n")
-    return
-    print(f"\n{'='*70}")
-    print(f"Evo_Finance — Final Archive  ({total_iters} iterations, {elapsed:.1f}s)")
-    print(f"{'='*70}")
-    header = f"{'Rank':>4}  {'Score':>7}  {'ValIC':>6}  {'ICIR':>6}  "
-    header += f"{'Hit':>5}  {'Gap':>5}  {'TestIC':>7}  {'nGenes':>6}"
-    print(header)
-    print("-" * 70)
-    for r in rows:
-        tm = r.get("test_metrics", {})
-        print(
-            f"{r['rank']:>4}  {r['score']:>7.4f}  "
-            f"{r['val_mean_ic']:>6.4f}  {r['val_icir']:>6.4f}  "
-            f"{r['hit_rate']:>5.4f}  {r['overfit_gap']:>5.4f}  "
-            f"{tm.get('test_mean_ic', float('nan')):>7.4f}  "
-            f"{r['n_genes']:>6}"
-        )
-    print(f"{'='*70}\n")
 
 
 def _fmt_metric(value) -> str:
@@ -596,7 +652,7 @@ def _load_data(path: str) -> pd.DataFrame:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Evo_Finance — evolutionary feature selection cho mô hình LightGBM lambdarank",
+        description="Evo_Finance evolutionary feature selection for LightGBM lambdarank",
         formatter_class=argparse.RawTextHelpFormatter,
     )
 
@@ -606,16 +662,16 @@ if __name__ == "__main__":
         "--data-dir",
         metavar="DIR",
         help=(
-            "Thư mục chứa các file <TICKER>.csv sinh ra bởi craw_data.py\n"
-            "Ví dụ: --data-dir data/raw"
+            "Directory containing <TICKER>.csv files generated by craw_data.py\n"
+            "Example: --data-dir data/raw"
         ),
     )
     data_grp.add_argument(
         "--data",
         metavar="FILE",
         help=(
-            "File parquet/csv duy nhất đã có MultiIndex (date, ticker)\n"
-            "Ví dụ: --data data/all_stocks.parquet"
+            "Single parquet/csv file with MultiIndex (date, ticker)\n"
+            "Example: --data data/all_stocks.parquet"
         ),
     )
 
@@ -626,8 +682,8 @@ if __name__ == "__main__":
         metavar="TICKER",
         default=None,
         help=(
-            "Chỉ load một số ticker nhất định (mặc định: tất cả file trong thư mục)\n"
-            "Ví dụ: --tickers ACB VCB TCB HPG"
+            "Load only selected tickers (default: all files in the directory)\n"
+            "Example: --tickers ACB VCB TCB HPG"
         ),
     )
 
@@ -637,27 +693,27 @@ if __name__ == "__main__":
         type=float,
         default=TIME_BUDGET_SECONDS,
         metavar="SECONDS",
-        help=f"Ngân sách thời gian chạy (giây). Mặc định: {TIME_BUDGET_SECONDS}",
+        help=f"Runtime budget in seconds. Default: {TIME_BUDGET_SECONDS}",
     )
     parser.add_argument(
         "--restart",
         type=float,
         default=RESTART_PROB,
         metavar="PROB",
-        help=f"Xác suất restart về OHLCV gốc. Mặc định: {RESTART_PROB}",
+        help=f"Xac suat restart ve normalized seed. Mac dinh: {RESTART_PROB}",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=42,
-        help="Random seed. Mặc định: 42",
+        help="Random seed. Default: 42",
     )
     parser.add_argument(
         "--save",
         type=str,
         default=None,
         metavar="PATH",
-        help="Lưu kết quả archive ra file JSON. Ví dụ: --save results/archive.json",
+        help="Save archive results to a JSON file. Example: --save results/archive.json",
     )
 
     # ── Ngày split ───────────────────────────────────────────────────────────
@@ -689,8 +745,8 @@ if __name__ == "__main__":
         default=VAL_START,
         metavar="DATE",
         help=(
-            "Ngày đầu tiên của val = kết thúc train (YYYY-MM-DD)\n"
-            f"Mặc định: {VAL_START}"
+            "First validation date = train end (YYYY-MM-DD)\n"
+            f"Default: {VAL_START}"
         ),
     )
     parser.add_argument(
@@ -699,8 +755,8 @@ if __name__ == "__main__":
         default=TEST_START,
         metavar="DATE",
         help=(
-            "Ngày đầu tiên của test = kết thúc val (YYYY-MM-DD)\n"
-            f"Mặc định: {TEST_START}"
+            "First test date = validation end (YYYY-MM-DD)\n"
+            f"Default: {TEST_START}"
         ),
     )
     parser.add_argument(
@@ -709,8 +765,8 @@ if __name__ == "__main__":
         default=TEST_END,
         metavar="DATE",
         help=(
-            "Ngày cuối test (YYYY-MM-DD). None = lấy hết data còn lại\n"
-            f"Mặc định: {TEST_END or 'hết data'}"
+            "Last test date (YYYY-MM-DD). None = use all remaining data\n"
+            f"Default: {TEST_END or 'end of data'}"
         ),
     )
 

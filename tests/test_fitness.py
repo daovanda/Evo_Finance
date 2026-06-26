@@ -8,6 +8,8 @@ from fitness.fitness import (
     FitnessEvaluator,
     FoldPrediction,
     _ic_per_date,
+    _hit_rate,
+    _random_hit_baseline,
 )
 from mutator.gene import Individual
 
@@ -34,6 +36,20 @@ class FitnessMetricTests(unittest.TestCase):
         self.assertEqual(constant_warnings, [])
         self.assertEqual(ic.loc[dates[0]], 0.0)
         self.assertEqual(ic.loc[dates[1]], 0.0)
+
+    def test_hit_rate_uses_available_universe_when_top_k_is_too_large(self):
+        dates = pd.date_range("2024-01-01", periods=2)
+        tickers = ["AAA", "BBB", "CCC"]
+        idx = pd.MultiIndex.from_product(
+            [dates, tickers],
+            names=["date", "ticker"],
+        )
+        pred = pd.Series([3.0, 2.0, 1.0, 1.0, 3.0, 2.0], index=idx)
+        label = pd.Series([3.0, 2.0, 1.0, 1.0, 3.0, 2.0], index=idx)
+        df = pd.DataFrame(index=idx)
+
+        self.assertEqual(_hit_rate(pred, label, idx, top_k=10), 1.0)
+        self.assertEqual(_random_hit_baseline(df, top_k=10), 1.0)
 
     def test_walk_forward_fitness_penalizes_fold_train_val_gap(self):
         dates = pd.date_range("2024-01-01", periods=4)

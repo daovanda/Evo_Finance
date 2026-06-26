@@ -8,10 +8,9 @@ Expected input (per file at <data_dir>/<TICKER>.csv):
     date, open, high, low, close, volume, is_trading_day
 
 Key behaviours
-  - Chỉ giữ ngày giao dịch thực sự (is_trading_day == 1 hoặc volume > 0).
-  - Align tất cả ticker về cùng tập ngày giao dịch (union).
-  - Ngày thiếu của 1 ticker → forward-fill (giá) hoặc 0 (volume), đánh dấu
-    is_trading_day = 0.  Ticker nào thiếu quá MISSING_DAY_THRESHOLD thì bị drop.
+  - Chỉ giữ ngày giao dịch thực sự (volume > 0).
+  - Align tất cả ticker về phần giao nhau của ngày giao dịch.
+  - Không forward-fill giá: mỗi hàng đều là dữ liệu giao dịch thật.
   - Trả về DataFrame với MultiIndex (date, ticker) sorted ascending.
 """
 
@@ -20,15 +19,15 @@ import logging
 from pathlib import Path
 from typing import List, Optional
 
-import numpy as np
 import pandas as pd
 
 from config.settings import MARKET_INDEX_TICKER
 
 logger = logging.getLogger(__name__)
 
-# Ticker bị drop nếu tỉ lệ ngày thiếu vượt ngưỡng này
-MISSING_DAY_THRESHOLD: float = 0.90   # 30 %
+# Deprecated: current loader uses strict date intersection and does not
+# forward-fill/drop by missing-day ratio. Kept to avoid breaking older imports.
+MISSING_DAY_THRESHOLD: float = 0.90
 
 # Cột OHLCV bắt buộc (không tính is_trading_day)
 _REQUIRED_COLS = ["open", "high", "low", "close", "volume"]
@@ -54,8 +53,8 @@ def load_from_dir(
     tickers       : Danh sách ticker muốn load; None = load tất cả file .csv
                     (trừ VNINDEX).
     min_rows      : Ticker có ít hơn min_rows dòng hợp lệ thì bị bỏ qua.
-    ffill_prices  : Forward-fill giá ở những ngày không giao dịch (True theo
-                    convention tài chính VN — giá không đổi nếu không có giao dịch).
+    ffill_prices  : Backward-compatible no-op. Loader now uses strict date
+                    intersection and does not forward-fill synthetic rows.
 
     Returns
     -------

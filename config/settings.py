@@ -4,9 +4,7 @@ All tunable knobs live here.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
 from typing import List, Callable
-import numpy as np
 
 # ─── Data split — nhập ngày cụ thể ──────────────────────────────────────────
 # TRAIN : [đầu data]   → VAL_START   (exclusive)
@@ -14,7 +12,7 @@ import numpy as np
 # TEST  : TEST_START   → TEST_END    (inclusive, None = hết data)
 
 VAL_START:  str = "2023-05-12"   # ngày đầu tiên của val  = ngày kết thúc train
-TEST_START: str = "2025-01-01"   # 2024-07-29 ngày đầu tiên của test = ngày kết thúc val
+TEST_START: str = "2025-01-01"   # ngày đầu tiên của test = ngày kết thúc val
 TEST_END:   str | None = None    # ngày cuối test (None = hết data)
 
 # ─── Holding horizon ──────────────────────────────────────────────────────────
@@ -52,7 +50,7 @@ CORR_THRESHOLD: float = 0.70       # used for domain & individual dedup
 
 # Full startup precompute can be very slow once the domain contains many
 # sector/market primitives. Keep it lazy by default; set True for debugging.
-DOMAIN_PRECOMPUTE_ON_START: bool = True
+DOMAIN_PRECOMPUTE_ON_START: bool = False
 
 # ─── Window whitelist ─────────────────────────────────────────────────────────
 
@@ -86,7 +84,7 @@ MAX_RETRY: int = 5                 # max retries before fallback in c1/c2/c3
 
 # ─── Restart ──────────────────────────────────────────────────────────────────
 
-RESTART_PROB: float = 0.0001       # 0.01 % — restart from raw OHLCV
+RESTART_PROB: float = 0.0001       # 0.01 % — restart from normalized seed features
 
 # ─── Archive ──────────────────────────────────────────────────────────────────
 
@@ -159,3 +157,67 @@ FITNESS_WEIGHTS = {
     "bad_fold_ratio": -0.18,
     "wf_overfit_gap": -0.25,
 }
+
+
+def validate_config() -> None:
+    val_start_ts = _parse_date_setting("VAL_START", VAL_START)
+    test_start_ts = _parse_date_setting("TEST_START", TEST_START)
+    wf_end_ts = _parse_date_setting("WF_END", WF_END)
+    test_end_ts = _parse_optional_date_setting("TEST_END", TEST_END)
+
+    if val_start_ts >= test_start_ts:
+        raise ValueError("VAL_START must be before TEST_START.")
+    if test_end_ts is not None and test_end_ts < test_start_ts:
+        raise ValueError("TEST_END must be >= TEST_START.")
+    if wf_end_ts > test_start_ts:
+        raise ValueError("WF_END must be <= TEST_START to keep evolution out of final test.")
+
+    required_mutators = {"c1", "c2", "c3"}
+    if set(MUTATOR_PROBS) != required_mutators:
+        raise ValueError(f"MUTATOR_PROBS keys must be {sorted(required_mutators)}.")
+    if any(value < 0 for value in MUTATOR_PROBS.values()):
+        raise ValueError("MUTATOR_PROBS values must be non-negative.")
+    if abs(sum(MUTATOR_PROBS.values()) - 1.0) > 1e-9:
+        raise ValueError("MUTATOR_PROBS must sum to 1.0.")
+
+    if FEATURE_MIN < 1 or FEATURE_MAX < FEATURE_MIN:
+        raise ValueError("Feature limits require 1 <= FEATURE_MIN <= FEATURE_MAX.")
+    if ARCHIVE_SIZE < 1:
+        raise ValueError("ARCHIVE_SIZE must be positive.")
+    if not WINDOWS or any(int(w) <= 0 for w in WINDOWS):
+        raise ValueError("WINDOWS must contain positive integers.")
+    if len(set(WINDOWS)) != len(WINDOWS):
+        raise ValueError("WINDOWS must not contain duplicates.")
+    if not 0.0 <= CORR_THRESHOLD <= 1.0:
+        raise ValueError("CORR_THRESHOLD must be in [0, 1].")
+
+    if HOLDING_HORIZON < 1:
+        raise ValueError("HOLDING_HORIZON must be positive.")
+    if WF_MIN_TRAIN_MONTHS < 1 or WF_VAL_MONTHS < 1 or WF_STEP_MONTHS < 1:
+        raise ValueError("WF month settings must be positive.")
+    if WF_PURGE_DAYS < 0:
+        raise ValueError("WF_PURGE_DAYS must be non-negative.")
+    if WF_PURGE_DAYS < HOLDING_HORIZON:
+        raise ValueError("WF_PURGE_DAYS must be >= HOLDING_HORIZON to avoid split leakage.")
+    if HIT_RATE_TOP_K < 1:
+        raise ValueError("HIT_RATE_TOP_K must be positive.")
+    if CHECKPOINT_EVERY_SECONDS < 0:
+        raise ValueError("CHECKPOINT_EVERY_SECONDS must be non-negative.")
+
+
+def _parse_date_setting(name: str, value: str):
+    import pandas as pd
+
+    try:
+        return pd.Timestamp(value)
+    except Exception as exc:
+        raise ValueError(f"{name} must be a valid date string.") from exc
+
+
+def _parse_optional_date_setting(name: str, value: str | None):
+    if value is None:
+        return None
+    return _parse_date_setting(name, value)
+
+
+validate_config()

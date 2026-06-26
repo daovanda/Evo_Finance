@@ -24,6 +24,27 @@ def _archive_with_one_entry() -> Archive:
 
 
 class CheckpointTests(unittest.TestCase):
+    def test_archive_add_loaded_preserves_metrics_for_resume(self):
+        archive = Archive(max_size=1)
+        individual = Individual.seed()
+
+        added = archive.add_loaded(
+            individual,
+            score=0.42,
+            metrics={"wf_mean_ic": 0.12},
+            final_val_metrics={"final_val_mean_ic": 0.03},
+            test_metrics={"test_mean_ic": -0.01},
+        )
+
+        self.assertTrue(added)
+        self.assertEqual(len(archive), 1)
+        entry = archive.entries[0]
+        self.assertIsNone(entry.booster)
+        self.assertEqual(entry.score, 0.42)
+        self.assertEqual(entry.metrics["wf_mean_ic"], 0.12)
+        self.assertEqual(entry.final_val_metrics["final_val_mean_ic"], 0.03)
+        self.assertEqual(entry.test_metrics["test_mean_ic"], -0.01)
+
     def test_checkpoint_path_is_next_to_final_archive(self):
         self.assertEqual(
             _checkpoint_path(Path("results/archive.json")),
