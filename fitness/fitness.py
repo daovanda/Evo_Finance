@@ -28,11 +28,7 @@ def _ic_per_date(
     df_index: pd.Index,
 ) -> pd.Series:
     """Compute Spearman IC for each date."""
-    data = (
-        pd.DataFrame({"pred": pred, "label": label})
-        .replace([np.inf, -np.inf], np.nan)
-        .dropna()
-    )
+    data = _clean_metric_data(pred, label)
 
     if isinstance(data.index, pd.MultiIndex):
         dates_arr = data.index.get_level_values("date")
@@ -63,11 +59,7 @@ def _hit_rate(
     df_index: pd.Index,
     top_k: int = HIT_RATE_TOP_K,
 ) -> float:
-    data = (
-        pd.DataFrame({"pred": pred, "label": label})
-        .replace([np.inf, -np.inf], np.nan)
-        .dropna()
-    )
+    data = _clean_metric_data(pred, label)
 
     if isinstance(data.index, pd.MultiIndex):
         dates_arr = data.index.get_level_values("date")
@@ -80,6 +72,12 @@ def _hit_rate(
         grp = data[mask]
         k = min(int(top_k), len(grp))
         if k <= 0:
+            continue
+        if (
+            grp["pred"].nunique(dropna=True) < 2
+            or grp["label"].nunique(dropna=True) < 2
+        ):
+            hits.append(float(k) / float(len(grp)))
             continue
         top_pred = set(grp.nlargest(k, "pred").index)
         top_label = set(grp.nlargest(k, "label").index)
@@ -97,6 +95,28 @@ def _random_hit_baseline(df: pd.DataFrame, top_k: int = HIT_RATE_TOP_K) -> float
         return float(np.mean(daily)) if daily else 0.0
     n_tickers = len(df)
     return min(1.0, float(top_k) / float(n_tickers)) if n_tickers > 0 else 0.0
+
+
+def _clean_metric_data(pred: pd.Series, label: pd.Series) -> pd.DataFrame:
+    return (
+        pd.DataFrame({"pred": pred, "label": label})
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
+
+
+def _random_hit_baseline_for_predictions(
+    pred: pd.Series,
+    label: pd.Series,
+    top_k: int = HIT_RATE_TOP_K,
+) -> float:
+    """
+    Random top-k overlap baseline on the same valid rows used by hit-rate.
+
+    This keeps hit_excess honest when a metric call receives non-finite
+    predictions or labels: both sides use the identical effective universe.
+    """
+    return _random_hit_baseline(_clean_metric_data(pred, label), top_k=top_k)
 
 
 @dataclass
@@ -157,7 +177,7 @@ class FitnessEvaluator:
         val_icir = val_mean_ic / (val_ic_std + 1e-9)
         val_icir_scaled = float(np.clip(val_icir, -3.0, 3.0)) / 3.0
         hit_rate = _hit_rate(val_pred, val_labels, val_df.index)
-        baseline = _random_hit_baseline(val_df)
+        baseline = _random_hit_baseline_for_predictions(val_pred, val_labels)
         hit_excess = hit_rate - baseline
         overfit_gap = max(0.0, train_mean_ic - val_mean_ic)
 
@@ -208,7 +228,10 @@ class FitnessEvaluator:
             train_mean_ic = _safe_mean(train_ic)
             val_mean_ic = _safe_mean(val_ic)
             hit_rate = _hit_rate(fold.val_pred, fold.val_labels, fold.val_df.index)
-            baseline = _random_hit_baseline(fold.val_df)
+            baseline = _random_hit_baseline_for_predictions(
+                fold.val_pred,
+                fold.val_labels,
+            )
             fold_metrics.append(
                 {
                     "train_mean_ic": train_mean_ic,

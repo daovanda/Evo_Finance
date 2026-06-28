@@ -16,6 +16,7 @@ re-trains archived individuals before reporting out-of-sample metrics.
 
 from __future__ import annotations
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict
 
@@ -69,7 +70,30 @@ class Archive:
         if individual.score is None:
             raise ValueError("Individual must be evaluated before archiving.")
 
-        score = individual.score
+        score = float(individual.score)
+        if not math.isfinite(score):
+            logger.debug("Archive: rejected non-finite score=%r", individual.score)
+            return False
+
+        duplicate_index = self._duplicate_index(individual)
+        if duplicate_index is not None:
+            existing = self._entries[duplicate_index]
+            if score <= existing.score:
+                logger.debug("Archive: rejected duplicate individual.")
+                return False
+            self._entries[duplicate_index] = ArchiveEntry(
+                individual=individual,
+                booster=booster,
+                score=score,
+                metrics=dict(individual.metrics),
+            )
+            self._entries.sort(key=lambda e: e.score, reverse=True)
+            logger.info(
+                "Archive: replaced duplicate score=%.4f -> %.4f",
+                existing.score,
+                score,
+            )
+            return True
 
         if len(self._entries) < self.max_size:
             self._admit(individual, booster, score)
@@ -104,16 +128,29 @@ class Archive:
         Resume archives do not contain LightGBM boosters, so the booster is
         intentionally left as None until a later evaluation retrains it.
         """
-        individual.score = float(score)
+        score = float(score)
+        if not math.isfinite(score):
+            return False
+
+        individual.score = score
         individual.metrics = dict(metrics or {})
         entry = ArchiveEntry(
             individual=individual,
             booster=None,
-            score=float(score),
+            score=score,
             metrics=dict(individual.metrics),
             final_val_metrics=dict(final_val_metrics or {}),
             test_metrics=dict(test_metrics or {}),
         )
+
+        duplicate_index = self._duplicate_index(individual)
+        if duplicate_index is not None:
+            existing = self._entries[duplicate_index]
+            if entry.score <= existing.score:
+                return False
+            self._entries[duplicate_index] = entry
+            self._entries.sort(key=lambda e: e.score, reverse=True)
+            return True
 
         if len(self._entries) < self.max_size:
             self._entries.append(entry)
@@ -204,3 +241,17 @@ class Archive:
         logger.debug(
             "Archive admitted score=%.4f, size=%d", score, len(self._entries)
         )
+
+    def _contains(self, individual: Individual) -> bool:
+        return self._duplicate_index(individual) is not None
+
+    def _duplicate_index(self, individual: Individual) -> Optional[int]:
+        signature = _individual_signature(individual)
+        for idx, entry in enumerate(self._entries):
+            if _individual_signature(entry.individual) == signature:
+                return idx
+        return None
+
+
+def _individual_signature(individual: Individual) -> tuple[str, ...]:
+    return tuple(sorted(str(formula) for formula in individual.formulas))

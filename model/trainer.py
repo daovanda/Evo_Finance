@@ -14,7 +14,6 @@ The caller (main loop) is responsible for supplying pre-split DataFrames:
 """
 
 from __future__ import annotations
-import logging
 from typing import Hashable, List, Tuple
 
 import numpy as np
@@ -31,8 +30,6 @@ from config.settings import (
 )
 from mutator.gene import Individual
 from mutator.evaluator import evaluate
-
-logger = logging.getLogger(__name__)
 
 # Number of integer relevance grades for lambdarank (0 = worst, N-1 = best)
 N_RELEVANCE_BINS: int = 5
@@ -91,25 +88,27 @@ def build_feature_matrix(
     cols = {}
     col_map = {}   # sanitized_name → formula (for debug)
     for gene in individual.genes:
-        try:
-            cache_key = (
-                (context_key, gene.formula)
-                if feature_cache is not None and context_key is not None
-                else None
-            )
-            series = feature_cache.get(cache_key) if cache_key is not None else None
-            if series is None:
+        cache_key = (
+            (context_key, gene.formula)
+            if feature_cache is not None and context_key is not None
+            else None
+        )
+        series = feature_cache.get(cache_key) if cache_key is not None else None
+        if series is None:
+            try:
                 series = evaluate(gene.formula, df)
-                if cache_key is not None:
-                    feature_cache[cache_key] = series
-            safe_name = _sanitize_col_name(gene.formula)
-            # handle rare collision after sanitize
-            if safe_name in cols:
-                safe_name = safe_name + f"_{len(cols)}"
-            cols[safe_name] = series
-            col_map[safe_name] = gene.formula
-        except Exception as exc:
-            logger.warning("Gene eval failed: %r — %s", gene.formula, exc)
+            except Exception as exc:
+                raise ValueError(
+                    f"Gene eval failed for {gene.formula!r}: {exc}"
+                ) from exc
+            if cache_key is not None:
+                feature_cache[cache_key] = series
+        safe_name = _sanitize_col_name(gene.formula)
+        # handle rare collision after sanitize
+        if safe_name in cols:
+            safe_name = safe_name + f"_{len(cols)}"
+        cols[safe_name] = series
+        col_map[safe_name] = gene.formula
     feat_df = pd.DataFrame(cols, index=df.index)
     if target_index is not None:
         feat_df = feat_df.loc[target_index]
@@ -155,6 +154,11 @@ def _feature_context(*dfs: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(frames).sort_index()
 
 
+def _sort_index_if_needed(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep ranking groups contiguous without copying already-sorted frames."""
+    return df if df.index.is_monotonic_increasing else df.sort_index()
+
+
 def _group_sizes(df: pd.DataFrame) -> List[int]:
     """
     LightGBM needs the number of items per query (date).
@@ -167,6 +171,23 @@ def _group_sizes(df: pd.DataFrame) -> List[int]:
     else:
         # fallback: all in one group
         return [len(df)]
+
+
+def _validate_group_alignment(
+    labels: pd.Series,
+    groups: List[int],
+    split_name: str,
+) -> None:
+    if not groups:
+        raise ValueError(f"{split_name} has no LightGBM query groups.")
+    if any(int(group_size) <= 0 for group_size in groups):
+        raise ValueError(f"{split_name} has non-positive LightGBM query group size.")
+    total = int(sum(groups))
+    if total != len(labels):
+        raise ValueError(
+            f"{split_name} LightGBM group sizes sum to {total}, "
+            f"but labels contain {len(labels)} rows."
+        )
 
 
 def _training_config(mode: str) -> tuple[dict, int, int]:
@@ -183,6 +204,14 @@ def _training_config(mode: str) -> tuple[dict, int, int]:
 
 
 # ─── Trainer ──────────────────────────────────────────────────────────────────
+
+def _series_fingerprint(series: pd.Series) -> tuple[int, int]:
+    """Stable-enough content fingerprint for split label cache invalidation."""
+    if len(series) == 0:
+        return 0, 0
+    hashed = pd.util.hash_pandas_object(series, index=True)
+    return len(series), int(hashed.sum())
+
 
 class Trainer:
     """Stateless helper; instantiate per evolutionary run or share across runs."""
@@ -224,20 +253,19 @@ class Trainer:
         labels: pd.Series,
         mask: pd.Series,
     ) -> tuple[pd.Series, List[int]]:
+        masked_df = split_df[mask]
+        masked_labels = labels[mask]
         split_key = (
             id(split_df),
             id(split_df.index),
-            len(split_df),
-            int(mask.sum()),
-            _index_boundary_key(split_df.index),
+            _index_boundary_key(masked_df.index),
+            _series_fingerprint(masked_labels),
         )
         if self.enable_split_cache:
             cached = self._split_cache.get(split_key)
             if cached is not None:
                 return cached
 
-        masked_df = split_df[mask]
-        masked_labels = labels[mask]
         y_int = _bin_labels(masked_labels, masked_df)
         groups = _group_sizes(masked_df)
         if self.enable_split_cache:
@@ -265,6 +293,10 @@ class Trainer:
         """
         # ── Build feature matrices ────────────────────────────────────────────
         params, num_boost_round, early_stopping_rounds = _training_config(mode)
+        train_df = _sort_index_if_needed(train_df)
+        val_df = _sort_index_if_needed(val_df)
+        if feature_df is not None:
+            feature_df = _sort_index_if_needed(feature_df)
 
         context_df = feature_df if feature_df is not None else _feature_context(
             train_df, val_df
@@ -299,6 +331,8 @@ class Trainer:
         y_val_int, val_groups = self._labels_and_groups(
             val_df, val_labels, val_mask
         )
+        _validate_group_alignment(y_train_int, train_groups, "train")
+        _validate_group_alignment(y_val_int, val_groups, "val")
 
         lgb_train = lgb.Dataset(
             X_train, label=y_train_int, group=train_groups, free_raw_data=False
@@ -342,10 +376,12 @@ class Trainer:
         feature_df: pd.DataFrame | None = None,
     ) -> pd.Series:
         """Run inference on an arbitrary split (e.g. test set)."""
+        target_index = df.index
         context_df = feature_df if feature_df is not None else df
+        context_df = _sort_index_if_needed(context_df)
         X = clean_feature_matrix(
-            self._build_feature_matrix(individual, context_df, target_index=df.index)
+            self._build_feature_matrix(individual, context_df, target_index=target_index)
         )
         if X.shape[1] == 0:
             raise ValueError("Empty feature matrix: no valid gene columns.")
-        return pd.Series(booster.predict(X), index=df.index, name="pred")
+        return pd.Series(booster.predict(X), index=target_index, name="pred")

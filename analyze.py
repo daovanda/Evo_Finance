@@ -43,18 +43,23 @@ from config.settings import (
     VAL_START, TEST_START, TEST_END, HIT_RATE_TOP_K,
     WF_END, WF_MIN_TRAIN_MONTHS, WF_VAL_MONTHS,
     WF_STEP_MONTHS, WF_PURGE_DAYS, FITNESS_WEIGHTS,
+    REQUIRE_SECTOR_MAPPING, MIN_SECTOR_MEMBERS_IN_UNIVERSE,
 )
 from data.loader       import load_from_dir
 from model.data_utils  import (
     label_dataframe,
     make_walk_forward_folds,
+    small_sectors_in_universe,
     split_labeled_by_dates,
     tickers_missing_sector,
+    validate_full_universe_panel,
+    validate_market_ohlcv,
     validate_ohlcv,
+    validate_temporal_splits,
 )
 from model.trainer     import Trainer
 from mutator.gene      import Gene, Individual
-from fitness.fitness   import _ic_per_date
+from fitness.fitness   import _ic_per_date, _random_hit_baseline_for_predictions
 
 logging.basicConfig(
     level=logging.INFO,
@@ -85,6 +90,43 @@ def json_to_individual(entry: dict) -> Individual:
     )
 
 
+def _handle_missing_sector_mapping(missing_sector: list[str]) -> None:
+    if not missing_sector:
+        return
+
+    message = (
+        f"SECTORS mapping is missing {len(missing_sector)} tickers: "
+        f"{missing_sector}."
+    )
+    if REQUIRE_SECTOR_MAPPING:
+        raise ValueError(
+            message
+            + " Update config.settings.SECTORS before analyzing, or set "
+            + "REQUIRE_SECTOR_MAPPING=False to group them as Unknown."
+        )
+
+    logger.warning("%s Sector primitives will group them as Unknown.", message)
+
+
+def _handle_small_sector_universe(small_sectors: dict[str, int]) -> None:
+    if not small_sectors:
+        return
+
+    message = (
+        "Some sectors have too few loaded tickers for stable sector "
+        f"features (min={MIN_SECTOR_MEMBERS_IN_UNIVERSE}): {small_sectors}."
+    )
+    if REQUIRE_SECTOR_MAPPING:
+        raise ValueError(
+            message
+            + " Add more tickers for those sectors, merge the sector groups, "
+            + "lower MIN_SECTOR_MEMBERS_IN_UNIVERSE, or set "
+            + "REQUIRE_SECTOR_MAPPING=False."
+        )
+
+    logger.warning("%s Sector primitives may be noisy.", message)
+
+
 # ─── Hit rate per date ───────────────────────────────────────────────────────
 
 def _hitrate_per_date(
@@ -96,7 +138,11 @@ def _hitrate_per_date(
     Hit rate per date: |top_k pred ∩ top_k label| / top_k
     Returns pd.Series index = date.
     """
-    data = pd.DataFrame({"pred": pred, "label": label}).dropna()
+    data = (
+        pd.DataFrame({"pred": pred, "label": label})
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
 
     if isinstance(data.index, pd.MultiIndex):
         dates_arr = data.index.get_level_values("date")
@@ -109,6 +155,12 @@ def _hitrate_per_date(
         grp  = data[mask]
         k = min(int(top_k), len(grp))
         if k <= 0:
+            continue
+        if (
+            grp["pred"].nunique(dropna=True) < 2
+            or grp["label"].nunique(dropna=True) < 2
+        ):
+            hits[date] = float(k) / float(len(grp))
             continue
         top_pred  = set(grp.nlargest(k, "pred").index)
         top_label = set(grp.nlargest(k, "label").index)
@@ -196,7 +248,9 @@ def compute_walk_forward_metrics(
     fold_rows: list[dict] = []
     ic_parts: list[pd.Series] = []
     hr_parts: list[pd.Series] = []
-    date_parts: list[pd.DatetimeIndex] = []
+    all_wf_dates = _combine_date_indexes(
+        [_date_index_from_frames(fold.val_df) for fold in wf_folds]
+    )
 
     for fold in wf_folds:
         try:
@@ -208,8 +262,14 @@ def compute_walk_forward_metrics(
                 mode="wf",
             )
         except Exception as exc:
-            logger.warning("WF train failed on %s: %s", fold.name, exc)
-            continue
+            logger.warning(
+                "WF train failed on %s: %s; discard WF recompute for this "
+                "individual to avoid partial-fold scoring.",
+                fold.name,
+                exc,
+            )
+            empty = pd.Series(dtype=float)
+            return pd.DataFrame(), empty, empty, all_wf_dates
 
         train_ic_series = _ic_per_date(
             train_pred, train_labels, fold.train_df.index
@@ -222,9 +282,7 @@ def compute_walk_forward_metrics(
         train_mean_ic = _safe_mean(train_ic_series)
         val_mean_ic = _safe_mean(val_ic_series)
         hit_rate = _safe_mean(hr_series)
-        baseline = _random_hit_rate_baseline(
-            fold.val_df.index.get_level_values("ticker").nunique()
-        )
+        baseline = _random_hit_baseline_for_predictions(val_pred, val_labels)
 
         fold_rows.append(
             {
@@ -247,7 +305,6 @@ def compute_walk_forward_metrics(
             ic_parts.append(val_ic_series.sort_index())
         if not hr_series.empty:
             hr_parts.append(hr_series.sort_index())
-        date_parts.append(_date_index_from_frames(fold.val_df))
 
     fold_metrics = pd.DataFrame(fold_rows)
     wf_ic_series = (
@@ -260,8 +317,7 @@ def compute_walk_forward_metrics(
         if hr_parts
         else pd.Series(dtype=float)
     )
-    wf_dates = _combine_date_indexes(date_parts)
-    return fold_metrics, wf_ic_series, wf_hr_series, wf_dates
+    return fold_metrics, wf_ic_series, wf_hr_series, all_wf_dates
 
 
 def _add_period_shading(ax, xmin, xmax, test_ts, val_ts=None):
@@ -291,7 +347,7 @@ def _period_means(series, test_ts):
 
 def _safe_mean(series: pd.Series) -> float:
     clean = series.replace([np.inf, -np.inf], np.nan).dropna()
-    return float(clean.mean()) if len(clean) else float("nan")
+    return float(clean.mean()) if len(clean) else 0.0
 
 
 def _combine_date_indexes(indexes: list[pd.DatetimeIndex]) -> pd.DatetimeIndex:
@@ -770,14 +826,21 @@ def analyze(
     logger.info("Loading data from %s …", data_dir)
     df = load_from_dir(data_dir, tickers=tickers)
     validate_ohlcv(df)
+    validate_market_ohlcv(df)
+    validate_temporal_splits(
+        val_start=val_start,
+        test_start=test_start,
+        test_end=test_end,
+        wf_end=wf_end,
+        wf_min_train_months=wf_min_train_months,
+        wf_val_months=wf_val_months,
+        wf_step_months=wf_step_months,
+        wf_purge_days=wf_purge_days,
+    )
     missing_sector = tickers_missing_sector(df)
-    if missing_sector:
-        logger.warning(
-            "SECTORS mapping is missing %d tickers: %s. "
-            "Sector primitives will group them as Unknown.",
-            len(missing_sector),
-            missing_sector,
-        )
+    _handle_missing_sector_mapping(missing_sector)
+    small_sectors = small_sectors_in_universe(df, MIN_SECTOR_MEMBERS_IN_UNIVERSE)
+    _handle_small_sector_universe(small_sectors)
 
     # ── Split ─────────────────────────────────────────────────────────────────
     labeled_df = label_dataframe(df)
@@ -788,6 +851,10 @@ def analyze(
         test_end=test_end,
         purge_days=wf_purge_days,
     )
+    expected_tickers = df.index.get_level_values("ticker").unique()
+    validate_full_universe_panel(train_df, expected_tickers, "final train split")
+    validate_full_universe_panel(val_df, expected_tickers, "final val split")
+    validate_full_universe_panel(test_df, expected_tickers, "final test split")
     feature_df = labeled_df.sort_index()
     logger.info(
         "train=%d rows | val=%d rows | test=%d rows",
@@ -806,6 +873,17 @@ def analyze(
         purge_days=wf_purge_days,
     )
     wf_feature_df = wf_labeled_df.sort_index()
+    for fold in wf_folds:
+        validate_full_universe_panel(
+            fold.train_df,
+            expected_tickers,
+            f"{fold.name} train split",
+        )
+        validate_full_universe_panel(
+            fold.val_df,
+            expected_tickers,
+            f"{fold.name} val split",
+        )
     logger.info(
         "WF folds=%d | end=%s | min_train=%dm | val=%dm | step=%dm | purge=%dd",
         len(wf_folds),

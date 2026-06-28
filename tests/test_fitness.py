@@ -10,6 +10,7 @@ from fitness.fitness import (
     _ic_per_date,
     _hit_rate,
     _random_hit_baseline,
+    _random_hit_baseline_for_predictions,
 )
 from mutator.gene import Individual
 
@@ -50,6 +51,51 @@ class FitnessMetricTests(unittest.TestCase):
 
         self.assertEqual(_hit_rate(pred, label, idx, top_k=10), 1.0)
         self.assertEqual(_random_hit_baseline(df, top_k=10), 1.0)
+
+    def test_hit_rate_constant_predictions_equal_random_baseline(self):
+        dates = pd.date_range("2024-01-01", periods=1)
+        tickers = ["AAA", "BBB", "CCC", "DDD", "EEE"]
+        idx = pd.MultiIndex.from_product(
+            [dates, tickers],
+            names=["date", "ticker"],
+        )
+        pred = pd.Series(1.0, index=idx)
+        label = pd.Series([5.0, 4.0, 3.0, 2.0, 1.0], index=idx)
+        df = pd.DataFrame(index=idx)
+
+        self.assertEqual(
+            _hit_rate(pred, label, idx, top_k=2),
+            _random_hit_baseline(df, top_k=2),
+        )
+
+    def test_hit_excess_baseline_uses_only_valid_prediction_rows(self):
+        date = pd.Timestamp("2024-01-01")
+        tickers = [f"T{i:02d}" for i in range(20)]
+        idx = pd.MultiIndex.from_product([[date], tickers], names=["date", "ticker"])
+        df = pd.DataFrame(index=idx)
+        labels = pd.Series(range(20), index=idx, dtype=float)
+        pred = pd.Series(1.0, index=idx)
+        pred.iloc[:10] = float("nan")
+
+        self.assertEqual(_hit_rate(pred, labels, idx), 1.0)
+        self.assertEqual(_random_hit_baseline(df), 0.5)
+        self.assertEqual(
+            _random_hit_baseline_for_predictions(pred, labels),
+            1.0,
+        )
+
+        individual = Individual.seed()
+        result = FitnessEvaluator().evaluate(
+            individual,
+            train_pred=pred,
+            val_pred=pred,
+            train_labels=labels,
+            val_labels=labels,
+            train_df=df,
+            val_df=df,
+        )
+
+        self.assertEqual(result.extra["hit_excess"], 0.0)
 
     def test_walk_forward_fitness_penalizes_fold_train_val_gap(self):
         dates = pd.date_range("2024-01-01", periods=4)

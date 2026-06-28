@@ -1,0 +1,6 @@
+﻿# Bo qua tat ca cac thu muc __pycache__ va file cache .pyc o bat ky dau
+**/__pycache__/
+*.pyc
+
+# Bo qua toan bo thu muc ket qua chay
+results/

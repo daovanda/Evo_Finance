@@ -27,6 +27,16 @@ def _sample_df(periods=4, tickers=None):
 
 
 class TrainerCacheTests(unittest.TestCase):
+    def test_sort_index_if_needed_keeps_sorted_frame_identity(self):
+        df = _sample_df()
+        sorted_df = trainer_module._sort_index_if_needed(df)
+        self.assertIs(sorted_df, df)
+
+        unsorted_df = df.iloc[::-1]
+        resorted = trainer_module._sort_index_if_needed(unsorted_df)
+        self.assertTrue(resorted.index.is_monotonic_increasing)
+        self.assertIsNot(resorted, unsorted_df)
+
     def test_feature_cache_reuses_formula_only_within_same_context(self):
         df = _sample_df()
         other_df = df.copy()
@@ -53,6 +63,18 @@ class TrainerCacheTests(unittest.TestCase):
 
         expected = uncached_trainer._build_feature_matrix(individual, other_df)
         pd.testing.assert_frame_equal(separate_context, expected)
+
+    def test_feature_matrix_fails_when_any_gene_cannot_evaluate(self):
+        df = _sample_df()
+        individual = Individual(
+            genes=[Gene("close_1"), Gene("not_a_column_1")]
+        )
+
+        with self.assertRaisesRegex(ValueError, "not_a_column_1"):
+            Trainer(enable_feature_cache=False)._build_feature_matrix(
+                individual,
+                df,
+            )
 
     def test_split_cache_reuses_label_bins_and_groups_per_split_only(self):
         df = _sample_df()
@@ -92,6 +114,35 @@ class TrainerCacheTests(unittest.TestCase):
             self.assertEqual(bin_mock.call_count, 2)
             self.assertEqual(group_mock.call_count, 2)
 
+    def test_split_cache_invalidates_when_label_values_change(self):
+        df = _sample_df(periods=2)
+        trainer = Trainer(enable_split_cache=True)
+
+        with patch(
+            "model.trainer._bin_labels",
+            wraps=trainer_module._bin_labels,
+        ) as bin_mock:
+            labels = df["label"]
+            mask = labels.notna()
+            y_first, _ = trainer._labels_and_groups(df, labels, mask)
+
+            reversed_by_date = labels.groupby(level="date").transform(
+                lambda s: s.iloc[::-1].to_numpy()
+            )
+            df["label"] = reversed_by_date
+            labels = df["label"]
+            mask = labels.notna()
+            y_second, _ = trainer._labels_and_groups(df, labels, mask)
+
+        self.assertEqual(bin_mock.call_count, 2)
+        self.assertFalse(y_first.equals(y_second))
+
+    def test_group_alignment_validation_rejects_mismatched_group_total(self):
+        labels = pd.Series([0, 1, 2], dtype=np.int32)
+
+        with self.assertRaisesRegex(ValueError, "group sizes sum to 2"):
+            trainer_module._validate_group_alignment(labels, [2], "train")
+
     def test_train_path_uses_feature_and_split_caches(self):
         class DummyBooster:
             def predict(self, matrix):
@@ -128,6 +179,29 @@ class TrainerCacheTests(unittest.TestCase):
         self.assertEqual(eval_mock.call_count, 2)
         self.assertEqual(bin_mock.call_count, 2)
         self.assertEqual(group_mock.call_count, 2)
+
+    def test_predict_sorts_feature_context_for_time_series_features(self):
+        class EchoBooster:
+            def predict(self, matrix):
+                return matrix.iloc[:, 0].to_numpy()
+
+        df = _sample_df(periods=4, tickers=["AAA"])
+        unsorted_feature_df = df.iloc[::-1]
+        individual = Individual(genes=[Gene("shift(close_1, 1)")])
+
+        pred = Trainer(enable_feature_cache=False).predict(
+            EchoBooster(),
+            individual,
+            df,
+            feature_df=unsorted_feature_df,
+        )
+        expected = trainer_module.evaluate("shift(close_1, 1)", df).loc[df.index]
+
+        pd.testing.assert_series_equal(
+            pred,
+            expected.rename("pred"),
+            check_dtype=False,
+        )
 
 
 if __name__ == "__main__":

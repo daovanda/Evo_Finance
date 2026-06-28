@@ -116,6 +116,9 @@ def _finite_series(series: pd.Series) -> pd.Series:
 
 def evaluate(formula: str, df: pd.DataFrame) -> pd.Series:
     formula = formula.strip()
+    if not df.index.is_monotonic_increasing:
+        sorted_df = df.sort_index()
+        return evaluate(formula, sorted_df).reindex(df.index)
 
     # 1. Window-tag  (expr)_wN  — must check before binary to avoid conflict
     parsed_tag = _parse_window_tag(formula)
@@ -881,29 +884,32 @@ def _market_window(fn: str, w: int, df: pd.DataFrame) -> pd.Series:
     market_volume = _resolve("market_volume", df)
 
     stock_ret = _safe_div(close, _ts_apply(close, "shift", 1, df)) - 1.0
-    market_ret = _safe_div(market_close, _ts_apply(market_close, "shift", 1, df)) - 1.0
+    market_ret = _safe_div(
+        market_close,
+        _market_ts_apply(market_close, "shift", 1, df),
+    ) - 1.0
 
     if fn == "market_ret":
-        return _finance_ts("ret", market_close, w, df)
+        return _market_finance_ts("ret", market_close, w, df)
     if fn == "market_vol":
-        return _finance_ts("vol", market_close, w, df)
+        return _market_finance_ts("vol", market_close, w, df)
     if fn == "market_drawdown":
-        return _finance_ts("drawdown", market_close, w, df)
+        return _market_finance_ts("drawdown", market_close, w, df)
     if fn == "market_ma_ratio":
-        return _finance_ts("ma_ratio", market_close, w, df)
+        return _market_finance_ts("ma_ratio", market_close, w, df)
     if fn == "market_rsi":
-        return _finance_ts("rsi", market_close, w, df)
+        return _market_finance_ts("rsi", market_close, w, df)
     if fn == "market_pos":
-        rolling_high = _ts_apply(market_high, "max", w, df)
-        rolling_low = _ts_apply(market_low, "min", w, df)
+        rolling_high = _market_ts_apply(market_high, "max", w, df)
+        rolling_low = _market_ts_apply(market_low, "min", w, df)
         return _safe_div(market_close - rolling_low, rolling_high - rolling_low)
     if fn == "market_volume_ratio":
-        return _safe_div(market_volume, _ts_apply(market_volume, "mean", w, df)) - 1.0
+        return _safe_div(market_volume, _market_ts_apply(market_volume, "mean", w, df)) - 1.0
     if fn == "rel_ret":
-        return _finance_ts("ret", close, w, df) - _finance_ts("ret", market_close, w, df)
+        return _finance_ts("ret", close, w, df) - _market_finance_ts("ret", market_close, w, df)
     if fn == "rel_strength":
         stock_ratio = _safe_div(close, _ts_apply(close, "shift", w, df))
-        market_ratio = _safe_div(market_close, _ts_apply(market_close, "shift", w, df))
+        market_ratio = _safe_div(market_close, _market_ts_apply(market_close, "shift", w, df))
         return _safe_div(stock_ratio, market_ratio) - 1.0
     if fn == "market_corr":
         return _ts_pair_apply(stock_ret, market_ret, "ts_corr", w, df)
@@ -974,7 +980,7 @@ def _breadth_window(fn: str, w: int, df: pd.DataFrame) -> pd.Series:
 
     if fn == "breadth_momentum":
         net_pct = _breadth_noarg("advance_decline_net_pct", df)
-        return _ts_apply(net_pct, "mean", w, df)
+        return _date_ts_apply(net_pct, "mean", w, df)
 
     raise ValueError(fn)
 
@@ -1027,29 +1033,29 @@ def _sector_window(fn: str, w: int, df: pd.DataFrame) -> pd.Series:
     stock_ret = _stock_one_day_ret(df)
 
     if fn == "sector_ret":
-        return _finance_ts("ret", sector_index, w, df)
+        return _sector_finance_ts("ret", sector_index, w, df)
     if fn == "sector_vol":
-        return _finance_ts("vol", sector_index, w, df)
+        return _sector_finance_ts("vol", sector_index, w, df)
     if fn == "sector_drawdown":
-        return _finance_ts("drawdown", sector_index, w, df)
+        return _sector_finance_ts("drawdown", sector_index, w, df)
     if fn == "sector_ma_ratio":
-        return _finance_ts("ma_ratio", sector_index, w, df)
+        return _sector_finance_ts("ma_ratio", sector_index, w, df)
     if fn == "sector_rsi":
-        return _finance_ts("rsi", sector_index, w, df)
+        return _sector_finance_ts("rsi", sector_index, w, df)
     if fn == "sector_pos":
-        rolling_high = _ts_apply(sector_index, "max", w, df)
-        rolling_low = _ts_apply(sector_index, "min", w, df)
+        rolling_high = _sector_ts_apply(sector_index, "max", w, df)
+        rolling_low = _sector_ts_apply(sector_index, "min", w, df)
         denom = rolling_high - rolling_low
         pos = _safe_div(sector_index - rolling_low, denom)
         return pos.where(~_zero_denominator_mask(denom), 0.5)
     if fn == "sector_volume_ratio":
         sector_volume = _sector_date_sum(volume, df)
-        return _safe_div(sector_volume, _ts_apply(sector_volume, "mean", w, df)) - 1.0
+        return _safe_div(sector_volume, _sector_ts_apply(sector_volume, "mean", w, df)) - 1.0
     if fn == "rel_sector_ret":
-        return _finance_ts("ret", close, w, df) - _finance_ts("ret", sector_index, w, df)
+        return _finance_ts("ret", close, w, df) - _sector_finance_ts("ret", sector_index, w, df)
     if fn == "sector_rel_strength":
         stock_ratio = _safe_div(close, _ts_apply(close, "shift", w, df))
-        sector_ratio = _safe_div(sector_index, _ts_apply(sector_index, "shift", w, df))
+        sector_ratio = _safe_div(sector_index, _sector_ts_apply(sector_index, "shift", w, df))
         return _safe_div(stock_ratio, sector_ratio) - 1.0
     if fn == "sector_corr":
         return _ts_pair_apply(stock_ret, sector_ret, "ts_corr", w, df)
@@ -1078,7 +1084,7 @@ def _sector_window(fn: str, w: int, df: pd.DataFrame) -> pd.Series:
         return _safe_div(above_count, total)
     if fn == "sector_breadth_momentum":
         net_pct = _sector_noarg("sector_advance_decline_net_pct", df)
-        return _ts_apply(net_pct, "mean", w, df)
+        return _sector_ts_apply(net_pct, "mean", w, df)
 
     raise ValueError(fn)
 
@@ -1236,6 +1242,85 @@ def _date_sum(series: pd.Series, df: pd.DataFrame) -> pd.Series:
     return pd.Series(float(series.sum()), index=series.index)
 
 
+def _date_daily_unique(series: pd.Series, df: pd.DataFrame) -> pd.Series:
+    series = _finite_series(series)
+    if not isinstance(df.index, pd.MultiIndex):
+        return series
+    dates = df.index.get_level_values("date")
+    daily = pd.Series(series.to_numpy(), index=dates)
+    return daily.groupby(level=0, sort=True).first()
+
+
+def _broadcast_date_daily(daily: pd.Series, df: pd.DataFrame) -> pd.Series:
+    if not isinstance(df.index, pd.MultiIndex):
+        return daily.reindex(df.index)
+    dates = df.index.get_level_values("date")
+    return pd.Series(daily.reindex(dates).to_numpy(), index=df.index)
+
+
+def _date_ts_apply(series: pd.Series, fn: str, w: int, df: pd.DataFrame) -> pd.Series:
+    series = _finite_series(series)
+    if not isinstance(df.index, pd.MultiIndex):
+        return _roll(series, fn, w)
+    daily = _date_daily_unique(series, df)
+    rolled = _roll(daily, fn, w)
+    return _broadcast_date_daily(rolled, df)
+
+
+def _market_daily_unique(series: pd.Series, df: pd.DataFrame) -> pd.Series:
+    series = _finite_series(series)
+    if not isinstance(df.index, pd.MultiIndex):
+        return series
+    dates = df.index.get_level_values("date")
+    market_daily = pd.Series(series.to_numpy(), index=dates)
+    return market_daily.groupby(level=0, sort=True).first()
+
+
+def _broadcast_market_daily(market_daily: pd.Series, df: pd.DataFrame) -> pd.Series:
+    if not isinstance(df.index, pd.MultiIndex):
+        return market_daily.reindex(df.index)
+    dates = df.index.get_level_values("date")
+    return pd.Series(market_daily.reindex(dates).to_numpy(), index=df.index)
+
+
+def _market_ts_apply(series: pd.Series, fn: str, w: int, df: pd.DataFrame) -> pd.Series:
+    series = _finite_series(series)
+    if not isinstance(df.index, pd.MultiIndex):
+        return _roll(series, fn, w)
+    daily = _market_daily_unique(series, df)
+    rolled = _roll(daily, fn, w)
+    return _broadcast_market_daily(rolled, df)
+
+
+def _market_finance_ts(fn: str, series: pd.Series, w: int, df: pd.DataFrame) -> pd.Series:
+    shifted = _market_ts_apply(series, "shift", w, df)
+
+    if fn == "ret":
+        return _safe_div(series, shifted) - 1.0
+    if fn == "vol":
+        one_ret = _safe_div(series, _market_ts_apply(series, "shift", 1, df)) - 1.0
+        return _market_ts_apply(one_ret, "std", w, df)
+    if fn == "drawdown":
+        rolling_max = _market_ts_apply(series, "max", w, df)
+        return _safe_div(series, rolling_max) - 1.0
+    if fn == "ma_ratio":
+        rolling_mean = _market_ts_apply(series, "mean", w, df)
+        return _safe_div(series, rolling_mean) - 1.0
+    if fn == "rsi":
+        delta = series - _market_ts_apply(series, "shift", 1, df)
+        gain = delta.clip(lower=0.0)
+        loss = (-delta).clip(lower=0.0)
+        avg_gain = _market_ts_apply(gain, "mean", w, df)
+        avg_loss = _market_ts_apply(loss, "mean", w, df)
+        rs = _safe_div(avg_gain, avg_loss)
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+        return rsi.where(
+            ~_zero_denominator_mask(avg_loss),
+            np.where(avg_gain > 0, 100.0, 50.0),
+        )
+    raise ValueError(fn)
+
+
 def _sector_mapping() -> dict[str, str]:
     mapping: dict[str, str] = {}
     for sector_name, tickers in getattr(settings, "SECTORS", {}).items():
@@ -1281,13 +1366,84 @@ def _sector_date_sum(series: pd.Series, df: pd.DataFrame) -> pd.Series:
     return series.groupby([dates, sectors]).transform("sum")
 
 
+def _sector_daily_unique(series: pd.Series, df: pd.DataFrame) -> pd.Series:
+    series = _finite_series(series)
+    if not isinstance(df.index, pd.MultiIndex):
+        return series
+    dates = df.index.get_level_values("date")
+    sectors = _sector_series(df)
+    keys = pd.MultiIndex.from_arrays(
+        [sectors.to_numpy(), dates],
+        names=["sector", "date"],
+    )
+    sector_daily = pd.Series(series.to_numpy(), index=keys)
+    return sector_daily.groupby(level=["sector", "date"], sort=True).first()
+
+
+def _broadcast_sector_daily(sector_daily: pd.Series, df: pd.DataFrame) -> pd.Series:
+    if not isinstance(df.index, pd.MultiIndex):
+        return sector_daily.reindex(df.index)
+    dates = df.index.get_level_values("date")
+    sectors = _sector_series(df)
+    keys = pd.MultiIndex.from_arrays(
+        [sectors.to_numpy(), dates],
+        names=["sector", "date"],
+    )
+    return pd.Series(sector_daily.reindex(keys).to_numpy(), index=df.index)
+
+
+def _sector_ts_apply(series: pd.Series, fn: str, w: int, df: pd.DataFrame) -> pd.Series:
+    series = _finite_series(series)
+    if not isinstance(df.index, pd.MultiIndex):
+        return _roll(series, fn, w)
+    daily = _sector_daily_unique(series, df)
+    rolled = daily.groupby(level="sector", group_keys=False).apply(
+        lambda s: _roll(s, fn, w)
+    )
+    return _broadcast_sector_daily(rolled, df)
+
+
+def _sector_finance_ts(fn: str, series: pd.Series, w: int, df: pd.DataFrame) -> pd.Series:
+    shifted = _sector_ts_apply(series, "shift", w, df)
+
+    if fn == "ret":
+        return _safe_div(series, shifted) - 1.0
+    if fn == "vol":
+        one_ret = _safe_div(series, _sector_ts_apply(series, "shift", 1, df)) - 1.0
+        return _sector_ts_apply(one_ret, "std", w, df)
+    if fn == "drawdown":
+        rolling_max = _sector_ts_apply(series, "max", w, df)
+        return _safe_div(series, rolling_max) - 1.0
+    if fn == "ma_ratio":
+        rolling_mean = _sector_ts_apply(series, "mean", w, df)
+        return _safe_div(series, rolling_mean) - 1.0
+    if fn == "rsi":
+        delta = series - _sector_ts_apply(series, "shift", 1, df)
+        gain = delta.clip(lower=0.0)
+        loss = (-delta).clip(lower=0.0)
+        avg_gain = _sector_ts_apply(gain, "mean", w, df)
+        avg_loss = _sector_ts_apply(loss, "mean", w, df)
+        rs = _safe_div(avg_gain, avg_loss)
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+        return rsi.where(
+            ~_zero_denominator_mask(avg_loss),
+            np.where(avg_gain > 0, 100.0, 50.0),
+        )
+    raise ValueError(fn)
+
+
 def _sector_one_day_ret(df: pd.DataFrame) -> pd.Series:
     return _sector_date_transform(_stock_one_day_ret(df), lambda s: s.mean(), df)
 
 
 def _sector_index(df: pd.DataFrame) -> pd.Series:
     sector_daily_ret = _sector_one_day_ret(df).fillna(0.0)
-    return _ticker_transform(1.0 + sector_daily_ret, lambda s: s.cumprod(), df)
+    if not isinstance(df.index, pd.MultiIndex):
+        return (1.0 + sector_daily_ret).cumprod()
+    daily_growth = _sector_daily_unique(1.0 + sector_daily_ret, df)
+    sector_index = daily_growth.groupby(level="sector").cumprod()
+    return _broadcast_sector_daily(sector_index, df)
+
 
 
 def _stock_one_day_ret(df: pd.DataFrame) -> pd.Series:
@@ -1363,34 +1519,47 @@ def _compare(
     right: pd.Series,
     df: pd.DataFrame,
 ) -> pd.Series:
+    left = _finite_series(left)
+    right = _finite_series(right)
     if fn == "gt":
-        return (left > right).astype(float)
+        valid = left.notna() & right.notna()
+        return (left > right).astype(float).where(valid)
     if fn == "lt":
-        return (left < right).astype(float)
+        valid = left.notna() & right.notna()
+        return (left < right).astype(float).where(valid)
 
     prev_left = _ts_apply(left, "shift", 1, df)
     prev_right = _ts_apply(right, "shift", 1, df)
+    valid = (
+        left.notna()
+        & right.notna()
+        & prev_left.notna()
+        & prev_right.notna()
+    )
     if fn == "cross_above":
-        return ((left > right) & (prev_left <= prev_right)).astype(float)
+        return ((left > right) & (prev_left <= prev_right)).astype(float).where(valid)
     if fn == "cross_below":
-        return ((left < right) & (prev_left >= prev_right)).astype(float)
+        return ((left < right) & (prev_left >= prev_right)).astype(float).where(valid)
     raise ValueError(fn)
 
 
 def _conditional(fn: str, args: tuple[str, str, str], df: pd.DataFrame) -> pd.Series:
     if fn == "where":
-        cond = evaluate(args[0], df)
+        cond = _finite_series(evaluate(args[0], df))
         true_value = evaluate(args[1], df)
         false_value = evaluate(args[2], df)
-        return true_value.where(cond > 0, false_value)
+        out = true_value.where(cond > 0, false_value)
+        return out.where(cond.notna())
 
     if fn == "rule_signal":
-        expr = evaluate(args[0], df)
-        low = evaluate(args[1], df)
-        high = evaluate(args[2], df)
-        out = pd.Series(0.0, index=df.index)
-        out = out.where(~(expr < low), 1.0)
-        out = out.where(~(expr > high), -1.0)
+        expr = _finite_series(evaluate(args[0], df))
+        low = _finite_series(evaluate(args[1], df))
+        high = _finite_series(evaluate(args[2], df))
+        valid = expr.notna() & low.notna() & high.notna()
+        out = pd.Series(np.nan, index=df.index)
+        out = out.where(~valid, 0.0)
+        out = out.where(~(valid & (expr < low)), 1.0)
+        out = out.where(~(valid & (expr > high)), -1.0)
         return out
 
     raise ValueError(fn)
@@ -1517,30 +1686,30 @@ def _market_window_zero_count(fn: str, w: int, df: pd.DataFrame) -> int:
     market_volume = _resolve("market_volume", df)
     market_ret = _safe_div(
         market_close,
-        _ts_apply(market_close, "shift", 1, df),
+        _market_ts_apply(market_close, "shift", 1, df),
     ) - 1.0
 
     if fn in ("market_ret", "market_vol"):
-        return int(_zero_denominator_mask(_ts_apply(market_close, "shift", 1, df)).sum())
+        return int(_zero_denominator_mask(_market_ts_apply(market_close, "shift", 1, df)).sum())
     if fn == "market_drawdown":
-        return int(_zero_denominator_mask(_ts_apply(market_close, "max", w, df)).sum())
+        return int(_zero_denominator_mask(_market_ts_apply(market_close, "max", w, df)).sum())
     if fn == "market_ma_ratio":
-        return int(_zero_denominator_mask(_ts_apply(market_close, "mean", w, df)).sum())
+        return int(_zero_denominator_mask(_market_ts_apply(market_close, "mean", w, df)).sum())
     if fn == "market_pos":
-        denom = _ts_apply(market_high, "max", w, df) - _ts_apply(market_low, "min", w, df)
+        denom = _market_ts_apply(market_high, "max", w, df) - _market_ts_apply(market_low, "min", w, df)
         return int(_zero_denominator_mask(denom).sum())
     if fn == "market_volume_ratio":
-        return int(_zero_denominator_mask(_ts_apply(market_volume, "mean", w, df)).sum())
+        return int(_zero_denominator_mask(_market_ts_apply(market_volume, "mean", w, df)).sum())
     if fn == "rel_ret":
         return int(
             _zero_denominator_mask(_ts_apply(close, "shift", w, df)).sum()
-            + _zero_denominator_mask(_ts_apply(market_close, "shift", w, df)).sum()
+            + _zero_denominator_mask(_market_ts_apply(market_close, "shift", w, df)).sum()
         )
     if fn == "rel_strength":
-        market_ratio = _safe_div(market_close, _ts_apply(market_close, "shift", w, df))
+        market_ratio = _safe_div(market_close, _market_ts_apply(market_close, "shift", w, df))
         return int(
             _zero_denominator_mask(_ts_apply(close, "shift", w, df)).sum()
-            + _zero_denominator_mask(_ts_apply(market_close, "shift", w, df)).sum()
+            + _zero_denominator_mask(_market_ts_apply(market_close, "shift", w, df)).sum()
             + _zero_denominator_mask(market_ratio).sum()
         )
     if fn in ("market_beta", "market_alpha", "idiosyncratic_vol"):
@@ -1592,26 +1761,26 @@ def _sector_window_zero_count(fn: str, w: int, df: pd.DataFrame) -> int:
     sector_ret = _sector_one_day_ret(df)
 
     if fn in ("sector_ret", "sector_vol"):
-        return int(_zero_denominator_mask(_ts_apply(sector_index, "shift", 1, df)).sum())
+        return int(_zero_denominator_mask(_sector_ts_apply(sector_index, "shift", 1, df)).sum())
     if fn == "sector_drawdown":
-        return int(_zero_denominator_mask(_ts_apply(sector_index, "max", w, df)).sum())
+        return int(_zero_denominator_mask(_sector_ts_apply(sector_index, "max", w, df)).sum())
     if fn == "sector_ma_ratio":
-        return int(_zero_denominator_mask(_ts_apply(sector_index, "mean", w, df)).sum())
+        return int(_zero_denominator_mask(_sector_ts_apply(sector_index, "mean", w, df)).sum())
     if fn == "sector_pos":
         return 0
     if fn == "sector_volume_ratio":
         sector_volume = _sector_date_sum(volume, df)
-        return int(_zero_denominator_mask(_ts_apply(sector_volume, "mean", w, df)).sum())
+        return int(_zero_denominator_mask(_sector_ts_apply(sector_volume, "mean", w, df)).sum())
     if fn == "rel_sector_ret":
         return int(
             _zero_denominator_mask(_ts_apply(close, "shift", w, df)).sum()
-            + _zero_denominator_mask(_ts_apply(sector_index, "shift", w, df)).sum()
+            + _zero_denominator_mask(_sector_ts_apply(sector_index, "shift", w, df)).sum()
         )
     if fn == "sector_rel_strength":
-        sector_ratio = _safe_div(sector_index, _ts_apply(sector_index, "shift", w, df))
+        sector_ratio = _safe_div(sector_index, _sector_ts_apply(sector_index, "shift", w, df))
         return int(
             _zero_denominator_mask(_ts_apply(close, "shift", w, df)).sum()
-            + _zero_denominator_mask(_ts_apply(sector_index, "shift", w, df)).sum()
+            + _zero_denominator_mask(_sector_ts_apply(sector_index, "shift", w, df)).sum()
             + _zero_denominator_mask(sector_ratio).sum()
         )
     if fn in ("sector_beta", "sector_alpha", "sector_idiosyncratic_vol"):

@@ -4,6 +4,7 @@ import pandas as pd
 
 from mutator.domain import Domain, individual_corr_check
 from mutator.formula_guard import (
+    BLOCKED_EVOLUTION_PRIMITIVES,
     const_threshold_violation,
     is_const_threshold_safe,
     is_normalized_for_const_threshold,
@@ -68,6 +69,19 @@ class FormulaGuardTests(unittest.TestCase):
             with self.subTest(formula=formula):
                 self.assertTrue(is_const_threshold_safe(formula))
 
+    def test_rejects_constant_only_selected_features(self):
+        unsafe = [
+            "const(1)",
+            "(const(1) + const(2))",
+            "(const(1) / const(2))",
+            "((const(1) + const(2)))_w20",
+        ]
+
+        for formula in unsafe:
+            with self.subTest(formula=formula):
+                self.assertFalse(is_raw_scale_safe(formula))
+                self.assertIsNotNone(raw_scale_violation(formula))
+
     def test_rejects_raw_scale_selected_features(self):
         unsafe = [
             "open_3",
@@ -77,16 +91,15 @@ class FormulaGuardTests(unittest.TestCase):
             "market_close_30",
             "market_close_120",
             "vwap(20)",
+            "liquidity(20)",
+            "obv(20)",
+            "signed_volume()",
+            "typical_price()",
             "sum(volume_1, 20)",
             "cum_sum(volume_1)",
             "cum_obv()",
             "dollar_volume()",
             "money_flow()",
-            "body()",
-            "range()",
-            "gap()",
-            "upper_wick()",
-            "lower_wick()",
             "amihud(20)",
             "rank(open_3)",
             "zscore(volume_14)",
@@ -96,6 +109,8 @@ class FormulaGuardTests(unittest.TestCase):
             "rank(amihud(20))",
             "rank(low_1 * ts_corr(ret(close_1, 1), volume_ratio(20), 20))",
             "(ret(close_1, 20) + zscore(open_3))",
+            "vol_scale(close_1, 20)",
+            "vol_scale(volume_1, 20)",
             "ts_corr(open_1, high_1, 20)",
             "ts_corr(open_1, market_close_1, 20)",
             "ts_corr(ret(close_1, 1), market_close_1, 20)",
@@ -104,6 +119,10 @@ class FormulaGuardTests(unittest.TestCase):
             "cross_above(close_1, market_close_30)",
             "gt(volume_14, market_volume_20)",
             "gt(close_1, volume_1)",
+            "gt(rsi(close_1, 14), close_1)",
+            "lt(ret(close_1, 1), volume_1)",
+            "cross_above(market_ret(20), market_close_1)",
+            "where(gt(ret(close_1, 1), close_1), const(1), const(0))",
             "where(gt(close_1, market_close_1), const(1), const(0))",
             "rule_signal(close_1, market_low_1, market_high_1)",
             "advance_count()",
@@ -121,6 +140,14 @@ class FormulaGuardTests(unittest.TestCase):
             "(advance_decline_spread() + const(1))",
             "rank(advance_count())",
             "rank(sector_advance_decline_spread())",
+            "ema(advance_count(), 20)",
+            "ts_zscore(sector_size(), 20)",
+            "ts_beta(ret(close_1, 1), sector_unchanged_count(), 60)",
+            "ts_corr(advance_count(), market_ret(20), 20)",
+            "(sector_size() / const(30))",
+            "where(gt(sector_advance_count(), const(3)), sector_advance_ratio(), const(0))",
+            "where(gt(advance_count(), const(10)), const(1), const(0))",
+            "rule_signal(sector_code(), const(1), const(3))",
             "sign(close_1 - const(50))",
             "where(sign(close_1 - const(50)), const(1), const(0))",
             "sign(close_1 - market_close_1)",
@@ -154,12 +181,21 @@ class FormulaGuardTests(unittest.TestCase):
             "ts_corr(ret(close_1, 1), volume_ratio(20), 20)",
             "ts_corr(ret(close_1, 1), ret(market_close_1, 1), 20)",
             "ts_cov(ret(close_1, 1), volume_ratio(20), 20)",
+            "vol_scale(ret(close_1, 1), 20)",
+            "vol_scale(ma_ratio(close_1, 20), 20)",
+            "body()",
+            "range()",
+            "gap()",
+            "upper_wick()",
+            "lower_wick()",
             "gt(close_1, open_1)",
             "cross_above(ema(close_1, 12), ema(close_1, 26))",
             "gt(ret(close_1, 20), market_ret(20))",
             "gt(rsi(close_1, 14), market_rsi(14))",
             "sign(close_1 - open_1)",
             "sign(ret(close_1, 20) - const(0.05))",
+            "(ret(close_1, 20) * const(2))",
+            "(ret(close_1, 20) + const(1))",
             "advance_ratio()",
             "decline_ratio()",
             "advance_decline_ratio()",
@@ -195,26 +231,81 @@ class FormulaGuardTests(unittest.TestCase):
         raw_scale_gene = Gene("market_close_30")
         raw_rank_gene = Gene("rank(close_3)")
         cross_system_gene = Gene("gt(close_1, market_close_1)")
+        raw_normalized_comparison_gene = Gene("gt(rsi(close_1, 14), close_1)")
         id_count_gene = Gene("sector_code()")
         breadth_count_gene = Gene("advance_count()")
         breadth_spread_gene = Gene("advance_decline_spread()")
+        constant_gene = Gene("const(1)")
 
         domain = Domain()
         self.assertFalse(domain.try_add(unsafe_gene, empty_df))
         self.assertFalse(domain.try_add(raw_scale_gene, empty_df))
         self.assertFalse(domain.try_add(raw_rank_gene, empty_df))
         self.assertFalse(domain.try_add(cross_system_gene, empty_df))
+        self.assertFalse(domain.try_add(raw_normalized_comparison_gene, empty_df))
         self.assertFalse(domain.try_add(id_count_gene, empty_df))
         self.assertFalse(domain.try_add(breadth_count_gene, empty_df))
         self.assertFalse(domain.try_add(breadth_spread_gene, empty_df))
+        self.assertFalse(domain.try_add(constant_gene, empty_df))
         self.assertNotIn(unsafe_gene.formula, domain.formulas)
         self.assertFalse(individual_corr_check(unsafe_gene, [], empty_df))
         self.assertFalse(individual_corr_check(raw_scale_gene, [], empty_df))
         self.assertFalse(individual_corr_check(raw_rank_gene, [], empty_df))
         self.assertFalse(individual_corr_check(cross_system_gene, [], empty_df))
+        self.assertFalse(individual_corr_check(raw_normalized_comparison_gene, [], empty_df))
         self.assertFalse(individual_corr_check(id_count_gene, [], empty_df))
         self.assertFalse(individual_corr_check(breadth_count_gene, [], empty_df))
         self.assertFalse(individual_corr_check(breadth_spread_gene, [], empty_df))
+        self.assertFalse(individual_corr_check(constant_gene, [], empty_df))
+
+    def test_blocked_sector_and_breadth_primitives_are_not_evolvable(self):
+        empty_df = pd.DataFrame()
+        for op in sorted(BLOCKED_EVOLUTION_PRIMITIVES):
+            formula = f"{op}()"
+            with self.subTest(formula=formula):
+                self.assertFalse(is_raw_scale_safe(formula))
+                self.assertIsNotNone(raw_scale_violation(formula))
+                self.assertFalse(Domain().try_add(Gene(formula), empty_df))
+                self.assertFalse(individual_corr_check(Gene(formula), [], empty_df))
+
+    def test_sector_and_breadth_ratios_remain_evolvable(self):
+        safe = [
+            "advance_ratio()",
+            "decline_ratio()",
+            "advance_decline_ratio()",
+            "advance_decline_net_pct()",
+            "sector_advance_ratio()",
+            "sector_decline_ratio()",
+            "sector_advance_decline_ratio()",
+            "sector_advance_decline_net_pct()",
+            "where(gt(sector_advance_ratio(), const(0.55)), const(1), const(0))",
+            "where(lt(advance_decline_net_pct(), const(-0.2)), const(1), const(0))",
+        ]
+        for formula in safe:
+            with self.subTest(formula=formula):
+                self.assertTrue(is_raw_scale_safe(formula))
+                self.assertIsNone(raw_scale_violation(formula))
+                self.assertTrue(is_const_threshold_safe(formula))
+
+    def test_normalized_candlestick_primitives_are_admissible(self):
+        idx = pd.MultiIndex.from_product(
+            [pd.date_range("2024-01-01", periods=40), ["AAA"]],
+            names=["date", "ticker"],
+        )
+        row = pd.Series(range(len(idx)), index=idx, dtype=float)
+        df = pd.DataFrame(index=idx)
+        df["open"] = 10.0 + row
+        df["close"] = df["open"] * (1.0 + ((row % 5) - 2.0) * 0.01)
+        df["high"] = pd.concat([df["open"], df["close"]], axis=1).max(axis=1) + 0.5 + (row % 3) * 0.1
+        df["low"] = pd.concat([df["open"], df["close"]], axis=1).min(axis=1) - 0.4 - (row % 4) * 0.1
+        df["volume"] = 1000.0 + row
+
+        for formula in ("body()", "range()", "gap()", "upper_wick()", "lower_wick()"):
+            with self.subTest(formula=formula):
+                gene = Gene(formula)
+                self.assertTrue(is_raw_scale_safe(formula))
+                self.assertTrue(Domain().try_add(gene, df))
+                self.assertTrue(individual_corr_check(gene, [], df))
 
     def test_seed_formulas_are_guard_safe(self):
         domain = Domain()
@@ -246,6 +337,20 @@ class FormulaGuardTests(unittest.TestCase):
             )
         ]
         self.assertEqual([], unsafe_id_counts)
+
+        for op in sorted(BLOCKED_EVOLUTION_PRIMITIVES):
+            self.assertNotIn(f"{op}()", domain.formulas)
+        for formula in (
+            "advance_ratio()",
+            "decline_ratio()",
+            "advance_decline_ratio()",
+            "advance_decline_net_pct()",
+            "sector_advance_ratio()",
+            "sector_decline_ratio()",
+            "sector_advance_decline_ratio()",
+            "sector_advance_decline_net_pct()",
+        ):
+            self.assertIn(formula, domain.formulas)
 
         raw_scale_seed_violations = [
             (formula, raw_scale_violation(formula))

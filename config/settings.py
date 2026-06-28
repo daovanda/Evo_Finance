@@ -43,6 +43,8 @@ WF_PURGE_DAYS: int = HOLDING_HORIZON
 
 FEATURE_MIN: int = 3
 FEATURE_MAX: int = 30
+FEATURE_MIN_VALID_RATIO: float = 0.70  # reject new features with too many NaN rows
+FEATURE_MAX_DOMINANT_VALUE_RATIO: float = 0.98  # reject near-constant new features
 
 # ─── Correlation threshold ────────────────────────────────────────────────────
 
@@ -70,6 +72,8 @@ SECTORS: dict[str, list[str]] = {
     "Industry":    ["FPT", "GAS", "GVR", "HPG", "MSN", "PDR", "PLX", "POW"],
     "Consumer":    ["BVH", "MWG", "PNJ", "SAB", "SSI", "VJC", "VNM"],
 }
+REQUIRE_SECTOR_MAPPING: bool = True
+MIN_SECTOR_MEMBERS_IN_UNIVERSE: int = 2
 
 # ─── Mutator probabilities ────────────────────────────────────────────────────
 
@@ -182,6 +186,10 @@ def validate_config() -> None:
 
     if FEATURE_MIN < 1 or FEATURE_MAX < FEATURE_MIN:
         raise ValueError("Feature limits require 1 <= FEATURE_MIN <= FEATURE_MAX.")
+    if not 0.0 <= float(FEATURE_MIN_VALID_RATIO) <= 1.0:
+        raise ValueError("FEATURE_MIN_VALID_RATIO must be in [0, 1].")
+    if not 0.0 <= float(FEATURE_MAX_DOMINANT_VALUE_RATIO) <= 1.0:
+        raise ValueError("FEATURE_MAX_DOMINANT_VALUE_RATIO must be in [0, 1].")
     if ARCHIVE_SIZE < 1:
         raise ValueError("ARCHIVE_SIZE must be positive.")
     if not WINDOWS or any(int(w) <= 0 for w in WINDOWS):
@@ -203,6 +211,12 @@ def validate_config() -> None:
         raise ValueError("HIT_RATE_TOP_K must be positive.")
     if CHECKPOINT_EVERY_SECONDS < 0:
         raise ValueError("CHECKPOINT_EVERY_SECONDS must be non-negative.")
+    if not isinstance(REQUIRE_SECTOR_MAPPING, bool):
+        raise ValueError("REQUIRE_SECTOR_MAPPING must be a bool.")
+    if int(MIN_SECTOR_MEMBERS_IN_UNIVERSE) < 1:
+        raise ValueError("MIN_SECTOR_MEMBERS_IN_UNIVERSE must be >= 1.")
+
+    _validate_sector_mapping()
 
 
 def _parse_date_setting(name: str, value: str):
@@ -218,6 +232,46 @@ def _parse_optional_date_setting(name: str, value: str | None):
     if value is None:
         return None
     return _parse_date_setting(name, value)
+
+
+def _validate_sector_mapping() -> None:
+    if not isinstance(SECTORS, dict):
+        raise ValueError("SECTORS must be a dict[str, list[str]].")
+
+    seen: dict[str, str] = {}
+    sector_counts: dict[str, int] = {}
+    for sector_name, tickers in SECTORS.items():
+        sector = str(sector_name).strip()
+        if not sector:
+            raise ValueError("SECTORS contains an empty sector name.")
+        if not isinstance(tickers, (list, tuple, set)):
+            raise ValueError(f"SECTORS[{sector!r}] must be a ticker list.")
+
+        sector_counts.setdefault(sector, 0)
+        for ticker in tickers:
+            symbol = str(ticker).strip().upper()
+            if not symbol:
+                raise ValueError(f"SECTORS[{sector!r}] contains an empty ticker.")
+            previous = seen.get(symbol)
+            if previous is not None:
+                raise ValueError(
+                    f"Ticker {symbol!r} appears in multiple sectors: "
+                    f"{previous!r} and {sector!r}."
+                )
+            seen[symbol] = sector
+            sector_counts[sector] += 1
+
+    if REQUIRE_SECTOR_MAPPING and int(MIN_SECTOR_MEMBERS_IN_UNIVERSE) > 1:
+        small = {
+            sector: count
+            for sector, count in sector_counts.items()
+            if count < int(MIN_SECTOR_MEMBERS_IN_UNIVERSE)
+        }
+        if small:
+            raise ValueError(
+                "Each sector must contain at least "
+                f"{MIN_SECTOR_MEMBERS_IN_UNIVERSE} tickers; too small: {small}."
+            )
 
 
 validate_config()

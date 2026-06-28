@@ -15,7 +15,7 @@ Resume
     python main.py --data-dir data/raw --budget 10800 --resume results/archive_test7_wf.json --save results/archive_test7_wf.json
 
 The input file must be a Parquet (or CSV) with a MultiIndex (date, ticker)
-and columns [open, high, close, low, volume].
+and columns [open, high, close, low, volume] plus market_* OHLCV columns.
 
 At the end the archive is printed as a summary table and optionally saved.
 """
@@ -38,6 +38,7 @@ from config.settings import (
     WF_END, WF_MIN_TRAIN_MONTHS, WF_VAL_MONTHS,
     WF_STEP_MONTHS, WF_PURGE_DAYS, DOMAIN_PRECOMPUTE_ON_START,
     CHECKPOINT_EVERY_SECONDS, FEATURE_MIN, FEATURE_MAX,
+    REQUIRE_SECTOR_MAPPING, MIN_SECTOR_MEMBERS_IN_UNIVERSE,
 )
 from mutator.gene       import Gene, Individual
 from mutator.domain     import Domain
@@ -46,10 +47,13 @@ from mutator.mutator    import Mutator
 from model.trainer      import Trainer
 from model.data_utils   import (
     label_dataframe, make_walk_forward_folds,
-    split_labeled_by_dates, tickers_missing_sector, validate_ohlcv,
+    small_sectors_in_universe, split_labeled_by_dates,
+    tickers_missing_sector, validate_market_ohlcv, validate_ohlcv,
+    validate_full_universe_panel, validate_temporal_splits,
 )
 from fitness.fitness    import (
     FitnessEvaluator, FoldPrediction, _hit_rate, _ic_per_date,
+    _random_hit_baseline_for_predictions,
 )
 from archive.archive    import Archive
 
@@ -87,7 +91,6 @@ def run(
     wf_step_months:  int   = WF_STEP_MONTHS,
     wf_purge_days:   int   = WF_PURGE_DAYS,
     resume_archive:  Optional[Path] = None,
-    resume_recheck:  bool = False,
     checkpoint_every: float = CHECKPOINT_EVERY_SECONDS,
 ) -> Archive:
     """
@@ -105,14 +108,21 @@ def run(
     test_end     : Ngày cuối test (None = hết data).
     """
     validate_ohlcv(df)
+    validate_market_ohlcv(df)
+    validate_temporal_splits(
+        val_start=val_start,
+        test_start=test_start,
+        test_end=test_end,
+        wf_end=wf_end,
+        wf_min_train_months=wf_min_train_months,
+        wf_val_months=wf_val_months,
+        wf_step_months=wf_step_months,
+        wf_purge_days=wf_purge_days,
+    )
     missing_sector = tickers_missing_sector(df)
-    if missing_sector:
-        logger.warning(
-            "SECTORS mapping is missing %d tickers: %s. "
-            "Sector primitives will group them as Unknown.",
-            len(missing_sector),
-            missing_sector,
-        )
+    _handle_missing_sector_mapping(missing_sector)
+    small_sectors = small_sectors_in_universe(df, MIN_SECTOR_MEMBERS_IN_UNIVERSE)
+    _handle_small_sector_universe(small_sectors)
     rng = np.random.default_rng(seed)
 
     # ── Data split + labels ───────────────────────────────────────────────────
@@ -125,6 +135,10 @@ def run(
         test_end=test_end,
         purge_days=wf_purge_days,
     )
+    expected_tickers = df.index.get_level_values("ticker").unique()
+    validate_full_universe_panel(train_df, expected_tickers, "final train split")
+    validate_full_universe_panel(val_df, expected_tickers, "final val split")
+    validate_full_universe_panel(test_df, expected_tickers, "final test split")
     logger.info(
         "Final sizes: train=%d rows | val=%d rows | test=%d rows",
         len(train_df), len(val_df), len(test_df),
@@ -141,6 +155,16 @@ def run(
         purge_days=wf_purge_days,
     )
     for fold in wf_folds:
+        validate_full_universe_panel(
+            fold.train_df,
+            expected_tickers,
+            f"{fold.name} train split",
+        )
+        validate_full_universe_panel(
+            fold.val_df,
+            expected_tickers,
+            f"{fold.name} val split",
+        )
         logger.info(
             "WF %s: train [%s -> %s) %d rows | val [%s -> %s) %d rows",
             fold.name,
@@ -177,7 +201,6 @@ def run(
             evaluator,
             wf_folds,
             wf_feature_df,
-            recheck=resume_recheck,
         )
 
     # ── First individual: normalized seed features ────────────────────────────
@@ -307,6 +330,46 @@ def _evaluate_and_archive_wf(
     return archive.try_add(individual, last_booster)
 
 
+def _handle_missing_sector_mapping(missing_sector: list[str]) -> None:
+    if not missing_sector:
+        return
+
+    message = (
+        f"SECTORS mapping is missing {len(missing_sector)} tickers: "
+        f"{missing_sector}."
+    )
+    if REQUIRE_SECTOR_MAPPING:
+        raise ValueError(
+            message
+            + " Update config.settings.SECTORS before running, or set "
+            + "REQUIRE_SECTOR_MAPPING=False to group them as Unknown."
+        )
+
+    logger.warning(
+        "%s Sector primitives will group them as Unknown.",
+        message,
+    )
+
+
+def _handle_small_sector_universe(small_sectors: dict[str, int]) -> None:
+    if not small_sectors:
+        return
+
+    message = (
+        "Some sectors have too few loaded tickers for stable sector "
+        f"features (min={MIN_SECTOR_MEMBERS_IN_UNIVERSE}): {small_sectors}."
+    )
+    if REQUIRE_SECTOR_MAPPING:
+        raise ValueError(
+            message
+            + " Add more tickers for those sectors, merge the sector groups, "
+            + "lower MIN_SECTOR_MEMBERS_IN_UNIVERSE, or set "
+            + "REQUIRE_SECTOR_MAPPING=False."
+        )
+
+    logger.warning("%s Sector primitives may be noisy.", message)
+
+
 def _load_archive_json_into_archive(
     path: Path,
     archive: Archive,
@@ -314,9 +377,8 @@ def _load_archive_json_into_archive(
     evaluator: FitnessEvaluator,
     wf_folds,
     feature_df: pd.DataFrame,
-    recheck: bool = False,
 ) -> None:
-    """Load archive JSON entries so evolution can continue from them."""
+    """Re-evaluate archive JSON entries so evolution continues on current WF."""
     path = Path(path)
     with open(path, "r") as f:
         rows = json.load(f)
@@ -328,10 +390,10 @@ def _load_archive_json_into_archive(
     unsafe_genes = 0
     unsafe_examples: list[str] = []
     logger.info(
-        "Loading resume archive from %s (%d entries, recheck=%s) ...",
+        "Loading resume archive from %s (%d entries); "
+        "re-evaluating with current WF folds ...",
         path,
         len(rows),
-        recheck,
     )
 
     for row in rows:
@@ -342,33 +404,16 @@ def _load_archive_json_into_archive(
             for formula, reason in violations:
                 if len(unsafe_examples) < 5:
                     unsafe_examples.append(f"{formula} ({reason})")
-            if recheck:
-                admitted = _evaluate_and_archive_wf(
-                    individual,
-                    trainer,
-                    evaluator,
-                    archive,
-                    wf_folds,
-                    feature_df,
-                )
-                loaded += int(admitted)
-                continue
-
-            score = _safe_float(row.get("score"))
-            if score is None:
-                skipped += 1
-                continue
-            metrics = _archive_metrics_from_row(row)
-            if archive.add_loaded(
+            admitted = _evaluate_and_archive_wf(
                 individual,
-                score=score,
-                metrics=metrics,
-                final_val_metrics=row.get("final_val_metrics") or {},
-                test_metrics=row.get("test_metrics") or {},
-            ):
-                loaded += 1
-            else:
-                skipped += 1
+                trainer,
+                evaluator,
+                archive,
+                wf_folds,
+                feature_df,
+            )
+            loaded += int(admitted)
+            skipped += int(not admitted)
         except Exception as exc:
             skipped += 1
             logger.warning("Resume: skipped invalid archive entry: %s", exc)
@@ -475,7 +520,7 @@ def _safe_float(value):
         if value is None:
             return None
         out = float(value)
-        if np.isnan(out):
+        if not np.isfinite(out):
             return None
         return out
     except (TypeError, ValueError):
@@ -534,10 +579,13 @@ def _prediction_metrics(
         else float("nan")
     )
     hit = _hit_rate(pred, labels, index)
+    hit_baseline = _random_hit_baseline_for_predictions(pred, labels)
     return {
         f"{prefix}_mean_ic": mean_ic,
         f"{prefix}_icir": icir,
         f"{prefix}_hit_rate": hit,
+        f"{prefix}_hit_baseline": hit_baseline,
+        f"{prefix}_hit_excess": hit - hit_baseline,
     }
 
 
@@ -614,10 +662,25 @@ def _save_json(archive: Archive, path: Path) -> None:
     # make serialisable
     for r in rows:
         r.pop("val_ic_series", None)
+    rows = _json_clean(rows)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
-        json.dump(rows, f, indent=2, default=str)
+        json.dump(rows, f, indent=2, default=str, allow_nan=False)
     logger.info("Archive saved to %s", path)
+
+
+def _json_clean(value):
+    if isinstance(value, dict):
+        return {k: _json_clean(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_clean(v) for v in value]
+    if isinstance(value, tuple):
+        return [_json_clean(v) for v in value]
+    if isinstance(value, (float, np.floating)):
+        return float(value) if np.isfinite(value) else None
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    return value
 
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
@@ -732,12 +795,10 @@ if __name__ == "__main__":
         type=str,
         default=None,
         metavar="PATH",
-        help="Load archive JSON da luu de chay tiep.",
-    )
-    parser.add_argument(
-        "--resume-recheck",
-        action="store_true",
-        help="Danh gia lai archive resume bang WF hien tai truoc khi chay tiep.",
+        help=(
+            "Load archive JSON da luu de chay tiep. "
+            "Archive luon duoc danh gia lai bang WF hien tai."
+        ),
     )
     parser.add_argument(
         "--val-start",
@@ -769,6 +830,44 @@ if __name__ == "__main__":
             f"Default: {TEST_END or 'end of data'}"
         ),
     )
+    parser.add_argument(
+        "--wf-end",
+        type=str,
+        default=WF_END,
+        metavar="DATE",
+        help=(
+            "Last date boundary used by walk-forward evolution (YYYY-MM-DD)\n"
+            f"Default: {WF_END}"
+        ),
+    )
+    parser.add_argument(
+        "--wf-min-train-months",
+        type=int,
+        default=WF_MIN_TRAIN_MONTHS,
+        metavar="MONTHS",
+        help=f"Minimum expanding WF train length. Default: {WF_MIN_TRAIN_MONTHS}",
+    )
+    parser.add_argument(
+        "--wf-val-months",
+        type=int,
+        default=WF_VAL_MONTHS,
+        metavar="MONTHS",
+        help=f"WF validation window length. Default: {WF_VAL_MONTHS}",
+    )
+    parser.add_argument(
+        "--wf-step-months",
+        type=int,
+        default=WF_STEP_MONTHS,
+        metavar="MONTHS",
+        help=f"WF step between validation windows. Default: {WF_STEP_MONTHS}",
+    )
+    parser.add_argument(
+        "--wf-purge-days",
+        type=int,
+        default=WF_PURGE_DAYS,
+        metavar="DAYS",
+        help=f"Trading-day purge before each WF split. Default: {WF_PURGE_DAYS}",
+    )
 
     args = parser.parse_args()
 
@@ -790,7 +889,11 @@ if __name__ == "__main__":
         val_start    = args.val_start,
         test_start   = args.test_start,
         test_end     = args.test_end,
+        wf_end       = args.wf_end,
+        wf_min_train_months = args.wf_min_train_months,
+        wf_val_months       = args.wf_val_months,
+        wf_step_months      = args.wf_step_months,
+        wf_purge_days       = args.wf_purge_days,
         resume_archive = resume_path,
-        resume_recheck = args.resume_recheck,
         checkpoint_every = args.checkpoint_every,
     )

@@ -22,10 +22,22 @@ from mutator.gene import (
     PAIR_TS_OPS, BINARY_OPS,
 )
 from mutator.domain import Domain, individual_corr_check
+from mutator.formula_guard import const_threshold_violation, raw_scale_violation
 
 logger = logging.getLogger(__name__)
 CONSTANT_BINARY_PROB = 0.25
 CONTINUOUS_CONSTANT_PROB = 0.40
+
+
+def _feature_signature(individual: Individual) -> tuple[str, ...]:
+    return tuple(sorted(str(formula) for formula in individual.formulas))
+
+
+def _is_selectable_formula(formula: str) -> bool:
+    return (
+        const_threshold_violation(formula) is None
+        and raw_scale_violation(formula) is None
+    )
 
 
 class Mutator:
@@ -36,8 +48,9 @@ class Mutator:
     # ── Public entry ──────────────────────────────────────────────────────────
 
     def mutate(self, individual: Individual, train_df: pd.DataFrame) -> Individual:
-        child    = individual.clone()
-        probs    = [MUTATOR_PROBS["c1"], MUTATOR_PROBS["c2"], MUTATOR_PROBS["c3"]]
+        parent_signature = _feature_signature(individual)
+        child = individual.clone()
+        probs = [MUTATOR_PROBS["c1"], MUTATOR_PROBS["c2"], MUTATOR_PROBS["c3"]]
         strategy = self.rng.choice(["c1", "c2", "c3"], p=probs)
 
         if strategy == "c1":
@@ -46,6 +59,9 @@ class Mutator:
             self._c2(child, train_df)
         else:
             self._c3(child, train_df)
+
+        if _feature_signature(child) == parent_signature:
+            raise ValueError(f"{strategy} produced unchanged individual")
 
         return child
 
@@ -63,7 +79,7 @@ class Mutator:
             return
 
         for attempt in range(MAX_RETRY):
-            candidate = self.domain.random_gene(self.rng)
+            candidate = self._random_selectable_domain_gene()
             if candidate.formula in ind.formulas:
                 continue
             others = [g for g in ind.genes if g.formula != candidate.formula]
@@ -86,10 +102,7 @@ class Mutator:
             if new_gene.formula == old_gene.formula: continue
             if new_gene.formula in ind.formulas:     continue
 
-            others = [g for g in ind.genes if g.formula != old_gene.formula]
-            if individual_corr_check(new_gene, others, train_df):
-                ind.replace_gene(old_gene, new_gene)
-                self.domain.try_add(new_gene, train_df)
+            if self._try_replace(ind, old_gene, new_gene, train_df, "C2"):
 
                 logger.debug("C2: %r → %r", old_gene.formula, new_gene.formula)
                 return
@@ -153,14 +166,6 @@ class Mutator:
 
             if self._try_replace(ind, old_gene, new_gene, train_df, "C3 unary"):
                 return True
-            continue
-
-            others = [g for g in ind.genes if g.formula != old_gene.formula]
-            if individual_corr_check(new_gene, others, train_df):
-                ind.replace_gene(old_gene, new_gene)
-                self.domain.try_add(new_gene, train_df)
-                logger.debug("C3 unary: %r → %r", old_gene.formula, new_gene.formula)
-                return True
 
         return False
 
@@ -168,11 +173,11 @@ class Mutator:
         for _ in range(MAX_RETRY * 2):
             op = str(self.rng.choice(list(COMPARISON_OPS)))
             if op in ("cross_above", "cross_below") and self.rng.random() < 0.75:
-                other_gene = self.domain.random_gene(self.rng)
+                other_gene = self._random_selectable_domain_gene()
             elif self.rng.random() < 0.70:
                 other_gene = self._random_constant_gene()
             else:
-                other_gene = self.domain.random_gene(self.rng)
+                other_gene = self._random_selectable_domain_gene()
 
             new_gene = Gene.compare(old_gene, other_gene, op)
             if self._try_replace(ind, old_gene, new_gene, train_df, "C3 compare"):
@@ -182,7 +187,7 @@ class Mutator:
     def _c3_pair_ts(self, ind: Individual, old_gene: Gene, train_df: pd.DataFrame) -> bool:
         for _ in range(MAX_RETRY * 2):
             op = str(self.rng.choice(list(PAIR_TS_OPS)))
-            other_gene = self.domain.random_gene(self.rng)
+            other_gene = self._random_selectable_domain_gene()
             window = int(self.rng.choice(WINDOWS))
             new_gene = Gene.pair_ts(old_gene, other_gene, op, window)
             if self._try_replace(ind, old_gene, new_gene, train_df, "C3 pair_ts"):
@@ -249,11 +254,31 @@ class Mutator:
 
         others = [g for g in ind.genes if g.formula != old_gene.formula]
         if individual_corr_check(new_gene, others, train_df):
+            if (
+                new_gene.formula not in self.domain.formulas
+                and not self.domain.try_add(new_gene, train_df)
+            ):
+                return False
             ind.replace_gene(old_gene, new_gene)
-            self.domain.try_add(new_gene, train_df)
             logger.debug("%s: %r", tag, new_gene.formula)
             return True
         return False
+
+    def _random_selectable_domain_gene(self) -> Gene:
+        """Draw a domain gene that can legally appear as a selected feature."""
+        max_attempts = max(MAX_RETRY * 10, 20)
+        for _ in range(max_attempts):
+            gene = self.domain.random_gene(self.rng)
+            if _is_selectable_formula(gene.formula):
+                return gene
+
+        selectable = [
+            formula for formula in self.domain.formulas
+            if _is_selectable_formula(formula)
+        ]
+        if not selectable:
+            raise ValueError("Domain has no guard-safe selectable formulas.")
+        return Gene(str(self.rng.choice(selectable)))
 
     def _random_constant_gene(self) -> Gene:
         if self.rng.random() < CONTINUOUS_CONSTANT_PROB:
@@ -274,7 +299,7 @@ class Mutator:
             if self.rng.random() < CONSTANT_BINARY_PROB:
                 domain_gene = self._random_constant_gene()
             else:
-                domain_gene = self.domain.random_gene(self.rng)
+                domain_gene = self._random_selectable_domain_gene()
             op          = str(self.rng.choice(list(BINARY_OPS)))
             new_gene    = Gene.combine(old_gene, domain_gene, op)
 

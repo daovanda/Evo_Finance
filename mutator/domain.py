@@ -16,7 +16,12 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 
-from config.settings import CORR_THRESHOLD, WINDOWS
+from config.settings import (
+    CORR_THRESHOLD,
+    FEATURE_MAX_DOMINANT_VALUE_RATIO,
+    FEATURE_MIN_VALID_RATIO,
+    WINDOWS,
+)
 from mutator.gene import (
     Gene, BREADTH_NOARG_OPS, BREADTH_WINDOW_OPS,
     CONSTANT_FORMULAS, CUMULATIVE_NOARG_OPS, CUMULATIVE_TS_OPS,
@@ -25,22 +30,16 @@ from mutator.gene import (
     SECTOR_CS_OPS, SECTOR_NOARG_OPS, SECTOR_WINDOW_OPS, TS_ROLLING_OPS,
 )
 from mutator.evaluator import evaluate, has_division_by_zero
-from mutator.formula_guard import const_threshold_violation, raw_scale_violation
+from mutator.formula_guard import (
+    BLOCKED_EVOLUTION_PRIMITIVES,
+    const_threshold_violation,
+    raw_scale_violation,
+)
 
 logger = logging.getLogger(__name__)
 
 # Raw base columns (order preserved)
 _RAW_BASES = ["open", "high", "close", "low", "volume"]
-_BLOCKED_BREADTH_NOARG_OPS = {
-    "advance_count", "decline_count", "unchanged_count",
-    "advance_decline_spread",
-}
-_BLOCKED_SECTOR_NOARG_OPS = {
-    "sector_code", "sector_size",
-    "sector_advance_count", "sector_decline_count", "sector_unchanged_count",
-    "sector_advance_decline_spread",
-}
-
 
 class Domain:
     """
@@ -155,11 +154,25 @@ class Domain:
                 return False
 
             try:
-                new_series = self._compute(gene.formula, train_df)
+                full_series = _evaluate_clean(gene.formula, train_df)
             except Exception as exc:
                 logger.warning("Domain.try_add: cannot evaluate %r — %s",
                                gene.formula, exc)
                 return False
+
+            quality_violation = _feature_quality_violation(
+                gene.formula,
+                full_series,
+                train_df,
+            )
+            if quality_violation is not None:
+                logger.debug(
+                    "Domain.try_add: reject low-quality feature %r - %s",
+                    gene.formula,
+                    quality_violation,
+                )
+                return False
+            new_series = full_series.dropna()
 
             for existing_formula in self._formulas:
                 ex_series = self._cache.get(existing_formula)
@@ -244,7 +257,7 @@ class Domain:
         self._ensure_cache_context(df)
         if formula in self._cache:
             return self._cache[formula]
-        series = evaluate(formula, df).replace([np.inf, -np.inf], np.nan).dropna()
+        series = _evaluate_clean(formula, df).dropna()
         self._cache[formula] = series
         return series
 
@@ -295,13 +308,13 @@ def _finance_seed_formulas() -> List[str]:
     formulas.extend(
         f"{op}()"
         for op in BREADTH_NOARG_OPS
-        if op not in _BLOCKED_BREADTH_NOARG_OPS
+        if op not in BLOCKED_EVOLUTION_PRIMITIVES
     )
     for op in BREADTH_WINDOW_OPS:
         formulas.extend(f"{op}({w})" for w in WINDOWS)
 
     for op in SECTOR_NOARG_OPS:
-        if op in _BLOCKED_SECTOR_NOARG_OPS:
+        if op in BLOCKED_EVOLUTION_PRIMITIVES:
             continue
         formulas.append(f"{op}()")
     for op in SECTOR_WINDOW_OPS:
@@ -507,6 +520,45 @@ def _safe_corr(a: pd.Series, b: pd.Series) -> float:
         return 0.0
 
 
+def _evaluate_clean(formula: str, df: pd.DataFrame) -> pd.Series:
+    return evaluate(formula, df).replace([np.inf, -np.inf], np.nan)
+
+
+def _feature_quality_violation(
+    formula: str,
+    series: pd.Series,
+    train_df: pd.DataFrame,
+    min_valid_ratio: float = FEATURE_MIN_VALID_RATIO,
+    max_dominant_value_ratio: float = FEATURE_MAX_DOMINANT_VALUE_RATIO,
+) -> str | None:
+    """Reject features whose signal exists on too little of the train context."""
+    if len(train_df) == 0:
+        return f"no rows available for feature quality check: {formula!r}"
+
+    aligned = series.reindex(train_df.index)
+    clean = aligned.dropna()
+    if len(clean) == 0:
+        return f"feature has no valid values: {formula!r}"
+
+    if min_valid_ratio > 0.0:
+        valid_ratio = float(aligned.notna().mean())
+        if valid_ratio < float(min_valid_ratio):
+            return (
+                f"valid ratio {valid_ratio:.3f} is below "
+                f"FEATURE_MIN_VALID_RATIO={float(min_valid_ratio):.3f}"
+            )
+
+    if max_dominant_value_ratio < 1.0:
+        dominant_ratio = float(clean.value_counts(normalize=True).iloc[0])
+        if dominant_ratio > float(max_dominant_value_ratio):
+            return (
+                f"dominant value ratio {dominant_ratio:.3f} is above "
+                "FEATURE_MAX_DOMINANT_VALUE_RATIO="
+                f"{float(max_dominant_value_ratio):.3f}"
+            )
+    return None
+
+
 def individual_corr_check(
     new_gene: Gene,
     existing_genes: List[Gene],
@@ -549,14 +601,25 @@ def individual_corr_check(
         return False
 
     try:
-        new_series = (
-            evaluate(new_gene.formula, train_df)
-            .replace([np.inf, -np.inf], np.nan)
-            .dropna()
-        )
+        full_series = _evaluate_clean(new_gene.formula, train_df)
     except Exception as exc:
         logger.warning("corr_check eval failed for %r: %s", new_gene.formula, exc)
         return False
+
+    quality_violation = _feature_quality_violation(
+        new_gene.formula,
+        full_series,
+        train_df,
+    )
+    if quality_violation is not None:
+        logger.debug(
+            "corr_check: reject low-quality feature %r - %s",
+            new_gene.formula,
+            quality_violation,
+        )
+        return False
+
+    new_series = full_series.dropna()
 
     # Loại gene hằng số ngay tại đây
     if new_series.std() < 1e-8:

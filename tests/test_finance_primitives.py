@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from mutator.domain import Domain
+from mutator.domain import Domain, individual_corr_check
 from mutator.evaluator import evaluate, has_division_by_zero
 from mutator.gene import (
     BREADTH_NOARG_OPS,
@@ -270,6 +270,46 @@ class FinancePrimitiveTests(unittest.TestCase):
         self.assertIn(formula, domain._cache)
         self.assertFalse(first.equals(second))
 
+    def test_new_features_need_enough_valid_rows(self):
+        df = _sample_df(periods=20)
+        sparse = Gene("ret(close_1, 10)")
+        dense = Gene("ret(close_1, 3)")
+
+        self.assertFalse(Domain().try_add(sparse, df))
+        self.assertFalse(individual_corr_check(sparse, [], df))
+        self.assertTrue(Domain().try_add(dense, df))
+        self.assertTrue(individual_corr_check(dense, [], df))
+
+    def test_new_features_reject_near_constant_signals(self):
+        idx = pd.MultiIndex.from_product(
+            [pd.date_range("2024-01-01", periods=100), ["AAA"]],
+            names=["date", "ticker"],
+        )
+        df = pd.DataFrame(index=idx)
+        close = pd.Series(100.0, index=idx)
+        close.iloc[50:] = 200.0
+        df["close"] = close
+        df["open"] = close
+        df["high"] = close + 1.0
+        df["low"] = close - 1.0
+        df["volume"] = 1000.0
+
+        rare_signal = Gene("gt(ret(close_1, 1), const(0.5))")
+        self.assertFalse(Domain().try_add(rare_signal, df))
+        self.assertFalse(individual_corr_check(rare_signal, [], df))
+
+        alternating_close = pd.Series(
+            [100.0 if i % 2 == 0 else 101.0 for i in range(len(idx))],
+            index=idx,
+        )
+        df["close"] = alternating_close
+        df["open"] = alternating_close
+        df["high"] = alternating_close + 1.0
+        df["low"] = alternating_close - 1.0
+        balanced_signal = Gene("gt(ret(close_1, 1), const(0))")
+        self.assertTrue(Domain().try_add(balanced_signal, df))
+        self.assertTrue(individual_corr_check(balanced_signal, [], df))
+
     def test_finance_primitives_evaluate(self):
         df = _sample_df()
 
@@ -380,6 +420,80 @@ class FinancePrimitiveTests(unittest.TestCase):
         self.assertEqual(len(series), len(df))
         self.assertFalse(has_division_by_zero(formula, df))
 
+    def test_window_tag_binary_parser_handles_nested_division_guard(self):
+        df = _sample_df()
+        formula = (
+            "(((close_1 - open_1)_w20 - (close_1 - open_1)_w30) "
+            "/ volume_ratio(20))"
+        )
+
+        series = evaluate(formula, df)
+
+        self.assertEqual(len(series), len(df))
+        self.assertTrue(has_division_by_zero(formula, df))
+
+    def test_evaluate_sorts_index_for_time_series_primitives(self):
+        idx = pd.MultiIndex.from_tuples(
+            [
+                (pd.Timestamp("2024-01-03"), "AAA"),
+                (pd.Timestamp("2024-01-01"), "AAA"),
+                (pd.Timestamp("2024-01-02"), "AAA"),
+            ],
+            names=["date", "ticker"],
+        )
+        df = pd.DataFrame(index=idx)
+        df["close"] = [30.0, 10.0, 20.0]
+        df["open"] = df["close"]
+        df["high"] = df["close"]
+        df["low"] = df["close"]
+        df["volume"] = 1000.0
+
+        actual = evaluate("shift(close_1, 1)", df)
+        expected = evaluate("shift(close_1, 1)", df.sort_index()).reindex(df.index)
+
+        pd.testing.assert_series_equal(actual, expected)
+
+    def test_boolean_primitives_preserve_missing_inputs(self):
+        idx = pd.MultiIndex.from_product(
+            [pd.date_range("2024-01-01", periods=4), ["AAA"]],
+            names=["date", "ticker"],
+        )
+        df = pd.DataFrame(index=idx)
+        close = pd.Series([10.0, 11.0, 10.5, 12.0], index=idx)
+        df["close"] = close
+        df["open"] = close
+        df["high"] = close + 1.0
+        df["low"] = close - 1.0
+        df["volume"] = 1000.0
+
+        first = idx[0]
+        second = idx[1]
+
+        self.assertTrue(pd.isna(evaluate("gt(ret(close_1, 1), const(0))", df).loc[first]))
+        self.assertEqual(
+            evaluate("gt(ret(close_1, 1), const(0))", df).loc[second],
+            1.0,
+        )
+        self.assertTrue(
+            pd.isna(
+                evaluate("cross_above(close_1, shift(close_1, 1))", df).loc[first]
+            )
+        )
+        self.assertTrue(
+            pd.isna(
+                evaluate(
+                    "where(gt(ret(close_1, 1), const(0)), const(1), const(0))",
+                    df,
+                ).loc[first]
+            )
+        )
+        self.assertTrue(
+            pd.isna(
+                evaluate("rule_signal(ret(close_1, 1), const(-0.01), const(0.01))", df)
+                .loc[first]
+            )
+        )
+
     def test_path_dependent_primitives_are_per_ticker(self):
         idx = pd.MultiIndex.from_product(
             [pd.date_range("2024-01-01", periods=5), ["AAA"]],
@@ -453,6 +567,116 @@ class FinancePrimitiveTests(unittest.TestCase):
         banking_day = neutral.loc[pd.Timestamp("2024-01-02")]
         self.assertAlmostEqual(float(banking_day.loc[["ACB", "VCB"]].sum()), 0.0)
         self.assertAlmostEqual(float(banking_day.loc["HPG"]), 0.0)
+
+    def test_sector_index_rolls_by_sector_not_ticker(self):
+        dates = pd.date_range("2024-01-01", periods=4)
+        idx = pd.MultiIndex.from_tuples(
+            [
+                (dates[0], "ACB"),
+                (dates[1], "ACB"),
+                (dates[2], "ACB"),
+                (dates[2], "VCB"),
+                (dates[3], "ACB"),
+                (dates[3], "VCB"),
+            ],
+            names=["date", "ticker"],
+        )
+        df = pd.DataFrame(index=idx)
+        close = pd.Series(
+            [100.0, 110.0, 121.0, 50.0, 133.1, 55.0],
+            index=idx,
+        )
+        df["close"] = close
+        df["open"] = close
+        df["high"] = close + 1.0
+        df["low"] = close - 1.0
+        df["volume"] = 1000.0
+
+        sector_ret = evaluate("sector_ret(2)", df)
+        acb_ret = sector_ret.loc[(dates[3], "ACB")]
+        vcb_ret = sector_ret.loc[(dates[3], "VCB")]
+
+        self.assertFalse(pd.isna(vcb_ret))
+        self.assertAlmostEqual(float(acb_ret), float(vcb_ret))
+        self.assertAlmostEqual(float(vcb_ret), 0.21)
+
+    def test_market_features_roll_by_date_not_ticker(self):
+        dates = pd.date_range("2024-01-01", periods=4)
+        idx = pd.MultiIndex.from_tuples(
+            [
+                (dates[0], "AAA"),
+                (dates[1], "AAA"),
+                (dates[2], "AAA"),
+                (dates[2], "BBB"),
+                (dates[3], "AAA"),
+                (dates[3], "BBB"),
+            ],
+            names=["date", "ticker"],
+        )
+        df = pd.DataFrame(index=idx)
+        close = pd.Series(
+            [100.0, 110.0, 121.0, 50.0, 133.1, 55.0],
+            index=idx,
+        )
+        market_by_date = pd.Series(
+            [100.0, 110.0, 121.0, 133.1],
+            index=dates,
+        )
+        market_close = pd.Series(
+            [market_by_date.loc[date] for date, _ in idx],
+            index=idx,
+        )
+        df["close"] = close
+        df["open"] = close
+        df["high"] = close + 1.0
+        df["low"] = close - 1.0
+        df["volume"] = 1000.0
+        df["market_close"] = market_close
+        df["market_open"] = market_close
+        df["market_high"] = market_close + 1.0
+        df["market_low"] = market_close - 1.0
+        df["market_volume"] = 1_000_000.0
+
+        market_ret = evaluate("market_ret(2)", df)
+        aaa_ret = market_ret.loc[(dates[3], "AAA")]
+        bbb_ret = market_ret.loc[(dates[3], "BBB")]
+
+        self.assertFalse(pd.isna(bbb_ret))
+        self.assertAlmostEqual(float(aaa_ret), float(bbb_ret))
+        self.assertAlmostEqual(float(bbb_ret), 0.21)
+
+    def test_breadth_momentum_rolls_by_date_not_ticker(self):
+        dates = pd.date_range("2024-01-01", periods=4)
+        idx = pd.MultiIndex.from_tuples(
+            [
+                (dates[0], "AAA"),
+                (dates[0], "BBB"),
+                (dates[1], "AAA"),
+                (dates[2], "AAA"),
+                (dates[2], "BBB"),
+                (dates[3], "AAA"),
+                (dates[3], "BBB"),
+            ],
+            names=["date", "ticker"],
+        )
+        df = pd.DataFrame(index=idx)
+        close = pd.Series(
+            [100.0, 50.0, 110.0, 100.0, 55.0, 110.0, 60.0],
+            index=idx,
+        )
+        df["close"] = close
+        df["open"] = close
+        df["high"] = close + 1.0
+        df["low"] = close - 1.0
+        df["volume"] = 1000.0
+
+        momentum = evaluate("breadth_momentum(2)", df)
+
+        aaa_day3 = momentum.loc[(dates[2], "AAA")]
+        bbb_day3 = momentum.loc[(dates[2], "BBB")]
+
+        self.assertAlmostEqual(float(aaa_day3), 0.5)
+        self.assertAlmostEqual(float(bbb_day3), 0.5)
 
     def test_finance_primitives_do_not_use_future_rows(self):
         base = _sample_df()

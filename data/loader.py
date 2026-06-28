@@ -71,8 +71,8 @@ def load_from_dir(
 
     if tickers is not None:
         stock_tickers = [
-            t for t in tickers
-            if t.upper() not in index_tickers
+            str(t).strip().upper() for t in tickers
+            if str(t).strip().upper() not in index_tickers
         ]
         csv_files = [data_dir / f"{t}.csv" for t in stock_tickers]
         missing   = [f for f in csv_files if not f.exists()]
@@ -105,14 +105,20 @@ def load_from_dir(
     market_index_df: Optional[pd.DataFrame] = None
     if include_vnindex and market_ticker is not None:
         market_index_df = load_market_index(data_dir, market_ticker)
-        if market_index_df is not None:
-            logger.info(
-                "Load market index %s: %d rows, %s -> %s",
-                market_ticker,
-                len(market_index_df),
-                market_index_df.index.min().date(),
-                market_index_df.index.max().date(),
+        if market_index_df is None:
+            raise FileNotFoundError(
+                f"Market index {market_ticker}.csv is required when "
+                "include_vnindex=True. Add the file, set MARKET_INDEX_TICKER "
+                "to an existing index, or call load_from_dir(..., "
+                "include_vnindex=False)."
             )
+        logger.info(
+            "Load market index %s: %d rows, %s -> %s",
+            market_ticker,
+            len(market_index_df),
+            market_index_df.index.min().date(),
+            market_index_df.index.max().date(),
+        )
 
     # ── INTERSECTION: chỉ giữ ngày TẤT CẢ ticker đều có giao dịch thực ──────
     # UNION sẽ tạo ffill noise ở ngày 1 ticker bị suspend/halted
@@ -217,11 +223,27 @@ def _load_single(
         return None
 
     # Thêm is_trading_day nếu chưa có
-    if "is_trading_day" not in df.columns:
-        df["is_trading_day"] = (df["volume"] > 0).astype(int)
+    for col in _REQUIRED_COLS:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    before_numeric_drop = len(df)
+    df = df.dropna(subset=_REQUIRED_COLS).copy()
+    dropped_bad_numeric = before_numeric_drop - len(df)
+    if dropped_bad_numeric:
+        logger.warning(
+            "%s dropped %d invalid OHLCV rows.",
+            ticker,
+            dropped_bad_numeric,
+        )
+
+    if "is_trading_day" in df.columns:
+        trading_day = pd.to_numeric(df["is_trading_day"], errors="coerce").fillna(0) != 0
+    else:
+        trading_day = df["volume"] > 0
+        df["is_trading_day"] = trading_day.astype(int)
 
     # Chỉ giữ ngày giao dịch thực tế
-    df = df[df["volume"] > 0].copy()
+    df = df[(df["volume"] > 0) & trading_day].copy()
+    df["is_trading_day"] = 1
 
     if len(df) < min_rows:
         logger.warning("%s chỉ có %d dòng hợp lệ (< %d) — bỏ qua.", ticker, len(df), min_rows)

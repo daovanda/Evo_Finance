@@ -84,13 +84,14 @@ _MARKET_PRICE_BASES = {
     "vnindex_open", "vnindex_high", "vnindex_low", "vnindex_close",
 }
 _MARKET_VOLUME_BASES = {"market_volume", "m_volume", "vnindex_volume"}
-_BLOCKED_ID_COUNT_OPS = {
+BLOCKED_EVOLUTION_PRIMITIVES = frozenset({
     "advance_count", "decline_count", "unchanged_count",
     "advance_decline_spread",
     "sector_code", "sector_size",
     "sector_advance_count", "sector_decline_count", "sector_unchanged_count",
     "sector_advance_decline_spread",
-}
+})
+_BLOCKED_ID_COUNT_OPS = BLOCKED_EVOLUTION_PRIMITIVES
 
 
 def is_const_threshold_safe(formula: str) -> bool:
@@ -122,6 +123,9 @@ def raw_scale_violation(formula: str) -> str | None:
     or time/regime proxies. Relative/normalized transforms remain allowed.
     """
     formula = formula.strip()
+    if _is_constant_only(formula):
+        return f"constant-only feature is not allowed: {formula!r}"
+
     blocked_primitive = _blocked_id_count_violation(formula)
     if blocked_primitive is not None:
         return blocked_primitive
@@ -455,8 +459,13 @@ def _output_scale_kind(expr: str) -> str | None:
     if fn in _TS_PRESERVE_IF_NORMALIZED_OPS:
         parsed = _split_ts_args(args)
         return _output_scale_kind(parsed[0]) if parsed[0] is not None else None
-    if fn in _FINANCE_TS_NORMALIZED_OPS or fn in _FINANCE_TS_IF_INPUT_NORMALIZED_OPS:
+    if fn in _FINANCE_TS_NORMALIZED_OPS:
         return "dimensionless"
+    if fn in _FINANCE_TS_IF_INPUT_NORMALIZED_OPS:
+        parsed = _split_ts_args(args)
+        if parsed[0] is None:
+            return None
+        return "dimensionless" if _is_normalized_expr(parsed[0]) else "raw_mixed"
     if fn == "delta":
         parsed = _split_ts_args(args)
         return _output_scale_kind(parsed[0]) if parsed[0] is not None else None
@@ -465,7 +474,7 @@ def _output_scale_kind(expr: str) -> str | None:
     if fn == "amihud":
         return "inverse_raw"
     if fn in {"body", "range", "gap", "upper_wick", "lower_wick"}:
-        return "price"
+        return "dimensionless"
     if fn in {"liquidity", "dollar_volume", "money_flow"}:
         return "dollar_volume"
     if fn in {"obv", "signed_volume"}:
@@ -728,7 +737,15 @@ def _format_raw_scale_comparison_violation(
 ) -> str | None:
     left_scale = _output_scale_kind(left)
     right_scale = _output_scale_kind(right)
-    if not (_is_raw_scale(left_scale) and _is_raw_scale(right_scale)):
+    left_raw = _is_raw_scale(left_scale)
+    right_raw = _is_raw_scale(right_scale)
+    if left_raw != right_raw:
+        return (
+            "comparison cannot mix raw-scale and normalized/relative inputs: "
+            f"{formula!r} compares {left!r} ({left_scale}) with "
+            f"{right!r} ({right_scale})"
+        )
+    if not (left_raw and right_raw):
         return None
     if left_scale == right_scale and left_scale not in {"raw_mixed", "inverse_raw"}:
         return None
