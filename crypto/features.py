@@ -7,10 +7,16 @@ normalization, bounded oscillator, or interaction of normalized quantities.
 
 from __future__ import annotations
 
+import logging
+import time
+
 import numpy as np
 import pandas as pd
 
 from crypto import config
+
+
+logger = logging.getLogger(__name__)
 
 
 RAW_SCALE_COLUMNS = {
@@ -35,7 +41,15 @@ def build_feature_frame(
     quality_index: pd.Index | None = None,
 ) -> pd.DataFrame:
     """Return a safe feature matrix aligned to df.index."""
+    start_time = time.time()
     data = df.sort_index()
+    windows = sorted({int(w) for w in windows if int(w) > 1})
+    logger.info(
+        "Crypto feature build: rows=%d | windows=%s | quality_rows=%s",
+        len(data),
+        windows,
+        len(quality_index) if quality_index is not None else "all",
+    )
     open_ = _num(data["open"])
     high = _num(data["high"])
     low = _num(data["low"])
@@ -96,7 +110,17 @@ def build_feature_frame(
         "trade_size_quote": features["trade_size_quote"],
     }
 
-    for w in sorted({int(w) for w in windows if int(w) > 1}):
+    logger.info("Crypto feature build: base features=%d", len(features))
+
+    for idx, w in enumerate(windows, start=1):
+        window_start = time.time()
+        before_count = len(features)
+        logger.info(
+            "Crypto feature build: window %d/%d w=%d started.",
+            idx,
+            len(windows),
+            w,
+        )
         ma = close.rolling(w, min_periods=w).mean()
         std = close.rolling(w, min_periods=w).std()
         ret_w = close.pct_change(w)
@@ -220,15 +244,32 @@ def build_feature_frame(
         features[f"imbalance_divergence_{w}"] = (
             features[f"taker_delta_z_{w}"] - features[f"ret_ts_rank_{w}"]
         )
+        logger.info(
+            "Crypto feature build: window %d/%d w=%d done | added=%d | total=%d | %.1fs",
+            idx,
+            len(windows),
+            w,
+            len(features) - before_count,
+            len(features),
+            time.time() - window_start,
+        )
 
+    logger.info("Crypto feature build: assembling DataFrame with %d columns.", len(features))
     feature_df = pd.DataFrame(features, index=data.index)
     feature_df = feature_df.replace([np.inf, -np.inf], np.nan)
-    return _quality_filter(
+    filtered = _quality_filter(
         feature_df,
         min_valid_ratio=float(min_valid_ratio),
         max_dominant_value_ratio=float(max_dominant_value_ratio),
         quality_index=quality_index,
     )
+    logger.info(
+        "Crypto feature build: kept %d/%d features after quality filter | total %.1fs",
+        len(filtered.columns),
+        len(feature_df.columns),
+        time.time() - start_time,
+    )
+    return filtered
 
 
 def selectable_features(feature_df: pd.DataFrame) -> list[str]:
@@ -244,9 +285,15 @@ def _quality_filter(
     max_dominant_value_ratio: float,
     quality_index: pd.Index | None = None,
 ) -> pd.DataFrame:
+    start_time = time.time()
     kept = []
     quality_df = feature_df if quality_index is None else feature_df.loc[quality_index]
     n_rows = max(len(quality_df), 1)
+    logger.info(
+        "Crypto feature quality filter: checking %d columns on %d rows.",
+        len(feature_df.columns),
+        len(quality_df),
+    )
     for col in feature_df.columns:
         series = pd.to_numeric(quality_df[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
         valid_ratio = float(series.notna().mean())
@@ -261,6 +308,12 @@ def _quality_filter(
         if len(valid) < max(20, int(0.01 * n_rows)):
             continue
         kept.append(col)
+    logger.info(
+        "Crypto feature quality filter: kept=%d dropped=%d | %.1fs",
+        len(kept),
+        len(feature_df.columns) - len(kept),
+        time.time() - start_time,
+    )
     return feature_df[kept].copy()
 
 
@@ -299,17 +352,13 @@ def _sqrt_nonnegative(series: pd.Series) -> pd.Series:
 
 def _persistence_ratio(series: pd.Series, window: int) -> pd.Series:
     signs = np.sign(series)
-
-    def persistence(values) -> float:
-        arr = pd.Series(values).dropna()
-        if arr.empty:
-            return np.nan
-        last = arr.iloc[-1]
-        if last == 0:
-            return 0.0
-        return float((arr == last).mean())
-
-    return signs.rolling(window, min_periods=window).apply(persistence, raw=False)
+    pos_ratio = (signs > 0).astype(float).rolling(window, min_periods=window).mean()
+    neg_ratio = (signs < 0).astype(float).rolling(window, min_periods=window).mean()
+    result = pd.Series(np.nan, index=series.index, dtype=float)
+    result = result.mask(signs > 0, pos_ratio)
+    result = result.mask(signs < 0, neg_ratio)
+    result = result.mask(signs == 0, 0.0)
+    return result
 
 
 def _rsi(close: pd.Series, window: int) -> pd.Series:
@@ -327,8 +376,16 @@ def _efficiency_ratio(close: pd.Series, window: int) -> pd.Series:
 
 
 def _rolling_rank_pct(series: pd.Series, window: int) -> pd.Series:
-    def rank_last(values) -> float:
-        arr = pd.Series(values)
-        return float(arr.rank(pct=True).iloc[-1])
+    def rank_last(values: np.ndarray) -> float:
+        last = values[-1]
+        if np.isnan(last):
+            return np.nan
+        valid = values[~np.isnan(values)]
+        if len(valid) == 0:
+            return np.nan
+        less = np.sum(valid < last)
+        equal = np.sum(valid == last)
+        average_rank = less + ((equal + 1.0) / 2.0)
+        return float(average_rank / len(valid))
 
-    return series.rolling(window, min_periods=window).apply(rank_last, raw=False)
+    return series.rolling(window, min_periods=window).apply(rank_last, raw=True)
