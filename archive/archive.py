@@ -254,4 +254,4 @@ class Archive:
 
 
 def _individual_signature(individual: Individual) -> tuple[str, ...]:
-    return tuple(sorted(str(formula) for formula in individual.formulas))
+    return tuple(sorted({str(formula).strip() for formula in individual.formulas}))

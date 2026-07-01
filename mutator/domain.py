@@ -2,7 +2,7 @@
 Evo_Finance — Domain
 ─────────────────────
 The Domain is the ever-growing pool of formula strings that the Mutator
-can draw from. A new formula is admitted only if its absolute Pearson
+can draw from. A new formula is admitted only if its absolute Spearman rank
 correlation with every existing formula in the domain is < CORR_THRESHOLD
 (computed on the training set).
 
@@ -15,6 +15,7 @@ import time
 from typing import List, Optional
 import numpy as np
 import pandas as pd
+from scipy.stats import spearmanr
 
 from config.settings import (
     CORR_THRESHOLD,
@@ -56,15 +57,20 @@ class Domain:
     # ── Initialisation ────────────────────────────────────────────────────────
 
     def seed(self, window: int = 1) -> List[Gene]:
-        """Populate with raw OHLCV genes; return them for the first individual."""
+        """
+        Populate the selectable domain with guard-safe finance primitives.
+
+        Raw OHLCV anchor genes are still returned for backwards compatibility,
+        but they are not inserted into ``self._formulas``.  They are raw scale
+        and should only appear inside normalized primitives such as returns,
+        ratios, candlestick percentages, or market-relative transforms.
+        """
         genes = [Gene.raw(b, window) for b in _RAW_BASES]
-        for g in genes:
-            self._formulas.append(g.formula)
 
         finance_formulas = []
         skipped_unsafe = 0
         for formula in _finance_seed_formulas():
-            violation = const_threshold_violation(formula)
+            violation = const_threshold_violation(formula) or raw_scale_violation(formula)
             if violation is not None:
                 skipped_unsafe += 1
                 logger.debug("Domain.seed: skip unsafe formula %r - %s", formula, violation)
@@ -75,7 +81,7 @@ class Domain:
                 self._formulas.append(formula)
 
         logger.info(
-            "Domain seeded with %d raw features + %d finance primitives%s.",
+            "Domain seeded with %d raw anchors excluded + %d guard-safe finance primitives%s.",
             len(genes),
             len(finance_formulas),
             f" ({skipped_unsafe} unsafe skipped)" if skipped_unsafe else "",
@@ -495,10 +501,11 @@ def _finance_seed_formulas() -> List[str]:
 
 def _safe_corr(a: pd.Series, b: pd.Series) -> float:
     """
-    Pearson correlation; trả về 1.0 (reject) nếu:
-      - Không đủ dữ liệu
-      - Một trong hai series là hằng số (std ≈ 0) → gene vô nghĩa như x/x
-    Trả về 0.0 nếu có exception khác.
+    Spearman rank correlation for feature de-duplication.
+
+    Fitness is rank-based, so admission should reject monotonic copies of an
+    existing feature, not only linear Pearson duplicates. Return 1.0 for an
+    unusable new signal so callers reject it.
     """
     try:
         aligned = (
@@ -515,7 +522,8 @@ def _safe_corr(a: pd.Series, b: pd.Series) -> float:
             return 1.0  # reject: gene không có thông tin
         if std_b < 1e-8:
             return 0.0
-        return float(aligned.iloc[:, 0].corr(aligned.iloc[:, 1]))
+        corr, _ = spearmanr(aligned.iloc[:, 0], aligned.iloc[:, 1])
+        return float(corr) if np.isfinite(corr) else 0.0
     except Exception:
         return 0.0
 

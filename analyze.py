@@ -10,11 +10,16 @@ Usage
 
     # Chỉ vẽ top-N individuals
     python analyze.py --data-dir data/raw --archive results/archive.json --top 10
-    python analyze.py --data-dir data/raw --archive results/archive_test6_morongdomain.json --top 10    
+    python analyze.py --data-dir data/raw --archive results/archive_test6_morongdomain.json --top 10   
+    
+    # Chỉ vẽ rank a trong archive chỉ định
+    python analyze.py --data-dir data/raw --archive results/archive_test10_seed3.json --rank 1 5 12 
 
     # Custom ngày split (phải khớp với lúc train)
     python analyze.py --data-dir data/raw --archive results/archive.json \\
         --val-start 2022-01-01 --test-start 2023-07-01
+
+
 
 Output
 ------
@@ -70,6 +75,12 @@ logger = logging.getLogger("evo_finance.analyze")
 
 ROLLING_WINDOW = 5
 
+# Market shock shading config. A shock is abs(market close-to-close return)
+# greater than or equal to this threshold; the chart shades surrounding sessions.
+MARKET_SHOCK_THRESHOLD = 0.03
+MARKET_SHOCK_BACKWARD_DAYS = 5
+MARKET_SHOCK_FORWARD_DAYS = 5
+
 
 # ─── Load archive JSON ────────────────────────────────────────────────────────
 
@@ -80,8 +91,56 @@ def load_archive_json(path: Path) -> list[dict]:
     return entries
 
 
+def _filter_archive_entries(
+    entries: list[dict],
+    top: Optional[int] = None,
+    ranks: Optional[list[int]] = None,
+) -> list[dict]:
+    """
+    Select which archive entries to analyze.
+
+    ranks has precedence over top because rank numbers refer to the full
+    archive, not to a top-N slice.
+    """
+    if ranks:
+        wanted = {int(rank) for rank in ranks}
+        selected = [
+            entry for entry in entries
+            if int(entry.get("rank", -1)) in wanted
+        ]
+        found = {int(entry.get("rank", -1)) for entry in selected}
+        missing = sorted(wanted - found)
+        if missing:
+            logger.warning("Archive does not contain requested rank(s): %s", missing)
+        if not selected:
+            raise ValueError(f"No archive entries matched rank(s): {sorted(wanted)}")
+        logger.info("Chỉ xử lý rank(s): %s", sorted(found))
+        return selected
+
+    if top is not None:
+        selected = entries[:top]
+        logger.info("Chỉ xử lý top %d individuals", top)
+        return selected
+
+    return entries
+
+
 def json_to_individual(entry: dict) -> Individual:
-    genes = [Gene(formula=f) for f in entry["genes"]]
+    formulas = entry.get("genes")
+    if not isinstance(formulas, list) or not formulas:
+        raise ValueError("archive entry has no genes list")
+
+    clean_formulas: list[str] = []
+    for formula in formulas:
+        clean = str(formula).strip()
+        if not clean:
+            continue
+        if clean not in clean_formulas:
+            clean_formulas.append(clean)
+    if not clean_formulas:
+        raise ValueError("archive entry has no valid gene formulas")
+
+    genes = [Gene(formula=f) for f in clean_formulas]
     return Individual(
         genes      = genes,
         score      = None,
@@ -333,6 +392,100 @@ def _add_period_shading(ax, xmin, xmax, test_ts, val_ts=None):
     ax.axhline(0,       color="#6B7280", linewidth=0.7, linestyle="--", alpha=0.5)
 
 
+def _market_shock_windows(
+    df: pd.DataFrame,
+    threshold: float = MARKET_SHOCK_THRESHOLD,
+    backward_days: int = MARKET_SHOCK_BACKWARD_DAYS,
+    forward_days: int = MARKET_SHOCK_FORWARD_DAYS,
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """Return chart spans for large market moves and surrounding sessions."""
+    if "market_close" not in df.columns or df.empty:
+        return []
+
+    if isinstance(df.index, pd.MultiIndex):
+        market_close = df["market_close"].groupby(level="date").first()
+    elif "date" in df.columns:
+        market_close = df.drop_duplicates("date").set_index("date")["market_close"]
+    else:
+        market_close = df["market_close"]
+
+    market_close = (
+        pd.to_numeric(market_close, errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+        .sort_index()
+    )
+    market_close = market_close[market_close > 0]
+    if len(market_close) < 2:
+        return []
+
+    dates = pd.DatetimeIndex(pd.to_datetime(market_close.index)).sort_values()
+    market_ret = market_close.reindex(dates).pct_change()
+    shock_positions = np.flatnonzero(
+        (market_ret.abs() >= abs(float(threshold))).to_numpy()
+    )
+    if len(shock_positions) == 0:
+        return []
+
+    selected = np.zeros(len(dates), dtype=bool)
+    backward = max(int(backward_days), 0)
+    follow = max(int(forward_days), 0)
+    for pos in shock_positions:
+        start_pos = max(pos - backward, 0)
+        end_pos = min(pos + follow + 1, len(dates))
+        selected[start_pos:end_pos] = True
+
+    windows: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    start_pos = None
+    for pos, active in enumerate(selected):
+        if active and start_pos is None:
+            start_pos = pos
+        if start_pos is not None and (not active or pos == len(selected) - 1):
+            end_pos = pos if active and pos == len(selected) - 1 else pos - 1
+            start = pd.Timestamp(dates[start_pos])
+            end = pd.Timestamp(dates[end_pos]) + pd.Timedelta(days=1)
+            windows.append((start, end))
+            start_pos = None
+
+    return windows
+
+
+def _add_market_shock_shading(
+    ax,
+    windows: Optional[list[tuple[pd.Timestamp, pd.Timestamp]]],
+    xmin=None,
+    xmax=None,
+) -> None:
+    """Shade market shock windows in red on top of val/test backgrounds."""
+    if not windows:
+        return
+
+    xmin = pd.Timestamp(xmin) if xmin is not None else None
+    xmax = pd.Timestamp(xmax) if xmax is not None else None
+    labelled = False
+    for start, end in windows:
+        start = pd.Timestamp(start)
+        end = pd.Timestamp(end)
+        if xmin is not None and end < xmin:
+            continue
+        if xmax is not None and start > xmax:
+            continue
+        label = (
+            f"|Market ret| >= {MARKET_SHOCK_THRESHOLD:.0%} +/- {MARKET_SHOCK_FORWARD_DAYS}d"
+            if not labelled
+            else None
+        )
+        ax.axvspan(
+            max(start, xmin) if xmin is not None else start,
+            min(end, xmax) if xmax is not None else end,
+            alpha=0.10,
+            color="#EF4444",
+            linewidth=0,
+            label=label,
+        )
+        labelled = True
+
+
 def _add_xaxis_format(ax):
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
     ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
@@ -454,7 +607,12 @@ def _aggregate_wf_metrics(
         "wf_hit_rate": float(wf_metrics["hit_rate"].mean()),
         "wf_hit_excess": float(wf_metrics["hit_excess"].mean()),
         "wf_ic_std": float(wf_metrics["val_mean_ic"].std(ddof=0)),
-        "bad_fold_ratio": float((wf_metrics["val_mean_ic"] <= 0.0).mean()),
+        "bad_fold_ratio": float(
+            (
+                (wf_metrics["val_mean_ic"] <= 0.0)
+                | (wf_metrics["hit_excess"] < 0.0)
+            ).mean()
+        ),
         "wf_overfit_gap": float(wf_metrics["overfit_gap"].mean()),
         "wf_train_mean_ic": float(wf_metrics["train_mean_ic"].mean()),
         "n_folds": float(len(wf_metrics)),
@@ -566,6 +724,7 @@ def plot_individual(
     wf_aggregate: Optional[dict[str, float]] = None,
     wf_ic_series: Optional[pd.Series] = None,
     wf_hr_series: Optional[pd.Series] = None,
+    market_shock_windows: Optional[list[tuple[pd.Timestamp, pd.Timestamp]]] = None,
 ) -> None:
     """
     2 subplot trong cùng 1 figure:
@@ -629,6 +788,7 @@ def plot_individual(
 
     # ── Panel 1: IC ───────────────────────────────────────────────────────────
     _add_period_shading(ax_ic, xmin, xmax, test_ts, val_ts=val_ts)
+    _add_market_shock_shading(ax_ic, market_shock_windows, xmin=xmin, xmax=xmax)
 
     ax_ic.bar(
         ic_series.index, ic_series.values,
@@ -665,6 +825,7 @@ def plot_individual(
     # ── Panel 2: Hit Rate ─────────────────────────────────────────────────────
     if not hr_series.empty:
         _add_period_shading(ax_hr, xmin, xmax, test_ts, val_ts=val_ts)
+        _add_market_shock_shading(ax_hr, market_shock_windows, xmin=xmin, xmax=xmax)
 
         # Random baseline
         ax_hr.axhline(
@@ -740,6 +901,7 @@ def _plot_summary_generic(
     ylabel:      str,
     baseline:    Optional[float] = None,
     date_index:  Optional[pd.DatetimeIndex] = None,
+    market_shock_windows: Optional[list[tuple[pd.Timestamp, pd.Timestamp]]] = None,
 ) -> None:
     """Generic summary chart (reused for IC và Hit Rate)."""
     if not all_series:
@@ -769,6 +931,7 @@ def _plot_summary_generic(
         return
 
     _add_period_shading(ax, xmin, xmax, test_ts, val_ts=pd.Timestamp(val_start))
+    _add_market_shock_shading(ax, market_shock_windows, xmin=xmin, xmax=xmax)
 
     if baseline is not None:
         ax.axhline(baseline, color="#9CA3AF", linewidth=1.2,
@@ -816,6 +979,7 @@ def analyze(
     wf_step_months: int         = WF_STEP_MONTHS,
     wf_purge_days: int          = WF_PURGE_DAYS,
     top:          Optional[int] = None,
+    ranks:        Optional[list[int]] = None,
     out_dir:      str           = "results/chart",
     tickers:      Optional[list[str]] = None,
 ) -> None:
@@ -841,6 +1005,14 @@ def analyze(
     _handle_missing_sector_mapping(missing_sector)
     small_sectors = small_sectors_in_universe(df, MIN_SECTOR_MEMBERS_IN_UNIVERSE)
     _handle_small_sector_universe(small_sectors)
+    market_shock_windows = _market_shock_windows(df)
+    logger.info(
+        "Market shock shading: %d window(s), abs_threshold=%.1f%%, backward=%d sessions, forward=%d sessions",
+        len(market_shock_windows),
+        MARKET_SHOCK_THRESHOLD * 100.0,
+        MARKET_SHOCK_BACKWARD_DAYS,
+        MARKET_SHOCK_FORWARD_DAYS,
+    )
 
     # ── Split ─────────────────────────────────────────────────────────────────
     labeled_df = label_dataframe(df)
@@ -907,9 +1079,7 @@ def analyze(
 
     # ── Load archive ──────────────────────────────────────────────────────────
     entries = load_archive_json(Path(archive_path))
-    if top is not None:
-        entries = entries[:top]
-        logger.info("Chỉ xử lý top %d individuals", top)
+    entries = _filter_archive_entries(entries, top=top, ranks=ranks)
 
     # ── Process each individual ───────────────────────────────────────────────
     all_ic: dict[int, pd.Series] = {}
@@ -917,9 +1087,15 @@ def analyze(
 
     for entry in entries:
         rank = entry["rank"]
-        logger.info("── Rank #%d (genes=%d) ──", rank, entry["n_genes"])
+        logger.info("── Rank #%d (genes=%d) ──", rank, entry.get("n_genes", 0))
 
-        ind = json_to_individual(entry)
+        try:
+            ind = json_to_individual(entry)
+        except Exception as exc:
+            logger.warning("Rank #%d: invalid archive entry - skip: %s", rank, exc)
+            continue
+        entry["genes"] = ind.formulas
+        entry["n_genes"] = len(ind)
         ic_series, hr_series, eval_dates = compute_series(
             ind, train_df, val_df, test_df, feature_df=feature_df
         )
@@ -974,7 +1150,8 @@ def analyze(
                         wf_metrics=wf_metrics,
                         wf_aggregate=wf_aggregate,
                         wf_ic_series=wf_ic_series,
-                        wf_hr_series=wf_hr_series)
+                        wf_hr_series=wf_hr_series,
+                        market_shock_windows=market_shock_windows)
 
     # ── Summary charts ────────────────────────────────────────────────────────
     if all_ic:
@@ -983,12 +1160,14 @@ def analyze(
             out_path / "ic_summary.png",
             title="IC (Spearman)", ylabel=f"IC Rolling-{ROLLING_WINDOW}",
             date_index=eval_dates,
+            market_shock_windows=market_shock_windows,
         )
         _plot_summary_generic(
             all_hr, entries, val_start, test_start,
             out_path / "hitrate_summary.png",
             title="Hit Rate", ylabel=f"Hit Rate Rolling-{ROLLING_WINDOW}",
             baseline=baseline, date_index=eval_dates,
+            market_shock_windows=market_shock_windows,
         )
 
     total = len(all_ic)
@@ -1018,6 +1197,15 @@ if __name__ == "__main__":
     parser.add_argument("--wf-step-months", type=int, default=WF_STEP_MONTHS)
     parser.add_argument("--wf-purge-days", type=int, default=WF_PURGE_DAYS)
     parser.add_argument("--top",        type=int, default=None, metavar="N")
+    parser.add_argument(
+        "--rank", "--ranks",
+        dest="ranks",
+        type=int,
+        nargs="+",
+        default=None,
+        metavar="RANK",
+        help="Only analyze specific archive rank(s), e.g. --rank 1 or --rank 1 5 10. Overrides --top.",
+    )
     parser.add_argument("--out-dir",    default="results/chart", metavar="DIR")
     parser.add_argument("--tickers",    nargs="+", default=None, metavar="TICKER")
 
@@ -1034,6 +1222,7 @@ if __name__ == "__main__":
         wf_step_months      = args.wf_step_months,
         wf_purge_days       = args.wf_purge_days,
         top          = args.top,
+        ranks        = args.ranks,
         out_dir      = args.out_dir,
         tickers      = args.tickers,
     )

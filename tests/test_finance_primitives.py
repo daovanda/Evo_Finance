@@ -3,8 +3,9 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from mutator.domain import Domain, individual_corr_check
+from mutator.domain import Domain, individual_corr_check, _safe_corr
 from mutator.evaluator import evaluate, has_division_by_zero
+from mutator.formula_guard import const_threshold_violation, raw_scale_violation
 from mutator.gene import (
     BREADTH_NOARG_OPS,
     BREADTH_WINDOW_OPS,
@@ -232,6 +233,13 @@ def _sample_df(periods=80):
 
 
 class FinancePrimitiveTests(unittest.TestCase):
+    def test_corr_dedup_uses_spearman_for_monotonic_copies(self):
+        x = pd.Series(np.linspace(0.0, 1.0, 100))
+        monotonic_nonlinear = pd.Series(np.exp(20.0 * x))
+
+        self.assertLess(abs(x.corr(monotonic_nonlinear)), 0.70)
+        self.assertGreater(abs(_safe_corr(x, monotonic_nonlinear)), 0.99)
+
     def test_domain_rejects_strong_negative_correlation(self):
         df = _sample_df(periods=20)
         domain = Domain()
@@ -790,15 +798,23 @@ class FinancePrimitiveTests(unittest.TestCase):
 
         domain = Domain()
         domain.seed()
+
+        def assert_seed_membership(formula: str) -> None:
+            violation = const_threshold_violation(formula) or raw_scale_violation(formula)
+            if violation is None:
+                self.assertIn(formula, domain.formulas)
+            else:
+                self.assertNotIn(formula, domain.formulas)
+
         for op in TS_ROLLING_OPS:
-            self.assertIn(f"{op}(close_1, 20)", domain.formulas)
-            self.assertIn(f"{op}(volume_1, 20)", domain.formulas)
+            assert_seed_membership(f"{op}(close_1, 20)")
+            assert_seed_membership(f"{op}(volume_1, 20)")
         for op in FINANCE_TS_OPS:
-            self.assertIn(f"{op}(close_1, 20)", domain.formulas)
+            assert_seed_membership(f"{op}(close_1, 20)")
         for op in FINANCE_WINDOW_OPS:
-            self.assertIn(f"{op}(20)", domain.formulas)
+            assert_seed_membership(f"{op}(20)")
         for op in MARKET_WINDOW_OPS:
-            self.assertIn(f"{op}(20)", domain.formulas)
+            assert_seed_membership(f"{op}(20)")
         blocked_breadth_noarg = {
             "advance_count", "decline_count", "unchanged_count",
             "advance_decline_spread",
@@ -809,9 +825,9 @@ class FinancePrimitiveTests(unittest.TestCase):
             else:
                 self.assertIn(f"{op}()", domain.formulas)
         for op in BREADTH_WINDOW_OPS:
-            self.assertIn(f"{op}(20)", domain.formulas)
+            assert_seed_membership(f"{op}(20)")
         for op in SECTOR_CS_OPS:
-            self.assertIn(f"{op}(ret(close_1, 1))", domain.formulas)
+            assert_seed_membership(f"{op}(ret(close_1, 1))")
         blocked_sector_noarg = {
             "sector_code", "sector_size",
             "sector_advance_count", "sector_decline_count",
@@ -824,24 +840,18 @@ class FinancePrimitiveTests(unittest.TestCase):
             else:
                 self.assertIn(f"{op}()", domain.formulas)
         for op in SECTOR_WINDOW_OPS:
-            self.assertIn(f"{op}(20)", domain.formulas)
+            assert_seed_membership(f"{op}(20)")
         for op in FINANCE_TWO_WINDOW_OPS:
-            self.assertIn(f"{op}(20, 3)", domain.formulas)
+            assert_seed_membership(f"{op}(20, 3)")
         for op in FINANCE_NOARG_OPS:
-            self.assertIn(f"{op}()", domain.formulas)
+            assert_seed_membership(f"{op}()")
         for op in CUMULATIVE_TS_OPS:
-            self.assertIn(f"{op}(close_1)", domain.formulas)
+            assert_seed_membership(f"{op}(close_1)")
         for op in CUMULATIVE_NOARG_OPS:
-            self.assertIn(f"{op}()", domain.formulas)
+            assert_seed_membership(f"{op}()")
         for op in PAIR_TS_OPS:
-            self.assertIn(
-                f"{op}(ret(close_1, 1), volume_ratio(20), 20)",
-                domain.formulas,
-            )
-            self.assertIn(
-                f"{op}(ret(close_1, 1), ret(market_close_1, 1), 20)",
-                domain.formulas,
-            )
+            assert_seed_membership(f"{op}(ret(close_1, 1), volume_ratio(20), 20)")
+            assert_seed_membership(f"{op}(ret(close_1, 1), ret(market_close_1, 1), 20)")
 
         for formula in [
             "const(0.5)", "ema(close_1, 20)", "bb_pos(close_1, 20)",
@@ -899,7 +909,7 @@ class FinancePrimitiveTests(unittest.TestCase):
             "sector_zscore(ret(close_1, 1))",
             "sector_neutralize(ret(close_1, 1))",
         ]:
-            self.assertIn(formula, domain.formulas)
+            assert_seed_membership(formula)
 
 
 if __name__ == "__main__":

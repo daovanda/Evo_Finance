@@ -318,6 +318,16 @@ class FormulaGuardTests(unittest.TestCase):
         ]
         self.assertEqual([], unsafe)
 
+        unsafe_by_guard = [
+            (formula, const_threshold_violation(formula) or raw_scale_violation(formula))
+            for formula in domain.formulas
+            if const_threshold_violation(formula) is not None
+            or raw_scale_violation(formula) is not None
+        ]
+        self.assertEqual([], unsafe_by_guard)
+        for raw_formula in ("open_1", "high_1", "close_1", "low_1", "volume_1"):
+            self.assertNotIn(raw_formula, domain.formulas)
+
         unsafe_cs_normalizers = [
             (formula, raw_scale_violation(formula))
             for formula in domain.formulas

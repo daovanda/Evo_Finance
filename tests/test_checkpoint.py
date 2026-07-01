@@ -1,7 +1,9 @@
+import io
 import json
 import math
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,9 +11,11 @@ import pandas as pd
 from archive.archive import Archive
 from main import (
     _checkpoint_path,
+    _final_evaluate_archive,
     _load_archive_json_into_archive,
     _maybe_save_checkpoint,
     _prediction_metrics,
+    _print_summary,
     _safe_float,
     _save_json,
 )
@@ -126,6 +130,17 @@ class CheckpointTests(unittest.TestCase):
         self.assertEqual(len(archive), 1)
         self.assertEqual(archive.best.score, 1.0)
 
+        duplicate_with_repeated_gene = Individual(
+            genes=[
+                Gene("ret(close_1, 5)"),
+                Gene("ret(close_1, 5)"),
+                Gene("volume_ratio(20)"),
+            ],
+            score=0.20,
+        )
+        self.assertFalse(archive.try_add(duplicate_with_repeated_gene, booster=object()))
+        self.assertEqual(len(archive), 1)
+
     def test_archive_rejects_non_finite_scores(self):
         archive = Archive(max_size=10)
         bad_live = Individual.seed()
@@ -137,6 +152,29 @@ class CheckpointTests(unittest.TestCase):
         self.assertEqual(len(archive), 0)
         self.assertIsNone(_safe_float(float("inf")))
         self.assertIsNone(_safe_float(float("-inf")))
+
+    def test_archive_row_to_individual_strips_and_deduplicates_genes(self):
+        from main import _archive_row_to_individual
+
+        individual = _archive_row_to_individual(
+            {
+                "score": 1.0,
+                "genes": [
+                    " ret(close_1, 5) ",
+                    "ret(close_1, 5)",
+                    "",
+                    " volume_ratio(20)",
+                ],
+            }
+        )
+
+        self.assertEqual(
+            individual.formulas,
+            ["ret(close_1, 5)", "volume_ratio(20)"],
+        )
+
+        with self.assertRaisesRegex(ValueError, "no valid gene formulas"):
+            _archive_row_to_individual({"score": 1.0, "genes": [" ", ""]})
 
     def test_checkpoint_path_is_next_to_final_archive(self):
         self.assertEqual(
@@ -224,6 +262,49 @@ class CheckpointTests(unittest.TestCase):
         self.assertEqual(metrics["test_hit_rate"], 1.0)
         self.assertEqual(metrics["test_hit_baseline"], 1.0)
         self.assertEqual(metrics["test_hit_excess"], 0.0)
+
+    def test_final_eval_failure_clears_stale_metrics(self):
+        class FailingTrainer:
+            def train(self, *args, **kwargs):
+                raise RuntimeError("boom")
+
+        archive = Archive(max_size=10)
+        archive.add_loaded(
+            Individual(genes=[Gene("ret(close_1, 5)")]),
+            score=0.42,
+            metrics={"wf_mean_ic": 0.1},
+            final_val_metrics={"final_val_mean_ic": 9.9},
+            test_metrics={"test_mean_ic": 8.8},
+        )
+
+        empty = pd.DataFrame(index=pd.MultiIndex.from_arrays([[], []], names=["date", "ticker"]))
+
+        _final_evaluate_archive(
+            archive,
+            FailingTrainer(),
+            empty,
+            empty,
+            empty,
+            empty,
+        )
+
+        entry = archive.entries[0]
+        self.assertIsNone(entry.booster)
+        self.assertEqual(entry.final_val_metrics, {})
+        self.assertEqual(entry.test_metrics, {})
+
+    def test_print_summary_handles_missing_nested_metrics(self):
+        archive = Archive(max_size=10)
+        archive.add_loaded(
+            Individual(genes=[Gene("ret(close_1, 5)")]),
+            score=0.42,
+            metrics={"wf_mean_ic": 0.1},
+            final_val_metrics={"final_val_mean_ic": None},
+            test_metrics={"test_mean_ic": None},
+        )
+
+        with redirect_stdout(io.StringIO()):
+            _print_summary(archive, total_iters=1, elapsed=0.0)
 
 
 if __name__ == "__main__":

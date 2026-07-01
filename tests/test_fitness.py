@@ -134,6 +134,36 @@ class FitnessMetricTests(unittest.TestCase):
         self.assertGreater(result.extra["bad_fold_ratio"], 0.0)
         self.assertIn("wf_mean_ic", ind.metrics)
 
+    def test_bad_fold_ratio_flags_negative_hit_excess_even_with_positive_ic(self):
+        date = pd.Timestamp("2024-01-01")
+        tickers = [f"T{i:02d}" for i in range(20)]
+        idx = pd.MultiIndex.from_product([[date], tickers], names=["date", "ticker"])
+        df = pd.DataFrame(index=idx)
+        labels = pd.Series(range(20), index=idx, dtype=float)
+        pred = pd.Series(
+            [10, 12, 17, 8, 0, 1, 4, 18, 14, 19, 7, 2, 5, 6, 3, 13, 16, 15, 9, 11],
+            index=idx,
+            dtype=float,
+        )
+
+        folds = [
+            FoldPrediction(
+                name="wf_01",
+                train_pred=labels,
+                val_pred=pred,
+                train_labels=labels,
+                val_labels=labels,
+                train_df=df,
+                val_df=df,
+            )
+        ]
+
+        result = FitnessEvaluator().evaluate_walk_forward(Individual.seed(), folds)
+
+        self.assertGreater(result.extra["wf_mean_ic"], 0.0)
+        self.assertLess(result.extra["wf_hit_excess"], 0.0)
+        self.assertEqual(result.extra["bad_fold_ratio"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

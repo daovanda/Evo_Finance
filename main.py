@@ -439,7 +439,16 @@ def _archive_row_to_individual(row: dict) -> Individual:
     formulas = row.get("genes")
     if not isinstance(formulas, list) or not formulas:
         raise ValueError("archive row has no genes list")
-    genes = [Gene(formula=str(formula)) for formula in formulas]
+    clean_formulas: list[str] = []
+    for formula in formulas:
+        clean = str(formula).strip()
+        if not clean:
+            continue
+        if clean not in clean_formulas:
+            clean_formulas.append(clean)
+    if not clean_formulas:
+        raise ValueError("archive row has no valid gene formulas")
+    genes = [Gene(formula=formula) for formula in clean_formulas]
     score = _safe_float(row.get("score"))
     generation = int(row.get("generation") or 0)
     return Individual(
@@ -537,6 +546,9 @@ def _final_evaluate_archive(
 ) -> None:
     """Retrain each archived individual on final split and evaluate val/test."""
     for entry in archive.entries:
+        entry.booster = None
+        entry.final_val_metrics = {}
+        entry.test_metrics = {}
         try:
             booster, _, val_pred, _, val_labels = trainer.train(
                 entry.individual, train_df, val_df,
@@ -611,7 +623,7 @@ def _print_summary(archive: Archive, total_iters: int, elapsed: float) -> None:
             f"{_fmt_metric(r.get('bad_fold_ratio')):>5}  "
             f"{_fmt_metric(r.get('wf_overfit_gap')):>6}  "
             f"{_fmt_metric(fvm.get('final_val_mean_ic')):>7}  "
-            f"{tm.get('test_mean_ic', float('nan')):>7.4f}  "
+            f"{_fmt_metric(tm.get('test_mean_ic')):>7}  "
             f"{r['n_genes']:>6}"
         )
     print(f"{'='*100}\n")

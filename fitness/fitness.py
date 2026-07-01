@@ -260,7 +260,12 @@ class FitnessEvaluator:
         wf_hit_excess = float(fold_df["hit_excess"].mean())
         wf_overfit_gap = float(fold_df["overfit_gap"].mean())
         train_mean_ic = float(fold_df["train_mean_ic"].mean())
-        bad_fold_ratio = float((fold_df["val_mean_ic"] <= 0.0).mean())
+        bad_fold_ratio = float(
+            (
+                (fold_df["val_mean_ic"] <= 0.0)
+                | (fold_df["hit_excess"] < 0.0)
+            ).mean()
+        )
 
         if len(all_val_ic) > 1:
             wf_icir = float(all_val_ic.mean()) / (float(all_val_ic.std()) + 1e-9)
