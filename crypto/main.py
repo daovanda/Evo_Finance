@@ -173,12 +173,52 @@ def run(
                 _save_archive(archive, checkpoint_path, horizons, label_threshold)
                 last_checkpoint = now
 
+    if not archive.is_empty():
+        _evaluate_final_archive(
+            archive=archive,
+            evaluator=evaluator,
+            train_df=train_df,
+            val_df=val_df,
+            test_df=test_df,
+            feature_space=feature_space,
+        )
+
     if save_path is not None:
         _save_archive(archive, save_path, horizons, label_threshold)
         logger.info("Saved crypto archive to %s", save_path)
     if checkpoint_path is not None:
         _save_archive(archive, checkpoint_path, horizons, label_threshold)
     return archive
+
+
+def _evaluate_final_archive(
+    archive: CryptoArchive,
+    evaluator: CryptoFitnessEvaluator,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    feature_space: CryptoFeatureSpace,
+) -> None:
+    logger.info(
+        "Budget ended; running final val/test evaluation for %d archive entries.",
+        len(archive),
+    )
+    ok = 0
+    for rank, individual in enumerate(archive.entries, start=1):
+        logger.info("Final evaluation rank %d/%d started.", rank, len(archive))
+        try:
+            evaluator.evaluate_final(
+                individual=individual,
+                train_df=train_df,
+                val_df=val_df,
+                test_df=test_df,
+                feature_data=feature_space,
+            )
+        except Exception as exc:
+            logger.warning("Final evaluation failed for rank %d: %s", rank, exc)
+            continue
+        ok += 1
+    logger.info("Final evaluation completed: %d/%d entries evaluated.", ok, len(archive))
 
 
 def _save_archive(
@@ -195,6 +235,7 @@ def _save_archive(
             "label_threshold": label_threshold,
             "fitness": config.FITNESS_WEIGHTS,
             "trade_top_fraction": config.TRADE_TOP_FRACTION,
+            "trade_cost": config.TRADE_COST,
             "return_score_scale": config.RETURN_SCORE_SCALE,
         },
     )

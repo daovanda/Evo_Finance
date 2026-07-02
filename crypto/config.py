@@ -14,7 +14,7 @@ RESULTS_DIR: Path = Path("crypto/results")
 DEFAULT_ARCHIVE_PATH: Path = RESULTS_DIR / "crypto_btc_archive.json"
 
 # Multi-horizon binary labels. Edit this list freely, for example [3, 7, 10, 20].
-HOLDING_HORIZONS: list[int] = [3, 7, 10]
+HOLDING_HORIZONS: list[int] = [3, 5]
 LABEL_THRESHOLD: float = 0.001  # label=1 when future return > 0.1%
 
 # Final split, kept separate from the stock settings.
@@ -31,10 +31,10 @@ WF_PURGE_BARS: int | None = None  # None => max(HOLDING_HORIZONS) + 1
 
 # Safe feature construction. All features are time-series/ratio normalized;
 # raw price/volume scale columns are intentionally not selectable.
-WINDOWS: list[int] = [3, 5, 10, 14, 20, 30, 60, 120, 240, 480]
+WINDOWS: list[int] = [3, 5, 7, 10, 14, 20, 30, 40, 50, 60, 80, 120, 160, 240, 320, 400, 480]
 FEATURE_MIN_VALID_RATIO: float = 0.70
 FEATURE_MAX_DOMINANT_VALUE_RATIO: float = 0.985
-FEATURE_CORR_THRESHOLD: float = 0.95
+FEATURE_CORR_THRESHOLD: float = 0.70
 EXPR_MAX_DEPTH: int = 4
 EXPR_MAX_LENGTH: int = 240
 EXPR_MAX_ABS_QUANTILE: float = 50.0
@@ -46,19 +46,25 @@ ARCHIVE_SIZE: int = 50
 TIME_BUDGET_SECONDS: float = 3600.0
 RESTART_PROB: float = 0.001
 CHECKPOINT_EVERY_SECONDS: float = 12 * 60 * 60
+MUTATOR_PROBS: dict[str, float] = {
+    "c1": 0.40,  # add/remove a feature
+    "c2": 0.35,  # change one window inside a feature
+    "c3": 0.25,  # replace a gene by a transformed gene
+}
+MAX_RETRY: int = 5
 
 # Fitness. RETURN_SCORE_SCALE normalizes mean trade return so that one metric
 # cannot dominate merely by being on a wider numerical scale.
 TRADE_TOP_FRACTION: float = 0.20
 MIN_TRADES_PER_SPLIT: int = 20
-TRADE_COST: float = 0.0
+TRADE_COST: float = 0.001  # 0.1% breakeven cost per selected trade
 RETURN_SCORE_SCALE: float = 0.01
 BAD_AUC_THRESHOLD: float = 0.50
 
 FITNESS_WEIGHTS: dict[str, float] = {
     "auc_edge": 0.40,
     "precision_excess": 0.25,
-    "trade_return_score": 0.25,
+    "trade_return_score": 0.20,
     "auc_std": -0.20,
     "overfit_gap": -0.30,
     "bad_fold_ratio": -0.30,
@@ -116,12 +122,23 @@ def validate_config() -> None:
         raise ValueError("TRADE_TOP_FRACTION must be in (0, 1].")
     if MIN_TRADES_PER_SPLIT < 1:
         raise ValueError("MIN_TRADES_PER_SPLIT must be positive.")
+    if TRADE_COST < 0:
+        raise ValueError("TRADE_COST must be non-negative.")
     if RETURN_SCORE_SCALE <= 0:
         raise ValueError("RETURN_SCORE_SCALE must be positive.")
     if ARCHIVE_SIZE < 1:
         raise ValueError("ARCHIVE_SIZE must be positive.")
     if CHECKPOINT_EVERY_SECONDS < 0:
         raise ValueError("CHECKPOINT_EVERY_SECONDS must be non-negative.")
+    required_mutators = {"c1", "c2", "c3"}
+    if set(MUTATOR_PROBS) != required_mutators:
+        raise ValueError(f"MUTATOR_PROBS keys must be {sorted(required_mutators)}.")
+    if any(value < 0 for value in MUTATOR_PROBS.values()):
+        raise ValueError("MUTATOR_PROBS values must be non-negative.")
+    if abs(sum(MUTATOR_PROBS.values()) - 1.0) > 1e-9:
+        raise ValueError("MUTATOR_PROBS must sum to 1.0.")
+    if MAX_RETRY < 1:
+        raise ValueError("MAX_RETRY must be positive.")
     if not 0.0 <= EARLY_STOP_VALID_FRACTION < 0.5:
         raise ValueError("EARLY_STOP_VALID_FRACTION must be in [0, 0.5).")
     if EARLY_STOP_MIN_VALID_SAMPLES < 1:

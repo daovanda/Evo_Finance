@@ -3,8 +3,9 @@ import unittest
 import numpy as np
 import pandas as pd
 
+from crypto import config
 from crypto.data import CryptoFold, add_binary_labels, split_labeled_by_dates
-from crypto.evolution import CryptoMutator
+from crypto.evolution import CryptoArchive, CryptoIndividual, CryptoMutator
 from crypto.expression import CryptoFeatureSpace
 from crypto.features import RAW_SCALE_COLUMNS, build_feature_frame, selectable_features
 from crypto.fitness import CryptoFitnessEvaluator, _internal_early_stop_split
@@ -66,6 +67,96 @@ class CryptoPipelineTests(unittest.TestCase):
             "imbalance_return_corr_20",
         }
         self.assertTrue(expected <= pool, sorted(expected - pool))
+
+    def test_seed_individual_samples_randomly_from_feature_pool(self):
+        pool = [f"feature_{idx}" for idx in range(12)]
+        idx = pd.date_range("2024-01-01", periods=30, freq="15min")
+        feature_df = pd.DataFrame(
+            {
+                name: np.linspace(float(pos), float(pos + 1), len(idx))
+                for pos, name in enumerate(pool)
+            },
+            index=idx,
+        )
+        seed = 123
+        mutator = CryptoMutator(pool, feature_df, idx, seed=seed)
+
+        individual = mutator.seed_individual()
+
+        expected_idx = np.random.default_rng(seed).choice(
+            len(pool),
+            size=config.FEATURE_MIN,
+            replace=False,
+        )
+        expected = [pool[int(pos)] for pos in expected_idx]
+        self.assertEqual(individual.features, expected)
+        self.assertEqual(len(individual.features), config.FEATURE_MIN)
+        self.assertEqual(len(set(individual.features)), config.FEATURE_MIN)
+        self.assertTrue(set(individual.features) <= set(pool))
+
+    def test_crypto_mutator_c1_adds_from_domain(self):
+        idx, feature_df = _synthetic_feature_space(
+            [f"feature_{idx}" for idx in range(12)]
+        )
+        pool = list(feature_df.columns)
+        mutator = CryptoMutator(pool, feature_df, idx, seed=7)
+        child = mutator.seed_individual()
+
+        changed = mutator._c1(child)
+
+        self.assertTrue(changed)
+        self.assertEqual(len(child.features), config.FEATURE_MIN + 1)
+        self.assertEqual(len(set(child.features)), len(child.features))
+        self.assertTrue(set(child.features) <= set(pool))
+
+    def test_crypto_mutator_c2_changes_window(self):
+        pool = [f"alpha_{window}" for window in config.WINDOWS]
+        idx, feature_df = _synthetic_feature_space(pool, rows=2000)
+        mutator = CryptoMutator(pool, feature_df, idx, seed=3)
+        individual = mutator.seed_individual()
+        individual.features = ["alpha_3"]
+
+        changed = mutator._c2(individual)
+
+        self.assertTrue(changed)
+        self.assertEqual(len(individual.features), 1)
+        self.assertNotEqual(individual.features[0], "alpha_3")
+        self.assertRegex(individual.features[0], r"^alpha_\d+$")
+        self.assertIn(individual.features[0], pool)
+
+    def test_crypto_mutator_c1_c2_fallback_to_c3(self):
+        pool = [f"feature_{idx}" for idx in range(8)]
+        idx, feature_df = _synthetic_feature_space(pool)
+        original_probs = dict(config.MUTATOR_PROBS)
+        cases = [
+            ("c1", {"c1": 1.0, "c2": 0.0, "c3": 0.0}),
+            ("c2", {"c1": 0.0, "c2": 1.0, "c3": 0.0}),
+        ]
+
+        for strategy, probs in cases:
+            mutator = CryptoMutator(pool, feature_df, idx, seed=5)
+            calls: list[str] = []
+
+            def fake_c3(individual):
+                calls.append("c3")
+                individual.features[0] = "feature_7"
+                return True
+
+            try:
+                config.MUTATOR_PROBS.update(probs)
+                if strategy == "c1":
+                    mutator._c1 = lambda individual: False  # type: ignore[method-assign]
+                else:
+                    mutator._c2 = lambda individual: False  # type: ignore[method-assign]
+                mutator._c3 = fake_c3  # type: ignore[method-assign]
+                parent = CryptoIndividual(features=["feature_0", "feature_1"])
+                child = mutator.mutate(parent)
+            finally:
+                config.MUTATOR_PROBS.clear()
+                config.MUTATOR_PROBS.update(original_probs)
+
+            self.assertEqual(calls, ["c3"])
+            self.assertIn("feature_7", child.features)
 
     def test_feature_quality_filter_can_use_train_only_index(self):
         df = _synthetic_crypto_frame(120)
@@ -168,6 +259,56 @@ class CryptoPipelineTests(unittest.TestCase):
         self.assertIn("precision_excess", individual.metrics)
         self.assertIn("trade_return_score", individual.metrics)
 
+    def test_crypto_final_evaluation_appends_final_metrics(self):
+        df = _synthetic_crypto_frame(900)
+        labeled = add_binary_labels(df, horizons=[3], threshold=0.001)
+        features = build_feature_frame(df, windows=[3, 5, 10, 20], min_valid_ratio=0.5)
+        pool = selectable_features(features)
+        feature_space = CryptoFeatureSpace(features, pool)
+        mutator = CryptoMutator(pool, feature_space, labeled.index[:500], seed=13)
+        individual = mutator.seed_individual()
+        individual.score = 0.01
+        params = {
+            "objective": "binary",
+            "metric": "auc",
+            "learning_rate": 0.05,
+            "num_leaves": 7,
+            "max_depth": 3,
+            "min_data_in_leaf": 20,
+            "force_col_wise": True,
+            "verbose": -1,
+            "seed": 13,
+        }
+        evaluator = CryptoFitnessEvaluator(
+            horizons=[3],
+            lgbm_params=params,
+            num_boost_round=5,
+            early_stopping_rounds=2,
+        )
+
+        metrics = evaluator.evaluate_final(
+            individual=individual,
+            train_df=labeled.iloc[:500],
+            val_df=labeled.iloc[520:700],
+            test_df=labeled.iloc[720:880],
+            feature_data=feature_space,
+        )
+
+        self.assertIn("final_val_mean_auc", metrics)
+        self.assertIn("final_test_mean_auc", metrics)
+        self.assertIn("final_test_precision_excess", individual.metrics)
+        self.assertTrue(np.isfinite(individual.metrics["final_test_mean_auc"]))
+
+        archive = CryptoArchive(max_size=5)
+        archive.try_add(individual)
+        row = archive.summary()[0]
+        self.assertIn("final_val_metrics", row)
+        self.assertIn("test_metrics", row)
+        self.assertIn("mean_auc", row["final_val_metrics"])
+        self.assertIn("mean_auc", row["test_metrics"])
+        self.assertIn("h3", row["test_metrics"]["horizons"])
+        self.assertNotIn("final_test_mean_auc", row["metrics"])
+
     def test_internal_early_stopping_split_uses_train_tail_only(self):
         idx = pd.date_range("2024-01-01", periods=200, freq="15min")
         X = pd.DataFrame({"x": np.arange(200)}, index=idx)
@@ -234,6 +375,18 @@ def _synthetic_crypto_frame(n: int) -> pd.DataFrame:
         },
         index=idx,
     )
+
+
+def _synthetic_feature_space(
+    names: list[str],
+    rows: int = 700,
+) -> tuple[pd.Index, pd.DataFrame]:
+    rng = np.random.default_rng(321)
+    idx = pd.date_range("2024-01-01", periods=rows, freq="15min")
+    data = {}
+    for name in names:
+        data[name] = rng.normal(0.0, 1.0, size=rows)
+    return idx, pd.DataFrame(data, index=idx)
 
 
 if __name__ == "__main__":

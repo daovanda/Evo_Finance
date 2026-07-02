@@ -131,6 +131,113 @@ class CryptoFitnessEvaluator:
         )
         return float(score)
 
+    def evaluate_final(
+        self,
+        individual: CryptoIndividual,
+        train_df: pd.DataFrame,
+        val_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        feature_data: CryptoFeatureSpace | pd.DataFrame,
+    ) -> dict[str, float]:
+        """
+        Train one final model per horizon and append final val/test metrics.
+
+        The archive score is intentionally kept as the walk-forward score. Final
+        metrics are diagnostic fields saved into the JSON after evolution ends.
+        """
+        feature_space = _feature_space_for(individual, feature_data)
+        rows: list[dict[str, float]] = []
+
+        for horizon in self.horizons:
+            label_col = f"label_h{horizon}"
+            ret_col = f"future_return_h{horizon}"
+            row = self._evaluate_one_final_horizon(
+                individual=individual,
+                train_df=train_df,
+                val_df=val_df,
+                test_df=test_df,
+                feature_space=feature_space,
+                label_col=label_col,
+                ret_col=ret_col,
+                horizon=horizon,
+            )
+            if row is not None:
+                rows.append(row)
+
+        if not rows:
+            raise ValueError("No valid crypto final metrics were produced.")
+
+        final_df = pd.DataFrame(rows)
+        metrics: dict[str, float] = {
+            "final_n_horizon_scores": float(len(final_df)),
+            "final_train_rows": float(final_df["train_n_samples"].mean()),
+            "final_val_rows": float(final_df["val_n_samples"].mean()),
+            "final_test_rows": float(final_df["test_n_samples"].mean()),
+        }
+        for split in ("val", "test"):
+            auc = final_df[f"{split}_auc"].astype(float)
+            metrics[f"final_{split}_mean_auc"] = float(auc.mean())
+            metrics[f"final_{split}_auc_edge"] = float((auc - 0.5).mean())
+            metrics[f"final_{split}_precision_at_trade"] = float(
+                final_df[f"{split}_precision_at_trade"].mean()
+            )
+            metrics[f"final_{split}_base_rate"] = float(
+                final_df[f"{split}_base_rate"].mean()
+            )
+            metrics[f"final_{split}_precision_excess"] = float(
+                final_df[f"{split}_precision_excess"].mean()
+            )
+            metrics[f"final_{split}_trade_return_mean"] = float(
+                final_df[f"{split}_trade_return_mean"].mean()
+            )
+            metrics[f"final_{split}_trade_return_score"] = float(
+                final_df[f"{split}_trade_return_score"].mean()
+            )
+            metrics[f"final_{split}_auc_std"] = (
+                float(auc.std(ddof=0)) if len(auc) > 1 else 0.0
+            )
+            metrics[f"final_{split}_bad_ratio"] = float(
+                final_df[f"{split}_bad"].mean()
+            )
+
+        metrics["final_test_overfit_gap"] = float(
+            final_df["test_overfit_gap"].mean()
+        )
+        metrics["final_val_overfit_gap"] = float(
+            final_df["val_overfit_gap"].mean()
+        )
+
+        for horizon in self.horizons:
+            subset = final_df[final_df["horizon"] == float(horizon)]
+            if subset.empty:
+                continue
+            for split in ("val", "test"):
+                metrics[f"final_h{horizon}_{split}_auc"] = float(
+                    subset[f"{split}_auc"].mean()
+                )
+                metrics[f"final_h{horizon}_{split}_precision_excess"] = float(
+                    subset[f"{split}_precision_excess"].mean()
+                )
+                metrics[f"final_h{horizon}_{split}_trade_return_score"] = float(
+                    subset[f"{split}_trade_return_score"].mean()
+                )
+                metrics[f"final_h{horizon}_{split}_trade_return_mean"] = float(
+                    subset[f"{split}_trade_return_mean"].mean()
+                )
+
+        individual.metrics.update(metrics)
+        logger.info(
+            "Crypto final: WF score=%.4f | val_auc=%.4f | test_auc=%.4f | "
+            "test_precision_excess=%.4f | test_ret_score=%.4f | test_gap=%.4f",
+            float(individual.score) if individual.score is not None else float("nan"),
+            metrics["final_val_mean_auc"],
+            metrics["final_test_mean_auc"],
+            metrics["final_test_precision_excess"],
+            metrics["final_test_trade_return_score"],
+            metrics["final_test_overfit_gap"],
+        )
+        return metrics
+
     def _evaluate_one_fold(
         self,
         individual: CryptoIndividual,
@@ -189,6 +296,91 @@ class CryptoFitnessEvaluator:
             "val_n_trades": float(val_metrics.n_trades),
         }
 
+    def _evaluate_one_final_horizon(
+        self,
+        individual: CryptoIndividual,
+        train_df: pd.DataFrame,
+        val_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        feature_space: CryptoFeatureSpace,
+        label_col: str,
+        ret_col: str,
+        horizon: int,
+    ) -> dict[str, float] | None:
+        train = _valid_labeled_frame(train_df, label_col, ret_col)
+        val = _valid_labeled_frame(val_df, label_col, ret_col)
+        test = _valid_labeled_frame(test_df, label_col, ret_col)
+        if train.empty or val.empty or test.empty:
+            return None
+
+        X_train = feature_space.matrix(individual.features, train.index)
+        X_val = feature_space.matrix(individual.features, val.index)
+        X_test = feature_space.matrix(individual.features, test.index)
+        y_train = train[label_col].astype(int)
+        y_val = val[label_col].astype(int)
+        y_test = test[label_col].astype(int)
+
+        if y_train.nunique() < 2:
+            train_metrics = _neutral_metrics(y_train, train[ret_col])
+            val_metrics = _neutral_metrics(y_val, val[ret_col])
+            test_metrics = _neutral_metrics(y_test, test[ret_col])
+        else:
+            booster = self._train_booster_final(X_train, y_train, X_val, y_val)
+            train_pred = pd.Series(booster.predict(X_train), index=train.index)
+            val_pred = pd.Series(booster.predict(X_val), index=val.index)
+            test_pred = pd.Series(booster.predict(X_test), index=test.index)
+            train_metrics = _classification_trade_metrics(
+                y_true=y_train,
+                pred=train_pred,
+                future_return=train[ret_col],
+            )
+            val_metrics = _classification_trade_metrics(
+                y_true=y_val,
+                pred=val_pred,
+                future_return=val[ret_col],
+            )
+            test_metrics = _classification_trade_metrics(
+                y_true=y_test,
+                pred=test_pred,
+                future_return=test[ret_col],
+            )
+
+        val_bad = float(
+            val_metrics.auc <= config.BAD_AUC_THRESHOLD
+            or val_metrics.precision_excess <= 0.0
+            or val_metrics.trade_return_score <= 0.0
+        )
+        test_bad = float(
+            test_metrics.auc <= config.BAD_AUC_THRESHOLD
+            or test_metrics.precision_excess <= 0.0
+            or test_metrics.trade_return_score <= 0.0
+        )
+        return {
+            "horizon": float(horizon),
+            "train_auc": train_metrics.auc,
+            "train_n_samples": float(train_metrics.n_samples),
+            "val_auc": val_metrics.auc,
+            "val_precision_at_trade": val_metrics.precision_at_trade,
+            "val_base_rate": val_metrics.base_rate,
+            "val_precision_excess": val_metrics.precision_excess,
+            "val_trade_return_mean": val_metrics.trade_return_mean,
+            "val_trade_return_score": val_metrics.trade_return_score,
+            "val_n_samples": float(val_metrics.n_samples),
+            "val_n_trades": float(val_metrics.n_trades),
+            "val_bad": val_bad,
+            "val_overfit_gap": max(0.0, train_metrics.auc - val_metrics.auc),
+            "test_auc": test_metrics.auc,
+            "test_precision_at_trade": test_metrics.precision_at_trade,
+            "test_base_rate": test_metrics.base_rate,
+            "test_precision_excess": test_metrics.precision_excess,
+            "test_trade_return_mean": test_metrics.trade_return_mean,
+            "test_trade_return_score": test_metrics.trade_return_score,
+            "test_n_samples": float(test_metrics.n_samples),
+            "test_n_trades": float(test_metrics.n_trades),
+            "test_bad": test_bad,
+            "test_overfit_gap": max(0.0, train_metrics.auc - test_metrics.auc),
+        }
+
     def _train_booster(
         self,
         X_train: pd.DataFrame,
@@ -211,6 +403,40 @@ class CryptoFitnessEvaluator:
                 free_raw_data=False,
             )
             valid_sets = [stop_set]
+            callbacks.insert(
+                0,
+                lgb.early_stopping(self.early_stopping_rounds, verbose=False),
+            )
+        return lgb.train(
+            params=dict(self.lgbm_params),
+            train_set=train_set,
+            num_boost_round=self.num_boost_round,
+            valid_sets=valid_sets,
+            callbacks=callbacks,
+        )
+
+    def _train_booster_final(
+        self,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+    ) -> lgb.Booster:
+        callbacks = [lgb.log_evaluation(period=-1)]
+        valid_sets = None
+        train_set = lgb.Dataset(X_train, label=y_train, free_raw_data=False)
+        if (
+            self.early_stopping_rounds > 0
+            and len(X_val) > 0
+            and y_val.nunique() >= 2
+        ):
+            val_set = lgb.Dataset(
+                X_val,
+                label=y_val,
+                reference=train_set,
+                free_raw_data=False,
+            )
+            valid_sets = [val_set]
             callbacks.insert(
                 0,
                 lgb.early_stopping(self.early_stopping_rounds, verbose=False),
@@ -319,7 +545,9 @@ def _internal_early_stop_split(
 
 def _neutral_metrics(y_true: pd.Series, future_return: pd.Series) -> SplitMetrics:
     base_rate = float(pd.to_numeric(y_true, errors="coerce").dropna().mean() or 0.0)
-    mean_return = float(pd.to_numeric(future_return, errors="coerce").dropna().mean() or 0.0)
+    mean_return = float(
+        pd.to_numeric(future_return, errors="coerce").dropna().mean() or 0.0
+    ) - float(config.TRADE_COST)
     return SplitMetrics(
         auc=0.5,
         precision_at_trade=base_rate,

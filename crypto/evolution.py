@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -23,12 +24,16 @@ from crypto.expression import (
 )
 
 
+_WINDOW_ARG_RE = re.compile(r",\s*(\d+)(?=\))")
+_WINDOW_SUFFIX_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9_]*_(\d+)\b")
+
+
 @dataclass
 class CryptoIndividual:
     features: list[str]
     generation: int = 0
     score: float | None = None
-    metrics: dict[str, float] = field(default_factory=dict)
+    metrics: dict[str, Any] = field(default_factory=dict)
 
     def clone(self) -> "CryptoIndividual":
         return CryptoIndividual(
@@ -94,13 +99,19 @@ class CryptoArchive:
     def summary(self) -> list[dict[str, Any]]:
         rows = []
         for rank, individual in enumerate(self._entries, start=1):
+            metrics, final_eval, final_val_metrics, test_metrics = _split_display_metrics(
+                individual.metrics
+            )
             rows.append(
                 {
                     "rank": rank,
                     "score": individual.score,
                     "n_features": len(individual.features),
                     "generation": individual.generation,
-                    "metrics": individual.metrics,
+                    "metrics": metrics,
+                    "final_eval": final_eval,
+                    "final_val_metrics": final_val_metrics,
+                    "test_metrics": test_metrics,
                     "features": individual.features,
                 }
             )
@@ -125,11 +136,12 @@ class CryptoArchive:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         entries = payload.get("entries", payload if isinstance(payload, list) else [])
         for row in entries:
+            metrics = _flatten_loaded_metrics(row)
             individual = CryptoIndividual(
                 features=list(row.get("features", [])),
                 generation=int(row.get("generation", 0) or 0),
                 score=float(row.get("score", float("-inf"))),
-                metrics=dict(row.get("metrics", {})),
+                metrics=metrics,
             )
             archive.try_add(individual)
         return archive
@@ -166,83 +178,135 @@ class CryptoMutator:
         self.rng = np.random.default_rng(seed)
 
     def seed_individual(self) -> CryptoIndividual:
-        preferred = [
-            "ret_close_1",
-            "ret_close_3",
-            "logret_close_10",
-            "ma_ratio_close_20",
-            "volatility_20",
-            "rsi_14",
-            "range_pct",
-            "buy_pressure_base",
-            "volume_log_z_20",
-            "trade_count_log_z_20",
-            "taker_ratio_z_20",
-            "ret_x_buy_pressure_20",
-        ]
-        selected = [name for name in preferred if name in self.feature_pool]
-        if len(selected) < config.FEATURE_MIN:
-            selected.extend(
-                name for name in self.feature_pool
-                if name not in selected
+        if len(self.feature_pool) < config.FEATURE_MIN:
+            raise ValueError(
+                "CryptoMutator feature_pool is smaller than FEATURE_MIN."
             )
-        return CryptoIndividual(features=selected[: config.FEATURE_MIN])
+        selected_idx = self.rng.choice(
+            len(self.feature_pool),
+            size=config.FEATURE_MIN,
+            replace=False,
+        )
+        selected = [self.feature_pool[int(idx)] for idx in selected_idx]
+        return CryptoIndividual(features=selected)
 
     def mutate(self, individual: CryptoIndividual) -> CryptoIndividual:
         child = individual.clone()
-        action = self.rng.choice(
-            ["add", "remove", "replace", "transform"],
-            p=[0.30, 0.12, 0.28, 0.30],
+        strategy = str(
+            self.rng.choice(
+                ["c1", "c2", "c3"],
+                p=[
+                    config.MUTATOR_PROBS["c1"],
+                    config.MUTATOR_PROBS["c2"],
+                    config.MUTATOR_PROBS["c3"],
+                ],
+            )
         )
-        if len(child.features) <= config.FEATURE_MIN:
-            action = "add"
-        if len(child.features) >= config.FEATURE_MAX:
-            action = "remove"
 
-        if action == "remove":
-            remove_idx = int(self.rng.integers(len(child.features)))
-            child.features.pop(remove_idx)
-            return child
-
-        if action == "add":
-            candidate = self._candidate_not_in(child.features)
-            if candidate is not None:
-                child.features.append(candidate)
-            return child
-
-        if action == "replace":
-            old_idx = int(self.rng.integers(len(child.features)))
-            base = [feature for idx, feature in enumerate(child.features) if idx != old_idx]
-            candidate = self._candidate_not_in(base)
-            if candidate is not None:
-                child.features[old_idx] = candidate
-            return child
-
-        old_idx = int(self.rng.integers(len(child.features)))
-        base = [feature for idx, feature in enumerate(child.features) if idx != old_idx]
-        candidate = self._generated_candidate(base, anchor=child.features[old_idx])
-        if candidate is not None:
-            child.features[old_idx] = candidate
+        if strategy == "c1":
+            changed = self._c1(child)
+            if not changed:
+                self._c3(child)
+        elif strategy == "c2":
+            changed = self._c2(child)
+            if not changed:
+                self._c3(child)
+        else:
+            self._c3(child)
         return child
 
-    def _candidate_not_in(self, current: list[str]) -> str | None:
-        current_set = set(current)
-        for _ in range(100):
-            if self.rng.random() < 0.55:
-                candidate = self._generated_candidate(current)
-            else:
-                candidate = str(self.rng.choice(self.domain_pool))
+    def _c1(self, individual: CryptoIndividual) -> bool:
+        action = str(self.rng.choice(["add", "remove"]))
+        if len(individual.features) >= config.FEATURE_MAX:
+            action = "remove"
+        if len(individual.features) <= config.FEATURE_MIN:
+            action = "add"
+
+        if action == "remove":
+            if len(individual.features) <= config.FEATURE_MIN:
+                return False
+            remove_idx = int(self.rng.integers(len(individual.features)))
+            individual.features.pop(remove_idx)
+            return True
+
+        candidate = self._domain_candidate_not_in(individual.features)
+        if candidate is None:
+            return False
+        individual.features.append(candidate)
+        return True
+
+    def _c2(self, individual: CryptoIndividual) -> bool:
+        if not individual.features:
+            return False
+        for _ in range(config.MAX_RETRY):
+            old_idx = int(self.rng.integers(len(individual.features)))
+            old_formula = individual.features[old_idx]
+            candidate = self._change_window_formula(old_formula)
             if candidate is None:
                 continue
+            if self._try_replace(individual, old_idx, candidate):
+                return True
+        return False
+
+    def _c3(self, individual: CryptoIndividual) -> bool:
+        if not individual.features:
+            return False
+        for _ in range(config.MAX_RETRY):
+            old_idx = int(self.rng.integers(len(individual.features)))
+            base = [
+                feature for idx, feature in enumerate(individual.features)
+                if idx != old_idx
+            ]
+            candidate = self._generated_candidate(
+                base,
+                anchor=individual.features[old_idx],
+            )
+            if candidate is None:
+                continue
+            individual.features[old_idx] = candidate
+            return True
+        return False
+
+    def _try_replace(
+        self,
+        individual: CryptoIndividual,
+        old_idx: int,
+        candidate: str,
+    ) -> bool:
+        old_formula = individual.features[old_idx]
+        if candidate == old_formula:
+            return False
+        base = [
+            feature for idx, feature in enumerate(individual.features)
+            if idx != old_idx
+        ]
+        if candidate in base:
+            return False
+        if not self._admit_candidate(candidate, base):
+            return False
+        individual.features[old_idx] = candidate
+        return True
+
+    def _domain_candidate_not_in(self, current: list[str]) -> str | None:
+        current_set = set(current)
+        for _ in range(config.MAX_RETRY):
+            candidate = str(self.rng.choice(self.domain_pool))
             if candidate in current_set:
                 continue
             if self._admit_candidate(candidate, current):
                 return candidate
-        fallback = [
-            name for name in self.domain_pool
-            if name not in current_set and self._admit_candidate(name, current)
-        ]
-        return str(self.rng.choice(fallback)) if fallback else None
+        return None
+
+    def _change_window_formula(self, formula: str) -> str | None:
+        spans = _window_spans(formula)
+        if not spans:
+            return None
+        start, end, old_window = spans[int(self.rng.integers(len(spans)))]
+        choices = [int(window) for window in config.WINDOWS if int(window) != old_window]
+        if not choices:
+            return None
+        new_window = int(self.rng.choice(choices))
+        return f"{formula[:start]}{new_window}{formula[end:]}"
 
     def _generated_candidate(
         self,
@@ -377,3 +441,103 @@ def _spearman_abs_corr(left: pd.Series, right: pd.Series) -> float:
 
 def _signature(features: list[str]) -> tuple[str, ...]:
     return tuple(sorted({str(feature) for feature in features}))
+
+
+def _window_spans(formula: str) -> list[tuple[int, int, int]]:
+    spans: list[tuple[int, int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for match in _WINDOW_ARG_RE.finditer(formula):
+        start, end = match.span(1)
+        seen.add((start, end))
+        spans.append((start, end, int(match.group(1))))
+    for match in _WINDOW_SUFFIX_RE.finditer(formula):
+        start, end = match.span(1)
+        if (start, end) in seen:
+            continue
+        seen.add((start, end))
+        spans.append((start, end, int(match.group(1))))
+    return spans
+
+
+def _split_display_metrics(
+    metrics: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    wf_metrics: dict[str, Any] = {}
+    final_eval: dict[str, Any] = {}
+    final_val_metrics: dict[str, Any] = {}
+    test_metrics: dict[str, Any] = {}
+
+    for key, value in metrics.items():
+        if key == "final_n_horizon_scores":
+            final_eval["n_horizon_scores"] = value
+        elif key == "final_train_rows":
+            final_eval["train_rows"] = value
+        elif key == "final_val_rows":
+            final_val_metrics["rows"] = value
+        elif key == "final_test_rows":
+            test_metrics["rows"] = value
+        elif key == "final_val_overfit_gap":
+            final_val_metrics["overfit_gap"] = value
+        elif key == "final_test_overfit_gap":
+            test_metrics["overfit_gap"] = value
+        elif key.startswith("final_val_"):
+            final_val_metrics[key.removeprefix("final_val_")] = value
+        elif key.startswith("final_test_"):
+            test_metrics[key.removeprefix("final_test_")] = value
+        elif key.startswith("final_h"):
+            _add_horizon_metric(final_val_metrics, test_metrics, key, value)
+        else:
+            wf_metrics[key] = value
+
+    return wf_metrics, final_eval, final_val_metrics, test_metrics
+
+
+def _add_horizon_metric(
+    final_val_metrics: dict[str, Any],
+    test_metrics: dict[str, Any],
+    key: str,
+    value: Any,
+) -> None:
+    match = re.match(r"^final_h(\d+)_(val|test)_(.+)$", key)
+    if match is None:
+        return
+    horizon, split, metric_name = match.groups()
+    target = final_val_metrics if split == "val" else test_metrics
+    horizons = target.setdefault("horizons", {})
+    horizon_metrics = horizons.setdefault(f"h{horizon}", {})
+    horizon_metrics[metric_name] = value
+
+
+def _flatten_loaded_metrics(row: dict[str, Any]) -> dict[str, Any]:
+    metrics = dict(row.get("metrics", {}))
+    final_eval = row.get("final_eval") or {}
+    final_val = row.get("final_val_metrics") or {}
+    test = row.get("test_metrics") or {}
+
+    if "n_horizon_scores" in final_eval:
+        metrics["final_n_horizon_scores"] = final_eval["n_horizon_scores"]
+    if "train_rows" in final_eval:
+        metrics["final_train_rows"] = final_eval["train_rows"]
+    _flatten_split_metrics(metrics, final_val, split="val")
+    _flatten_split_metrics(metrics, test, split="test")
+    return metrics
+
+
+def _flatten_split_metrics(
+    metrics: dict[str, Any],
+    split_metrics: dict[str, Any],
+    split: str,
+) -> None:
+    prefix = "final_val" if split == "val" else "final_test"
+    for key, value in split_metrics.items():
+        if key == "rows":
+            metrics[f"{prefix}_rows"] = value
+        elif key == "overfit_gap":
+            metrics[f"{prefix}_overfit_gap"] = value
+        elif key == "horizons":
+            for horizon_key, horizon_metrics in dict(value).items():
+                horizon = str(horizon_key).removeprefix("h")
+                for metric_name, metric_value in dict(horizon_metrics).items():
+                    metrics[f"final_h{horizon}_{split}_{metric_name}"] = metric_value
+        else:
+            metrics[f"{prefix}_{key}"] = value
