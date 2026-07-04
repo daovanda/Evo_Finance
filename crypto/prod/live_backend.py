@@ -14,7 +14,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 import lightgbm as lgb
@@ -466,9 +466,7 @@ def _predict_entry(
 
     predictions = []
     for model_record in entry.get("models", []):
-        model_path = Path(model_record["model_path"])
-        if not model_path.is_absolute():
-            model_path = model_dir / model_path.name
+        model_path = _resolve_model_path(model_record.get("model_path"), model_dir)
         booster = lgb.Booster(model_file=str(model_path))
         pred = float(booster.predict(x)[0])
         threshold = model_record.get("val_trade_threshold")
@@ -497,6 +495,36 @@ def _predict_entry(
         "pred_mean": float(np.mean([item["pred"] for item in predictions])) if predictions else None,
         "predictions": predictions,
     }
+
+
+def _resolve_model_path(model_path_value: Any, model_dir: Path) -> Path:
+    if not model_path_value:
+        raise ValueError("Manifest model record has empty model_path.")
+    raw = str(model_path_value)
+    path = Path(raw)
+    if path.is_absolute() and path.exists():
+        return path
+    if path.exists():
+        return path
+
+    normalized = raw.replace("\\", "/")
+    normalized_path = Path(normalized)
+    candidates = []
+    if normalized_path.is_absolute():
+        candidates.append(normalized_path)
+    else:
+        candidates.append(normalized_path)
+        candidates.append(model_dir / normalized_path.name)
+        candidates.append(model_dir / PureWindowsPath(raw).name)
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.exists():
+            return candidate
+    return model_dir / PureWindowsPath(raw).name
 
 
 def _load_manifest(model_dir: Path) -> dict[str, Any]:

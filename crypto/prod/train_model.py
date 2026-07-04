@@ -180,7 +180,7 @@ def _train_one_horizon(
     )
     return {
         "horizon": horizon,
-        "model_path": str(model_path),
+        "model_path": model_name,
         "label_col": label_col,
         "return_col": ret_col,
         "n_features": len(features),
