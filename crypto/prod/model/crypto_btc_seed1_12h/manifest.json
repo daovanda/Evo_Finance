@@ -1,0 +1,115 @@
+{
+  "pipeline": "crypto_prod_train",
+  "archive": "crypto\\results\\crypto_btc_seed1_12h.json",
+  "data": "data\\crypto\\BTCUSDT_15m.csv",
+  "run_name": "crypto_btc_seed1_12h",
+  "model_dir": "crypto\\prod\\model\\crypto_btc_seed1_12h",
+  "config": {
+    "horizons": [
+      3,
+      5
+    ],
+    "label_threshold": 0.001,
+    "val_start": "2024-01-01",
+    "test_start": "2025-01-01",
+    "test_end": null,
+    "purge_bars": 6,
+    "feature_windows": [
+      3,
+      5,
+      7,
+      10,
+      14,
+      20,
+      30,
+      40,
+      50,
+      60,
+      80,
+      120,
+      160,
+      240,
+      320,
+      400,
+      480
+    ],
+    "feature_corr_threshold": 0.7,
+    "lgbm_params": {
+      "objective": "binary",
+      "metric": "auc",
+      "learning_rate": 0.03,
+      "num_leaves": 15,
+      "max_depth": 4,
+      "feature_fraction": 0.7,
+      "bagging_fraction": 0.8,
+      "bagging_freq": 1,
+      "min_data_in_leaf": 300,
+      "lambda_l1": 2.0,
+      "lambda_l2": 10.0,
+      "force_col_wise": true,
+      "verbose": -1,
+      "seed": 42,
+      "feature_fraction_seed": 42,
+      "bagging_seed": 42,
+      "data_random_seed": 42
+    },
+    "lgbm_num_boost_round": 250,
+    "lgbm_early_stopping": 20
+  },
+  "entries": [
+    {
+      "rank": 1,
+      "score": -0.21793082731639382,
+      "generation": 28,
+      "features": [
+        "clip(quote_volume_proxy_log_delta_7)",
+        "ts_corr(trade_size_base_ratio_30, trade_size_quote_log_delta_7, 20)",
+        "q75((signed_volume_sum_ratio_14 / taker_buy_base_volume_log_delta_120), 14)",
+        "range_pct_mean_14",
+        "(vol_regime_z_14 - ts_corr(trade_size_base_ratio_30, trade_size_quote_log_delta_7, 20))",
+        "buy_pressure_mean_10",
+        "rolling_logret_mean_120",
+        "taker_buy_quote_volume_log_delta_120",
+        "trade_count_ratio_480",
+        "rolling_logret_mean_400",
+        "realized_vol_z_480",
+        "volatility_x_buy_pressure_120",
+        "taker_buy_base_volume_log_z_20",
+        "trade_size_base_log_delta_320",
+        "(ret_close_20 * (vol_regime_z_14 * buy_pressure_negative_ratio_50))"
+      ],
+      "models": [
+        {
+          "horizon": 3,
+          "model_path": "crypto\\prod\\model\\crypto_btc_seed1_12h\\rank_01_h3.txt",
+          "label_col": "label_h3",
+          "return_col": "future_return_h3",
+          "n_features": 15,
+          "train_rows": 209798,
+          "val_rows": 35130,
+          "train_base_rate": 0.3770340994671065,
+          "val_base_rate": 0.3738969541702249,
+          "val_trade_threshold": 0.41800456605789904,
+          "trade_top_fraction": 0.2,
+          "min_trades_per_split": 20,
+          "best_iteration": 186
+        },
+        {
+          "horizon": 5,
+          "model_path": "crypto\\prod\\model\\crypto_btc_seed1_12h\\rank_01_h5.txt",
+          "label_col": "label_h5",
+          "return_col": "future_return_h5",
+          "n_features": 15,
+          "train_rows": 209798,
+          "val_rows": 35130,
+          "train_base_rate": 0.4039075682322996,
+          "val_base_rate": 0.4056931397665813,
+          "val_trade_threshold": 0.44107890952369033,
+          "trade_top_fraction": 0.2,
+          "min_trades_per_split": 20,
+          "best_iteration": 157
+        }
+      ]
+    }
+  ]
+}

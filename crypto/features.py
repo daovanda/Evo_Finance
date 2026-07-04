@@ -39,6 +39,7 @@ def build_feature_frame(
     min_valid_ratio: float = config.FEATURE_MIN_VALID_RATIO,
     max_dominant_value_ratio: float = config.FEATURE_MAX_DOMINANT_VALUE_RATIO,
     quality_index: pd.Index | None = None,
+    quality_filter: bool = True,
 ) -> pd.DataFrame:
     """Return a safe feature matrix aligned to df.index."""
     start_time = time.time()
@@ -257,6 +258,12 @@ def build_feature_frame(
     logger.info("Crypto feature build: assembling DataFrame with %d columns.", len(features))
     feature_df = pd.DataFrame(features, index=data.index)
     feature_df = feature_df.replace([np.inf, -np.inf], np.nan)
+    if not quality_filter:
+        logger.info(
+            "Crypto feature build: quality filter disabled | total %.1fs",
+            time.time() - start_time,
+        )
+        return feature_df
     filtered = _quality_filter(
         feature_df,
         min_valid_ratio=float(min_valid_ratio),

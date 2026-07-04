@@ -4,3 +4,8 @@
 
 # Bo qua toan bo thu muc ket qua chay
 results/
+
+# Secrets / local environment
+.env
+.env.*
+!.env.example
