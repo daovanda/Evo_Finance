@@ -17,7 +17,7 @@ DEFAULT_ENV_FILE = Path(".env")
 
 
 def load_env_file(path: str | Path = DEFAULT_ENV_FILE) -> None:
-    path = Path(path)
+    path = _resolve_env_path(path)
     if not path.exists():
         return
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -29,6 +29,26 @@ def load_env_file(path: str | Path = DEFAULT_ENV_FILE) -> None:
         value = value.strip().strip('"').strip("'")
         if key and key not in os.environ:
             os.environ[key] = value
+
+
+def _resolve_env_path(path: str | Path) -> Path:
+    path = Path(path)
+    candidates = [path]
+    if not path.is_absolute():
+        candidates.append(Path.cwd() / path)
+        candidates.append(Path(__file__).resolve().parents[2] / path)
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if candidate.exists():
+            return candidate
+    return path
 
 
 def telegram_enabled() -> bool:

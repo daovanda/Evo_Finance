@@ -49,6 +49,13 @@ ACTIVE_STATES = {
     "BUY_NOT_FILLED",
     "ERROR",
 }
+TERMINAL_NON_BLOCKING_STATES = {
+    "NO_SIGNAL",
+    "WAITING_ENTRY",
+    "ENTRY_TIME_PASSED",
+    "TP_FILLED",
+    "FINAL_SELL_FILLED",
+}
 
 
 @dataclass(frozen=True)
@@ -110,17 +117,20 @@ def loop(runtime: TradeRuntime) -> None:
             run_once(runtime)
         except Exception as exc:
             logger.exception("Trader iteration failed.")
-            _save_state(
-                runtime.state_path,
+            previous = _load_state(runtime.state_path)
+            position_open = bool(previous.get("position_open", False))
+            error_state = dict(previous) if previous else {}
+            error_state.update(
                 {
                     "updated_at": _utc_now_iso(),
                     "status": "ERROR",
-                    "position_open": False,
+                    "position_open": position_open,
                     "block_new_trades": True,
                     "requires_manual_check": True,
                     "error": str(exc),
-                },
+                }
             )
+            _save_state(runtime.state_path, error_state)
         time.sleep(max(float(runtime.poll_seconds), 1.0))
 
 
@@ -130,6 +140,10 @@ def _enter_trade(
     selected_entry: dict[str, Any],
 ) -> dict[str, Any]:
     client = _client(runtime)
+    preflight_error = _preflight_live_entry(runtime, client, prediction, selected_entry)
+    if preflight_error is not None:
+        return preflight_error
+
     buy_order = _place_market_buy(runtime, client, prediction)
     buy_status = str(buy_order.get("status", "")).upper()
 
@@ -160,9 +174,13 @@ def _enter_trade(
     avg_entry = _avg_entry_price(buy_order, fallback=Decimal(str(prediction["entry_open"])))
     sell_qty = executed_qty * runtime.sell_qty_safety_factor
     tp_price = avg_entry * (Decimal("1") + runtime.take_profit_pct)
+    filters = None
 
     if not runtime.dry_run:
         filters = _symbol_filters(client, runtime.symbol)
+        free_base = _free_asset_balance_safe(client, filters["base_asset"])
+        if free_base is not None and free_base > 0:
+            sell_qty = min(sell_qty, free_base)
         sell_qty = _round_down_to_step(sell_qty, filters["step_size"])
         tp_price = _round_down_to_step(tp_price, filters["tick_size"])
 
@@ -188,7 +206,69 @@ def _enter_trade(
             ),
         )
 
-    tp_order = _place_limit_sell(runtime, client, sell_qty, tp_price)
+    if filters is not None and filters["min_notional"] > 0 and sell_qty * tp_price < filters["min_notional"]:
+        message = (
+            "TP notional is below Binance minimum. "
+            f"notional={sell_qty * tp_price}, min_notional={filters['min_notional']}."
+        )
+        logger.error(message)
+        return _save_state(
+            runtime.state_path,
+            _base_state(
+                runtime,
+                prediction,
+                selected_entry,
+                status="ERROR",
+                position_open=True,
+                extra={
+                    "error": message,
+                    "block_new_trades": True,
+                    "requires_manual_check": True,
+                    "buy_order": buy_order,
+                    "qty": str(sell_qty),
+                    "raw_executed_qty": str(executed_qty),
+                    "avg_entry_price": str(avg_entry),
+                    "take_profit_price": str(tp_price),
+                    "min_notional": str(filters["min_notional"]),
+                    "exit_deadline_time": _exit_deadline_time(
+                        prediction,
+                        selected_entry,
+                        runtime.interval,
+                    ),
+                },
+            ),
+        )
+
+    try:
+        tp_order = _place_limit_sell(runtime, client, sell_qty, tp_price)
+    except Exception as exc:
+        message = f"BUY was FILLED but TP order failed: {exc}"
+        logger.error(message)
+        return _save_state(
+            runtime.state_path,
+            _base_state(
+                runtime,
+                prediction,
+                selected_entry,
+                status="ERROR",
+                position_open=True,
+                extra={
+                    "error": message,
+                    "block_new_trades": True,
+                    "requires_manual_check": True,
+                    "buy_order": buy_order,
+                    "qty": str(sell_qty),
+                    "raw_executed_qty": str(executed_qty),
+                    "avg_entry_price": str(avg_entry),
+                    "take_profit_price": str(tp_price),
+                    "exit_deadline_time": _exit_deadline_time(
+                        prediction,
+                        selected_entry,
+                        runtime.interval,
+                    ),
+                },
+            ),
+        )
     state = _base_state(
         runtime,
         prediction,
@@ -229,6 +309,7 @@ def _monitor_or_report_active_position(runtime: TradeRuntime, state: dict[str, A
                         "status": "TP_FILLED",
                         "position_open": False,
                         "block_new_trades": False,
+                        "requires_manual_check": False,
                         "tp_order": current,
                     }
                 )
@@ -236,7 +317,7 @@ def _monitor_or_report_active_position(runtime: TradeRuntime, state: dict[str, A
 
         deadline = _parse_local_ts(state.get("exit_deadline_time"))
         if _now_local() >= deadline:
-            return _force_market_exit(runtime, client, state)
+            return _force_market_exit(runtime, client, state, current_tp_order=current if order_id else None)
     elif status == "FINAL_SELL_PENDING":
         final_order = state.get("final_sell_order") or {}
         order_id = final_order.get("orderId")
@@ -249,6 +330,7 @@ def _monitor_or_report_active_position(runtime: TradeRuntime, state: dict[str, A
                         "status": "FINAL_SELL_FILLED",
                         "position_open": False,
                         "block_new_trades": False,
+                        "requires_manual_check": False,
                         "final_sell_order": current,
                     }
                 )
@@ -270,27 +352,116 @@ def _monitor_or_report_active_position(runtime: TradeRuntime, state: dict[str, A
     return state
 
 
-def _force_market_exit(runtime: TradeRuntime, client: BinanceClient, state: dict[str, Any]) -> dict[str, Any]:
+def _force_market_exit(
+    runtime: TradeRuntime,
+    client: BinanceClient,
+    state: dict[str, Any],
+    current_tp_order: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     tp_order = state.get("tp_order") or {}
     order_id = tp_order.get("orderId")
+    latest_tp = current_tp_order
     if order_id:
+        if latest_tp is None:
+            latest_tp = client.get_order(runtime.symbol, order_id)
+        if str(latest_tp.get("status", "")).upper() == "FILLED":
+            state.update(
+                {
+                    "updated_at": _utc_now_iso(),
+                    "status": "TP_FILLED",
+                    "position_open": False,
+                    "block_new_trades": False,
+                    "requires_manual_check": False,
+                    "tp_order": latest_tp,
+                }
+            )
+            return _save_state(runtime.state_path, state)
         try:
-            client.cancel_order(runtime.symbol, order_id)
+            latest_tp = client.cancel_order(runtime.symbol, order_id)
         except Exception as exc:  # noqa: BLE001 - keep going to forced exit
             logger.warning("Could not cancel TP order before final sell: %s", exc)
-    qty = Decimal(str(state["qty"]))
+            try:
+                latest_tp = client.get_order(runtime.symbol, order_id)
+            except Exception as query_exc:  # noqa: BLE001 - keep state safe
+                latest_tp = None
+                logger.warning("Could not query TP order after cancel failure: %s", query_exc)
+            if latest_tp and str(latest_tp.get("status", "")).upper() == "FILLED":
+                state.update(
+                    {
+                        "updated_at": _utc_now_iso(),
+                        "status": "TP_FILLED",
+                        "position_open": False,
+                        "block_new_trades": False,
+                        "requires_manual_check": False,
+                        "tp_order": latest_tp,
+                    }
+                )
+                return _save_state(runtime.state_path, state)
+            message = (
+                "Could not cancel or confirm TP order before final sell. "
+                "Manual check is required to avoid double-selling."
+            )
+            state.update(
+                {
+                    "updated_at": _utc_now_iso(),
+                    "status": "ERROR",
+                    "position_open": True,
+                    "block_new_trades": True,
+                    "requires_manual_check": True,
+                    "error": message,
+                    "tp_order": latest_tp or tp_order,
+                }
+            )
+            return _save_state(runtime.state_path, state)
+
+    qty = _remaining_tp_qty(latest_tp or tp_order)
+    if not runtime.dry_run:
+        try:
+            filters = _symbol_filters(client, runtime.symbol)
+            free_base = _free_asset_balance_safe(client, filters["base_asset"])
+            if free_base is not None and free_base > 0:
+                qty = min(qty, free_base)
+            qty = _round_down_to_step(qty, filters["step_size"])
+        except Exception as exc:  # noqa: BLE001 - keep previous remaining qty but record context
+            logger.warning("Could not refresh balance/filters before final sell: %s", exc)
+    if qty <= 0:
+        message = "Cannot determine a positive remaining TP quantity for final sell."
+        state.update(
+            {
+                "updated_at": _utc_now_iso(),
+                "status": "ERROR",
+                "position_open": True,
+                "block_new_trades": True,
+                "requires_manual_check": True,
+                "error": message,
+                "tp_order": latest_tp or tp_order,
+            }
+        )
+        return _save_state(runtime.state_path, state)
+
     final_order = client.place_market_sell_quantity(runtime.symbol, qty)
     state.update(
         {
             "updated_at": _utc_now_iso(),
             "status": "FINAL_SELL_PENDING",
             "position_open": True,
+            "block_new_trades": True,
+            "requires_manual_check": False,
+            "qty": str(qty),
+            "tp_order": latest_tp or tp_order,
             "final_sell_order": final_order,
             "final_sell_submitted_at": pd.Timestamp.utcnow().tz_localize(None).isoformat(),
         }
     )
     if str(final_order.get("status", "")).upper() == "FILLED":
-        state.update({"status": "FINAL_SELL_FILLED", "position_open": False})
+        state.update(
+            {
+                "status": "FINAL_SELL_FILLED",
+                "position_open": False,
+                "block_new_trades": False,
+                "requires_manual_check": False,
+            }
+        )
     return _save_state(runtime.state_path, state)
 
 
@@ -334,6 +505,118 @@ def _place_limit_sell(
             "dry_run": True,
         }
     return client.place_limit_sell(runtime.symbol, qty, price)
+
+
+def _preflight_live_entry(
+    runtime: TradeRuntime,
+    client: BinanceClient,
+    prediction: dict[str, Any],
+    selected_entry: dict[str, Any],
+) -> dict[str, Any] | None:
+    if runtime.dry_run:
+        return None
+
+    try:
+        filters = _symbol_filters(client, runtime.symbol)
+    except Exception as exc:  # noqa: BLE001 - do not place orders if symbol metadata is unavailable
+        return _preflight_error(
+            runtime,
+            prediction,
+            selected_entry,
+            f"Cannot verify Binance symbol filters before BUY: {exc}",
+        )
+
+    symbol_status = str(filters.get("status") or "").upper()
+    if symbol_status and symbol_status != "TRADING":
+        return _preflight_error(
+            runtime,
+            prediction,
+            selected_entry,
+            f"Symbol {runtime.symbol} is not TRADING, status={symbol_status}.",
+            extra={"symbol_status": symbol_status},
+        )
+
+    min_notional = filters.get("min_notional") or Decimal("0")
+    if min_notional > 0 and runtime.quote_order_qty < min_notional:
+        return _preflight_error(
+            runtime,
+            prediction,
+            selected_entry,
+            (
+                f"Quote order qty is below Binance minimum notional: "
+                f"quote_order_qty={runtime.quote_order_qty}, min_notional={min_notional}."
+            ),
+            extra={"min_notional": str(min_notional)},
+        )
+
+    try:
+        open_orders = client.open_orders(runtime.symbol)
+    except Exception as exc:  # noqa: BLE001 - unknown account state is unsafe for a new entry
+        return _preflight_error(
+            runtime,
+            prediction,
+            selected_entry,
+            f"Cannot verify existing open orders before BUY: {exc}",
+        )
+    if open_orders:
+        return _preflight_error(
+            runtime,
+            prediction,
+            selected_entry,
+            "Existing open orders found on Binance. Refusing to open a new trade.",
+            extra={"open_orders": open_orders},
+        )
+
+    quote_asset = str(filters.get("quote_asset") or "")
+    free_quote = _free_asset_balance_safe(client, quote_asset)
+    if free_quote is None:
+        return _preflight_error(
+            runtime,
+            prediction,
+            selected_entry,
+            f"Cannot verify free {quote_asset or 'quote'} balance before BUY.",
+        )
+    if free_quote < runtime.quote_order_qty:
+        return _preflight_error(
+            runtime,
+            prediction,
+            selected_entry,
+            (
+                f"Insufficient free {quote_asset} balance before BUY: "
+                f"free={free_quote}, required={runtime.quote_order_qty}."
+            ),
+            extra={"free_quote_balance": str(free_quote), "quote_asset": quote_asset},
+        )
+
+    return None
+
+
+def _preflight_error(
+    runtime: TradeRuntime,
+    prediction: dict[str, Any],
+    selected_entry: dict[str, Any],
+    message: str,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    logger.error(message)
+    payload = {
+        "error": message,
+        "block_new_trades": True,
+        "requires_manual_check": True,
+    }
+    if extra:
+        payload.update(extra)
+    return _save_state(
+        runtime.state_path,
+        _base_state(
+            runtime,
+            prediction,
+            selected_entry,
+            status="ERROR",
+            position_open=False,
+            extra=payload,
+        ),
+    )
 
 
 def _selected_signal_entry(prediction: dict[str, Any]) -> dict[str, Any] | None:
@@ -380,9 +663,12 @@ def _base_state(
 def _is_blocking_state(state: dict[str, Any]) -> bool:
     if not state:
         return False
+    status = str(state.get("status", "")).upper()
+    if status in TERMINAL_NON_BLOCKING_STATES and not state.get("requires_manual_check"):
+        return False
     if state.get("block_new_trades") or state.get("requires_manual_check"):
         return True
-    return bool(state.get("position_open")) or str(state.get("status", "")).upper() in ACTIVE_STATES
+    return bool(state.get("position_open")) or status in ACTIVE_STATES
 
 
 def _max_horizon(entry: dict[str, Any] | None) -> int | None:
@@ -424,15 +710,30 @@ def _avg_entry_price(order: dict[str, Any], fallback: Decimal) -> Decimal:
     return fallback
 
 
-def _symbol_filters(client: BinanceClient, symbol: str) -> dict[str, Decimal]:
+def _remaining_tp_qty(order: dict[str, Any]) -> Decimal:
+    if not order:
+        return Decimal("0")
+    orig_qty = Decimal(str(order.get("origQty") or "0"))
+    executed_qty = Decimal(str(order.get("executedQty") or "0"))
+    remaining = orig_qty - executed_qty
+    return remaining if remaining > 0 else Decimal("0")
+
+
+def _symbol_filters(client: BinanceClient, symbol: str) -> dict[str, Any]:
     info = client.exchange_info(symbol)
     symbols = info.get("symbols") or []
     if not symbols:
         raise RuntimeError(f"No exchangeInfo returned for {symbol}.")
-    filters = {item["filterType"]: item for item in symbols[0].get("filters", [])}
+    symbol_info = symbols[0]
+    filters = {item["filterType"]: item for item in symbol_info.get("filters", [])}
+    notional_filter = filters.get("NOTIONAL") or filters.get("MIN_NOTIONAL") or {}
     return {
+        "base_asset": str(symbol_info.get("baseAsset") or ""),
+        "quote_asset": str(symbol_info.get("quoteAsset") or ""),
+        "status": str(symbol_info.get("status") or ""),
         "tick_size": Decimal(filters.get("PRICE_FILTER", {}).get("tickSize", "0.01")),
         "step_size": Decimal(filters.get("LOT_SIZE", {}).get("stepSize", "0.000001")),
+        "min_notional": Decimal(str(notional_filter.get("minNotional", "0"))),
     }
 
 
@@ -440,6 +741,21 @@ def _round_down_to_step(value: Decimal, step: Decimal) -> Decimal:
     if step <= 0:
         return value
     return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+
+def _free_asset_balance_safe(client: BinanceClient, asset: str) -> Decimal | None:
+    asset = str(asset or "").upper()
+    if not asset:
+        return None
+    try:
+        account = client.account_info(omit_zero_balances=False)
+    except Exception as exc:  # noqa: BLE001 - executedQty fallback is still usable
+        logger.warning("Could not fetch free %s balance: %s", asset, exc)
+        return None
+    for balance in account.get("balances", []):
+        if str(balance.get("asset", "")).upper() == asset:
+            return Decimal(str(balance.get("free") or "0"))
+    return Decimal("0")
 
 
 def _client(runtime: TradeRuntime) -> BinanceClient:
@@ -465,9 +781,15 @@ def _save_state(path: Path, state: dict[str, Any]) -> dict[str, Any]:
     previous = _load_state(path)
     _maybe_notify_state(state, previous)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_json_safe(state), indent=2), encoding="utf-8")
+    _atomic_write_json(path, _json_safe(state))
     logger.info("Trade state: %s | %s", state.get("status"), path)
     return state
+
+
+def _atomic_write_json(path: Path, payload: Any) -> None:
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def _maybe_notify_state(state: dict[str, Any], previous: dict[str, Any]) -> None:
@@ -683,6 +1005,7 @@ def _build_runtime(args: argparse.Namespace) -> TradeRuntime:
 
 
 def _load_env_file(path: Path) -> None:
+    path = _resolve_env_path(path)
     if not path.exists():
         return
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -694,6 +1017,26 @@ def _load_env_file(path: Path) -> None:
         value = value.strip().strip('"').strip("'")
         if key and key not in os.environ:
             os.environ[key] = value
+
+
+def _resolve_env_path(path: str | Path) -> Path:
+    path = Path(path)
+    candidates = [path]
+    if not path.is_absolute():
+        candidates.append(Path.cwd() / path)
+        candidates.append(Path(__file__).resolve().parents[2] / path)
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if candidate.exists():
+            return candidate
+    return path
 
 
 def main() -> None:

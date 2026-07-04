@@ -198,7 +198,7 @@ def _error_payload(
 def _write_payload(output_path: str | Path, payload: dict[str, Any]) -> None:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(_json_safe(payload), indent=2), encoding="utf-8")
+    _atomic_write_json(output_path, _json_safe(payload))
     logger.info("Saved live prediction: %s", output_path)
 
 
@@ -323,7 +323,13 @@ def _load_notify_state(path: Path) -> dict[str, Any]:
 
 def _save_notify_state(path: Path, state: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_json_safe(state), indent=2), encoding="utf-8")
+    _atomic_write_json(path, _json_safe(state))
+
+
+def _atomic_write_json(path: Path, payload: Any) -> None:
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def _fmt_value(value: Any, digits: int) -> str:

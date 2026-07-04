@@ -53,6 +53,15 @@ class BinanceClient:
             signed=True,
         )
 
+    def open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {}
+        if symbol:
+            params["symbol"] = symbol.upper()
+        data = self._request("GET", "/api/v3/openOrders", params, signed=True)
+        if not isinstance(data, list):
+            raise RuntimeError(f"Unexpected openOrders response: {data!r}")
+        return data
+
     def get_order(self, symbol: str, order_id: int | str) -> dict[str, Any]:
         return self._request(
             "GET",

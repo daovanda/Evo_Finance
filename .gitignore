@@ -9,3 +9,7 @@ results/
 .env
 .env.*
 !.env.example
+
+# Runtime live bot state. These files contain transient predictions/orders.
+crypto/prod/live/*.json
+crypto/prod/live/*.tmp
