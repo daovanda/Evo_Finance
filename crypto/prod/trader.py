@@ -421,7 +421,9 @@ def _force_market_exit(
             free_base = _free_asset_balance_safe(client, filters["base_asset"])
             if free_base is not None and free_base > 0:
                 qty = min(qty, free_base)
-            qty = _round_down_to_step(qty, filters["step_size"])
+            market_step = filters.get("market_step_size") or Decimal("0")
+            if market_step > 0:
+                qty = _round_down_to_step(qty, market_step)
         except Exception as exc:  # noqa: BLE001 - keep previous remaining qty but record context
             logger.warning("Could not refresh balance/filters before final sell: %s", exc)
     if qty <= 0:
@@ -549,6 +551,38 @@ def _preflight_live_entry(
             extra={"min_notional": str(min_notional)},
         )
 
+    estimated_tp = _estimate_limit_tp_after_market_buy(
+        quote_order_qty=runtime.quote_order_qty,
+        reference_price=Decimal(str(prediction.get("entry_open") or "0")),
+        take_profit_pct=runtime.take_profit_pct,
+        sell_qty_safety_factor=runtime.sell_qty_safety_factor,
+        step_size=filters["step_size"],
+        tick_size=filters["tick_size"],
+    )
+    if min_notional > 0 and estimated_tp["notional"] < min_notional:
+        return _preflight_error(
+            runtime,
+            prediction,
+            selected_entry,
+            (
+                "Estimated TP notional would be below Binance minimum after "
+                "quantity safety factor and LOT_SIZE rounding. "
+                f"quote_order_qty={runtime.quote_order_qty}, "
+                f"estimated_buy_qty={estimated_tp['estimated_buy_qty']}, "
+                f"estimated_sell_qty={estimated_tp['estimated_sell_qty']}, "
+                f"estimated_tp_price={estimated_tp['estimated_tp_price']}, "
+                f"estimated_notional={estimated_tp['notional']}, "
+                f"min_notional={min_notional}."
+            ),
+            extra={
+                "min_notional": str(min_notional),
+                "estimated_buy_qty": str(estimated_tp["estimated_buy_qty"]),
+                "estimated_sell_qty": str(estimated_tp["estimated_sell_qty"]),
+                "estimated_tp_price": str(estimated_tp["estimated_tp_price"]),
+                "estimated_tp_notional": str(estimated_tp["notional"]),
+            },
+        )
+
     try:
         open_orders = client.open_orders(runtime.symbol)
     except Exception as exc:  # noqa: BLE001 - unknown account state is unsafe for a new entry
@@ -589,6 +623,38 @@ def _preflight_live_entry(
         )
 
     return None
+
+
+def _estimate_limit_tp_after_market_buy(
+    quote_order_qty: Decimal,
+    reference_price: Decimal,
+    take_profit_pct: Decimal,
+    sell_qty_safety_factor: Decimal,
+    step_size: Decimal,
+    tick_size: Decimal,
+) -> dict[str, Decimal]:
+    if reference_price <= 0:
+        return {
+            "estimated_buy_qty": Decimal("0"),
+            "estimated_sell_qty": Decimal("0"),
+            "estimated_tp_price": Decimal("0"),
+            "notional": Decimal("0"),
+        }
+    estimated_buy_qty = _round_down_to_step(quote_order_qty / reference_price, step_size)
+    estimated_sell_qty = _round_down_to_step(
+        estimated_buy_qty * sell_qty_safety_factor,
+        step_size,
+    )
+    estimated_tp_price = _round_down_to_step(
+        reference_price * (Decimal("1") + take_profit_pct),
+        tick_size,
+    )
+    return {
+        "estimated_buy_qty": estimated_buy_qty,
+        "estimated_sell_qty": estimated_sell_qty,
+        "estimated_tp_price": estimated_tp_price,
+        "notional": estimated_sell_qty * estimated_tp_price,
+    }
 
 
 def _preflight_error(
@@ -733,6 +799,7 @@ def _symbol_filters(client: BinanceClient, symbol: str) -> dict[str, Any]:
         "status": str(symbol_info.get("status") or ""),
         "tick_size": Decimal(filters.get("PRICE_FILTER", {}).get("tickSize", "0.01")),
         "step_size": Decimal(filters.get("LOT_SIZE", {}).get("stepSize", "0.000001")),
+        "market_step_size": Decimal(filters.get("MARKET_LOT_SIZE", {}).get("stepSize", "0")),
         "min_notional": Decimal(str(notional_filter.get("minNotional", "0"))),
     }
 

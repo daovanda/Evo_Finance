@@ -54,7 +54,7 @@ Vi du hien tai:
 ```python
 SYMBOL = "BTCUSDT"
 INTERVAL = "15m"
-QUOTE_ORDER_QTY = 5.5
+QUOTE_ORDER_QTY = 7.0
 TAKE_PROFIT_PCT = 0.0035
 SELL_QTY_SAFETY_FACTOR = 0.999
 POLL_SECONDS = 10.0
@@ -68,6 +68,8 @@ Y nghia:
 - `TAKE_PROFIT_PCT`: muc limit sell TP. `0.0035` = 0.35%.
 - `SELL_QTY_SAFETY_FACTOR`: ban it hon so BTC mua mot chut de tranh loi fee/rounding.
 - `ALLOW_REAL_TRADING`: cong tac chan lenh live. Muon trade that can `True` va CLI phai co `--execute --live`.
+
+Khong nen dat `QUOTE_ORDER_QTY` qua sat min notional `5 USDT`. Voi BTCUSDT, BUY bang `quoteOrderQty` co the bi lam tron base quantity; sau do bot con nhan `SELL_QTY_SAFETY_FACTOR` va lam tron theo `LOT_SIZE` de dat TP. Neu size qua nho, TP notional co the tut xuong duoi `5 USDT`. Mac dinh `7.0` de co buffer an toan hon.
 
 ## 2. Tao file `.env`
 
@@ -619,7 +621,7 @@ timedatectl
 Nap them USDT vao Spot wallet hoac giam:
 
 ```powershell
---quote-order-qty 5.5
+  --quote-order-qty 7
 ```
 
 ### Co open order nen bot khong vao lenh
@@ -639,4 +641,3 @@ Chi xoa state khi chac chan khong con vi the/lenh treo:
 ```powershell
 Remove-Item crypto/prod/live/trade_state.json -ErrorAction SilentlyContinue
 ```
-

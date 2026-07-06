@@ -15,7 +15,7 @@ LIVE_NOTIFY_STATE_PATH: Path = Path("crypto/prod/live/live_notify_state.json")
 
 SYMBOL: str = "BTCUSDT"
 INTERVAL: str = "15m"
-QUOTE_ORDER_QTY: float = 5.5
+QUOTE_ORDER_QTY: float = 7.0
 TAKE_PROFIT_PCT: float = 0.0035
 SELL_QTY_SAFETY_FACTOR: float = 0.999
 
