@@ -27,6 +27,8 @@ from config.settings import (
     LGBM_WF_EARLY_STOPPING,
     LGBM_WF_NUM_BOOST_ROUND,
     LGBM_WF_PARAMS,
+    WF_EARLY_STOP_MIN_VALID_DATES,
+    WF_EARLY_STOP_VALID_FRACTION,
 )
 from mutator.gene import Individual
 from mutator.evaluator import evaluate
@@ -171,6 +173,61 @@ def _group_sizes(df: pd.DataFrame) -> List[int]:
     else:
         # fallback: all in one group
         return [len(df)]
+
+
+def _date_values(df: pd.DataFrame) -> pd.Index:
+    """Return chronological group keys used by lambdarank."""
+    if isinstance(df.index, pd.MultiIndex):
+        level = "date" if "date" in df.index.names else 0
+        return pd.Index(df.index.get_level_values(level))
+    if "date" in df.columns:
+        return pd.Index(df["date"])
+    return pd.Index([])
+
+
+def _wf_internal_early_stop_indices(
+    train_df: pd.DataFrame,
+    train_mask: pd.Series,
+) -> tuple[pd.Index, pd.Index] | None:
+    """
+    Split the tail of fold-train into an internal early-stop set.
+
+    The split is date-based so each LightGBM lambdarank query group stays whole.
+    Fold validation is intentionally untouched and remains fitness-only.
+    """
+    frac = float(WF_EARLY_STOP_VALID_FRACTION)
+    if frac <= 0.0:
+        return None
+
+    masked_df = train_df[train_mask]
+    if masked_df.empty:
+        return None
+
+    dates = _date_values(masked_df)
+    if len(dates) != len(masked_df):
+        return None
+
+    unique_dates = pd.Index(pd.unique(dates))
+    n_dates = len(unique_dates)
+    if n_dates < 4:
+        return None
+
+    n_stop = max(int(WF_EARLY_STOP_MIN_VALID_DATES), int(np.ceil(n_dates * frac)))
+    n_stop = min(n_stop, n_dates // 2)
+    if n_stop < 1:
+        return None
+
+    split_pos = n_dates - n_stop
+    fit_dates = unique_dates[:split_pos]
+    stop_dates = unique_dates[split_pos:]
+    fit_mask = dates.isin(fit_dates)
+    stop_mask = dates.isin(stop_dates)
+
+    fit_index = masked_df.index[fit_mask]
+    stop_index = masked_df.index[stop_mask]
+    if len(fit_index) == 0 or len(stop_index) == 0:
+        return None
+    return fit_index, stop_index
 
 
 def _validate_group_alignment(
@@ -325,37 +382,90 @@ class Trainer:
         # ── LightGBM datasets ─────────────────────────────────────────────────
         # lambdarank requires integer relevance labels (0, 1, 2, …)
         # We bin continuous returns into N_RELEVANCE_BINS grades per date.
-        y_train_int, train_groups = self._labels_and_groups(
-            train_df, train_labels, train_mask
-        )
-        y_val_int, val_groups = self._labels_and_groups(
-            val_df, val_labels, val_mask
-        )
-        _validate_group_alignment(y_train_int, train_groups, "train")
-        _validate_group_alignment(y_val_int, val_groups, "val")
+        callbacks = [lgb.log_evaluation(period=-1)]   # silence per-round output
+        valid_sets = None
 
-        lgb_train = lgb.Dataset(
-            X_train, label=y_train_int, group=train_groups, free_raw_data=False
+        wf_stop_split = (
+            _wf_internal_early_stop_indices(train_df, train_mask)
+            if mode == "wf" and early_stopping_rounds > 0
+            else None
         )
-        lgb_val = lgb.Dataset(
-            X_val, label=y_val_int, group=val_groups,
-            reference=lgb_train, free_raw_data=False,
-        )
+
+        if wf_stop_split is not None:
+            fit_index, stop_index = wf_stop_split
+            fit_mask = train_mask & pd.Series(
+                train_df.index.isin(fit_index),
+                index=train_df.index,
+            )
+            stop_mask = train_mask & pd.Series(
+                train_df.index.isin(stop_index),
+                index=train_df.index,
+            )
+
+            y_fit_int, fit_groups = self._labels_and_groups(
+                train_df, train_labels, fit_mask
+            )
+            y_stop_int, stop_groups = self._labels_and_groups(
+                train_df, train_labels, stop_mask
+            )
+            _validate_group_alignment(y_fit_int, fit_groups, "train_fit")
+            _validate_group_alignment(y_stop_int, stop_groups, "train_early_stop")
+
+            lgb_train = lgb.Dataset(
+                X_train.loc[fit_index],
+                label=y_fit_int,
+                group=fit_groups,
+                free_raw_data=False,
+            )
+            lgb_stop = lgb.Dataset(
+                X_train.loc[stop_index],
+                label=y_stop_int,
+                group=stop_groups,
+                reference=lgb_train,
+                free_raw_data=False,
+            )
+            valid_sets = [lgb_stop]
+            callbacks.insert(
+                0,
+                lgb.early_stopping(
+                    stopping_rounds=early_stopping_rounds,
+                    verbose=False,
+                ),
+            )
+        else:
+            y_train_int, train_groups = self._labels_and_groups(
+                train_df, train_labels, train_mask
+            )
+            _validate_group_alignment(y_train_int, train_groups, "train")
+
+            lgb_train = lgb.Dataset(
+                X_train, label=y_train_int, group=train_groups, free_raw_data=False
+            )
+
+            if mode == "final" and early_stopping_rounds > 0:
+                y_val_int, val_groups = self._labels_and_groups(
+                    val_df, val_labels, val_mask
+                )
+                _validate_group_alignment(y_val_int, val_groups, "val")
+                lgb_val = lgb.Dataset(
+                    X_val, label=y_val_int, group=val_groups,
+                    reference=lgb_train, free_raw_data=False,
+                )
+                valid_sets = [lgb_val]
+                callbacks.insert(
+                    0,
+                    lgb.early_stopping(
+                        stopping_rounds=early_stopping_rounds,
+                        verbose=False,
+                    ),
+                )
 
         # ── Train ─────────────────────────────────────────────────────────────
-        callbacks = [
-            lgb.early_stopping(
-                stopping_rounds=early_stopping_rounds,
-                verbose=False,
-            ),
-            lgb.log_evaluation(period=-1),   # silence per-round output
-        ]
-
         booster = lgb.train(
             params            = dict(params),
             train_set         = lgb_train,
             num_boost_round   = num_boost_round,
-            valid_sets        = [lgb_val],
+            valid_sets        = valid_sets,
             callbacks         = callbacks,
         )
 

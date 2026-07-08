@@ -180,6 +180,66 @@ class TrainerCacheTests(unittest.TestCase):
         self.assertEqual(bin_mock.call_count, 2)
         self.assertEqual(group_mock.call_count, 2)
 
+    def test_wf_training_uses_internal_stop_set_instead_of_fold_val(self):
+        class DummyDataset:
+            def __init__(
+                self,
+                data,
+                label=None,
+                group=None,
+                reference=None,
+                free_raw_data=False,
+            ):
+                self.data = data
+                self.label = label
+                self.group = group
+                self.reference = reference
+                self.free_raw_data = free_raw_data
+
+        class DummyBooster:
+            def predict(self, matrix):
+                return np.arange(len(matrix), dtype=float)
+
+        captured = {}
+
+        def fake_train(params, train_set, num_boost_round, valid_sets, callbacks):
+            captured["train_set"] = train_set
+            captured["valid_sets"] = valid_sets
+            return DummyBooster()
+
+        df = _sample_df(periods=12)
+        dates = df.index.get_level_values("date")
+        unique_dates = dates.unique()
+        train_df = df[dates < unique_dates[10]].copy()
+        val_df = df[dates >= unique_dates[10]].copy()
+        individual = Individual(genes=[Gene("close_1"), Gene("volume_1")])
+
+        with (
+            patch.object(trainer_module, "WF_EARLY_STOP_VALID_FRACTION", 0.20),
+            patch.object(trainer_module, "WF_EARLY_STOP_MIN_VALID_DATES", 2),
+            patch("model.trainer.lgb.Dataset", DummyDataset),
+            patch("model.trainer.lgb.train", side_effect=fake_train),
+        ):
+            Trainer(enable_feature_cache=False).train(
+                individual,
+                train_df,
+                val_df,
+                feature_df=df,
+                mode="wf",
+            )
+
+        self.assertIsNotNone(captured["valid_sets"])
+        self.assertEqual(len(captured["valid_sets"]), 1)
+
+        stop_index = captured["valid_sets"][0].data.index
+        stop_dates = set(stop_index.get_level_values("date"))
+        train_dates = set(train_df.index.get_level_values("date"))
+        val_dates = set(val_df.index.get_level_values("date"))
+
+        self.assertTrue(stop_dates)
+        self.assertTrue(stop_dates.issubset(train_dates))
+        self.assertFalse(stop_dates.intersection(val_dates))
+
     def test_predict_sorts_feature_context_for_time_series_features(self):
         class EchoBooster:
             def predict(self, matrix):

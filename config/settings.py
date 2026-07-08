@@ -34,7 +34,7 @@ LABEL_FN: Callable = default_label
 # Walk-forward folds used inside the evolutionary loop. Final validation/test
 # still use VAL_START / TEST_START / TEST_END after the time budget ends.
 WF_END: str = TEST_START
-WF_MIN_TRAIN_MONTHS: int = 36
+WF_MIN_TRAIN_MONTHS: int = 48
 WF_VAL_MONTHS: int = 6
 WF_STEP_MONTHS: int = 6
 WF_PURGE_DAYS: int = HOLDING_HORIZON
@@ -117,7 +117,10 @@ LGBM_WF_PARAMS: dict = {
 }
 
 LGBM_WF_NUM_BOOST_ROUND: int = 250
-LGBM_WF_EARLY_STOPPING: int = 20    # stop if fold val NDCG@10 doesn't improve
+LGBM_WF_EARLY_STOPPING: int = 20
+# WF early stopping uses the tail of each fold-train; fold-val is fitness-only.
+WF_EARLY_STOP_VALID_FRACTION: float = 0.20
+WF_EARLY_STOP_MIN_VALID_DATES: int = 20
 
 LGBM_FINAL_PARAMS: dict = {
     "objective":        "lambdarank",
@@ -207,6 +210,10 @@ def validate_config() -> None:
         raise ValueError("WF_PURGE_DAYS must be non-negative.")
     if WF_PURGE_DAYS < HOLDING_HORIZON:
         raise ValueError("WF_PURGE_DAYS must be >= HOLDING_HORIZON to avoid split leakage.")
+    if not 0.0 <= float(WF_EARLY_STOP_VALID_FRACTION) < 0.5:
+        raise ValueError("WF_EARLY_STOP_VALID_FRACTION must be in [0, 0.5).")
+    if int(WF_EARLY_STOP_MIN_VALID_DATES) < 1:
+        raise ValueError("WF_EARLY_STOP_MIN_VALID_DATES must be >= 1.")
     if HIT_RATE_TOP_K < 1:
         raise ValueError("HIT_RATE_TOP_K must be positive.")
     if CHECKPOINT_EVERY_SECONDS < 0:

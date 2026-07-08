@@ -51,6 +51,16 @@ class SettingsValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "WF_PURGE_DAYS must be >= HOLDING_HORIZON"):
                 settings.validate_config()
 
+    def test_wf_early_stop_fraction_must_be_less_than_half(self):
+        with patch.object(settings, "WF_EARLY_STOP_VALID_FRACTION", 0.5):
+            with self.assertRaisesRegex(ValueError, "WF_EARLY_STOP_VALID_FRACTION"):
+                settings.validate_config()
+
+    def test_wf_early_stop_min_dates_must_be_positive(self):
+        with patch.object(settings, "WF_EARLY_STOP_MIN_VALID_DATES", 0):
+            with self.assertRaisesRegex(ValueError, "WF_EARLY_STOP_MIN_VALID_DATES"):
+                settings.validate_config()
+
     def test_sector_mapping_rejects_duplicate_ticker(self):
         sectors = {
             "Banking": ["AAA", "BBB"],

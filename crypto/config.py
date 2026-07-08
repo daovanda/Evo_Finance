@@ -15,7 +15,7 @@ DEFAULT_ARCHIVE_PATH: Path = RESULTS_DIR / "crypto_btc_archive.json"
 
 # Multi-horizon binary labels. Edit this list freely, for example [3, 7, 10, 20].
 HOLDING_HORIZONS: list[int] = [3, 5]
-LABEL_THRESHOLD: float = 0.001  # label=1 when future return > 0.1%
+LABEL_THRESHOLD: float = 0.003 # label=1 when future return > 0.1%
 
 # Final split, kept separate from the stock settings.
 VAL_START: str = "2024-01-01"

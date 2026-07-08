@@ -308,6 +308,13 @@ Xoa state cu neu chac chan khong co vi the bot dang mo:
 Remove-Item crypto/prod/live/trade_state.json -ErrorAction SilentlyContinue
 ```
 
+Tren Linux/VM:
+
+```bash
+cd ~/Evo_Finance
+rm -f crypto/prod/live/trade_state.json
+```
+
 Chay trader live:
 
 ```powershell
@@ -316,7 +323,8 @@ python -m crypto.prod.trader `
   --state crypto/prod/live/trade_state.json `
   --execute `
   --live `
-  --loop
+  --loop `
+  --quote-order-qty 7
 ```
 
 Neu muon override so tien lenh cho lan chay nay:
@@ -328,7 +336,7 @@ python -m crypto.prod.trader `
   --execute `
   --live `
   --loop `
-  --quote-order-qty 6
+  --quote-order-qty 7
 ```
 
 CLI override khong sua file `trade_config.py`; no chi ap dung cho process dang chay.
@@ -380,7 +388,8 @@ python -m crypto.prod.trader `
   --state crypto/prod/live/trade_state.json `
   --execute `
   --live `
-  --loop
+  --loop `
+  --quote-order-qty 7
 ```
 
 Thu tu khuyen nghi:
@@ -491,6 +500,7 @@ python -m crypto.prod.trader \
   --execute \
   --live \
   --loop \
+  --quote-order-qty 7 \
   2>&1 | tee crypto/prod/live/trader.log
 ```
 
