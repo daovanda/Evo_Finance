@@ -49,12 +49,14 @@ FEATURE_MAX_DOMINANT_VALUE_RATIO: float = 0.98  # reject near-constant new featu
 # ─── Correlation threshold ────────────────────────────────────────────────────
 
 CORR_THRESHOLD: float = 0.70       # used for domain & individual dedup
-CORR_CHECK_MAX_ROWS: int = 30000   # deterministic row sample for faster Spearman checks
-DOMAIN_CORR_MAX_CHECKS: int = 100   # max existing domain formulas checked per new gene
+# 0 = use all valid rows; >0 = deterministic row sample for faster Spearman checks.
+CORR_CHECK_MAX_ROWS: int = 0 #30000
+# 0 = check all existing domain formulas; >0 = max domain formulas checked per new gene.
+DOMAIN_CORR_MAX_CHECKS: int =  0 #100
 
 # Full startup precompute can be very slow once the domain contains many
 # sector/market primitives. Keep it lazy by default; set True for debugging.
-DOMAIN_PRECOMPUTE_ON_START: bool = False
+DOMAIN_PRECOMPUTE_ON_START: bool = True #False
 
 # ─── Window whitelist ─────────────────────────────────────────────────────────
 

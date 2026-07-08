@@ -158,11 +158,58 @@ Correlation guard:
 
 ```python
 CORR_THRESHOLD = 0.70
+CORR_CHECK_MAX_ROWS = 0
+DOMAIN_CORR_MAX_CHECKS = 0
+DOMAIN_PRECOMPUTE_ON_START = True
 ```
 
 `CORR_THRESHOLD` dung de loc feature qua giong nhau trong domain va trong
 individual. Hien tai dang loc ca hai dau: tuong quan duong qua cao va am qua cao
 deu bi loai theo tri tuyet doi.
+
+Co 2 lop corr-check:
+
+```text
+individual corr-check:
+  Gene moi van check voi toan bo feature con lai trong individual.
+  Day la lop quan trong nhat de tranh individual bi trung feature.
+
+domain corr-check:
+  Neu gene moi chua co trong domain, he thu them gene do vao domain.
+  Luc do gene moi duoc check voi domain de tranh domain phinh ra boi cac ban sao.
+```
+
+Y nghia cac bien gioi han:
+
+```text
+CORR_CHECK_MAX_ROWS = 0
+  0  = dung toan bo valid rows de tinh corr.
+  >0 = lay sample co dinh toi da N rows de tinh nhanh hon.
+
+DOMAIN_CORR_MAX_CHECKS = 0
+  0  = check voi toan bo domain.
+  >0 = chi check toi da N formula trong domain.
+
+DOMAIN_PRECOMPUTE_ON_START = True
+  Tinh san feature domain luc bat dau. Khoi dong lau hon va ton RAM hon,
+  nhung sau do domain corr-check do bi giat/khoi tao lazy hon.
+```
+
+Neu muon chay nhanh hon, co the dung vi du:
+
+```python
+CORR_CHECK_MAX_ROWS = 12000
+DOMAIN_CORR_MAX_CHECKS = 40
+DOMAIN_PRECOMPUTE_ON_START = False
+```
+
+Neu muon corr full chat nhat nhu cau hinh hien tai, giu:
+
+```python
+CORR_CHECK_MAX_ROWS = 0
+DOMAIN_CORR_MAX_CHECKS = 0
+DOMAIN_PRECOMPUTE_ON_START = True
+```
 
 ### 2.6. LightGBM
 
