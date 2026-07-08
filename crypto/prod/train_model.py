@@ -44,6 +44,7 @@ def train_from_archive(
     val_start: str = config.VAL_START,
     test_start: str = config.TEST_START,
     test_end: str | None = config.TEST_END,
+    label_mode: str = config.LABEL_MODE,
 ) -> Path:
     """Train one LightGBM model per selected individual and horizon."""
     config.validate_config()
@@ -56,10 +57,12 @@ def train_from_archive(
 
     logger.info("Loading crypto data from %s", data_path)
     raw_df = load_ohlcv(data_path)
+    label_mode = str(label_mode).strip().lower()
     labeled_df = add_binary_labels(
         raw_df,
         horizons=config.HOLDING_HORIZONS,
         threshold=config.LABEL_THRESHOLD,
+        return_fn=config.get_label_return_fn(label_mode),
     )
     purge_bars = config.purge_bars_for_horizons(config.HOLDING_HORIZONS)
     train_df, val_df, test_df = split_labeled_by_dates(
@@ -93,6 +96,7 @@ def train_from_archive(
             test_start=test_start,
             test_end=test_end,
             purge_bars=purge_bars,
+            label_mode=label_mode,
         ),
         "entries": [],
     }
@@ -292,10 +296,11 @@ def _config_snapshot(
     test_start: str,
     test_end: str | None,
     purge_bars: int,
+    label_mode: str,
 ) -> dict[str, Any]:
     return {
         "horizons": list(config.HOLDING_HORIZONS),
-        "label_mode": config.LABEL_MODE,
+        "label_mode": label_mode,
         "label_threshold": float(config.LABEL_THRESHOLD),
         "val_start": val_start,
         "test_start": test_start,
@@ -366,6 +371,12 @@ def main() -> None:
     parser.add_argument("--val-start", default=config.VAL_START)
     parser.add_argument("--test-start", default=config.TEST_START)
     parser.add_argument("--test-end", default=config.TEST_END)
+    parser.add_argument(
+        "--label-mode",
+        choices=sorted(config.LABEL_RETURN_FNS),
+        default=config.LABEL_MODE,
+        help=f"Label mode used when training production models. Default: {config.LABEL_MODE}.",
+    )
     args = parser.parse_args()
 
     manifest_path = train_from_archive(
@@ -378,6 +389,7 @@ def main() -> None:
         val_start=args.val_start,
         test_start=args.test_start,
         test_end=args.test_end,
+        label_mode=args.label_mode,
     )
     logger.info("Done. Manifest: %s", manifest_path)
 

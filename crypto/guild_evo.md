@@ -73,6 +73,12 @@ future_return(t, h) = (max(high(t+1)..high(t+h)) - open(t+1)) / open(t+1)
 
 Mode `mfe` phu hop hon voi chien luoc dat TP, vi chi can gia cham muc loi trong horizon la label duong.
 
+Co the override label mode bang CLI, khong can sua file config:
+
+```powershell
+python -m crypto.main --label-mode mfe --help
+```
+
 ### Final split
 
 ```python
@@ -121,6 +127,7 @@ python -m crypto.main `
   --data data/crypto/BTCUSDT_15m.csv `
   --budget 1800 `
   --seed 1 `
+  --label-mode mfe `
   --save crypto/results/crypto_btc_seed1_30m.json `
   --checkpoint-every 600
 ```
@@ -132,6 +139,7 @@ python -m crypto.main `
   --data data/crypto/BTCUSDT_15m.csv `
   --budget 18000 `
   --seed 1 `
+  --label-mode mfe `
   --save crypto/results/crypto_btc_seed1_5h.json `
   --checkpoint-every 3600
 ```
@@ -143,6 +151,7 @@ python -m crypto.main `
   --data data/crypto/BTCUSDT_15m.csv `
   --budget 43200 `
   --seed 1 `
+  --label-mode mfe `
   --save crypto/results/crypto_btc_seed1_12h.json `
   --checkpoint-every 3600
 ```
@@ -157,6 +166,7 @@ python -m crypto.main `
   --budget 43200 `
   --seed 1 `
   --resume crypto/results/crypto_btc_seed1_12h.checkpoint.json `
+  --label-mode mfe `
   --save crypto/results/crypto_btc_seed1_12h.json `
   --checkpoint-every 3600
 ```
@@ -169,6 +179,7 @@ python -m crypto.main `
   --budget 18000 `
   --seed 2 `
   --horizons 3,5,10 `
+  --label-mode mfe `
   --label-threshold 0.001 `
   --save crypto/results/crypto_btc_seed2_h3_h5_h10.json
 ```

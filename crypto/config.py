@@ -20,7 +20,7 @@ DEFAULT_ARCHIVE_PATH: Path = RESULTS_DIR / "crypto_btc_archive.json"
 # Multi-horizon binary labels. Edit this list freely, for example [3, 7, 10, 20].
 HOLDING_HORIZONS: list[int] = [3, 5]
 LABEL_THRESHOLD: float = 0.003 # label=1 when future return > 0.1%
-LABEL_MODE: str = "close_exit"  # "close_exit" or "mfe"
+LABEL_MODE: str = "mfe"  # "close_exit" or "mfe"
 
 
 def close_exit_future_return(df: Any, horizon: int) -> Any:

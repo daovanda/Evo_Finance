@@ -43,6 +43,7 @@ def run(
     resume_archive: str | Path | None = None,
     horizons: list[int] | tuple[int, ...] = tuple(config.HOLDING_HORIZONS),
     label_threshold: float = config.LABEL_THRESHOLD,
+    label_mode: str = config.LABEL_MODE,
     val_start: str = config.VAL_START,
     test_start: str = config.TEST_START,
     test_end: str | None = config.TEST_END,
@@ -54,13 +55,20 @@ def run(
 ) -> CryptoArchive:
     config.validate_config()
     horizons = [int(h) for h in horizons]
+    label_mode = str(label_mode).strip().lower()
+    label_return_fn = config.get_label_return_fn(label_mode)
     purge_bars = config.purge_bars_for_horizons(horizons)
     wf_end = wf_end or test_start
     rng = np.random.default_rng(seed)
 
     logger.info("Loading crypto data from %s", data_path)
     raw_df = load_ohlcv(data_path)
-    labeled_df = add_binary_labels(raw_df, horizons=horizons, threshold=label_threshold)
+    labeled_df = add_binary_labels(
+        raw_df,
+        horizons=horizons,
+        threshold=label_threshold,
+        return_fn=label_return_fn,
+    )
     train_df, val_df, test_df = split_labeled_by_dates(
         labeled_df,
         val_start=val_start,
@@ -170,7 +178,7 @@ def run(
         if checkpoint_path is not None and checkpoint_every > 0:
             now = time.time()
             if now - last_checkpoint >= float(checkpoint_every):
-                _save_archive(archive, checkpoint_path, horizons, label_threshold)
+                _save_archive(archive, checkpoint_path, horizons, label_threshold, label_mode)
                 last_checkpoint = now
 
     if not archive.is_empty():
@@ -184,10 +192,10 @@ def run(
         )
 
     if save_path is not None:
-        _save_archive(archive, save_path, horizons, label_threshold)
+        _save_archive(archive, save_path, horizons, label_threshold, label_mode)
         logger.info("Saved crypto archive to %s", save_path)
     if checkpoint_path is not None:
-        _save_archive(archive, checkpoint_path, horizons, label_threshold)
+        _save_archive(archive, checkpoint_path, horizons, label_threshold, label_mode)
     return archive
 
 
@@ -226,13 +234,14 @@ def _save_archive(
     path: Path,
     horizons: list[int],
     label_threshold: float,
+    label_mode: str,
 ) -> None:
     archive.save(
         path,
         metadata={
             "pipeline": "crypto",
             "horizons": horizons,
-            "label_mode": config.LABEL_MODE,
+            "label_mode": label_mode,
             "label_threshold": label_threshold,
             "fitness": config.FITNESS_WEIGHTS,
             "trade_top_fraction": config.TRADE_TOP_FRACTION,
@@ -279,6 +288,12 @@ def main() -> None:
         help="Comma-separated horizons, default: 3,7,10.",
     )
     parser.add_argument("--label-threshold", type=float, default=config.LABEL_THRESHOLD)
+    parser.add_argument(
+        "--label-mode",
+        choices=sorted(config.LABEL_RETURN_FNS),
+        default=config.LABEL_MODE,
+        help=f"Label mode. Default: {config.LABEL_MODE}.",
+    )
     parser.add_argument("--val-start", default=config.VAL_START)
     parser.add_argument("--test-start", default=config.TEST_START)
     parser.add_argument("--test-end", default=config.TEST_END)
@@ -297,6 +312,7 @@ def main() -> None:
         resume_archive=args.resume,
         horizons=args.horizons,
         label_threshold=args.label_threshold,
+        label_mode=args.label_mode,
         val_start=args.val_start,
         test_start=args.test_start,
         test_end=args.test_end,

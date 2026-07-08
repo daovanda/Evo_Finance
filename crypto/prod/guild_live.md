@@ -105,6 +105,7 @@ Chay rank 1:
 ```powershell
 python -m crypto.analyze `
   --archive crypto/results/crypto_btc_seed1_12h.json `
+  --label-mode mfe `
   --rank 1
 ```
 
@@ -113,6 +114,7 @@ Chay top 5:
 ```powershell
 python -m crypto.analyze `
   --archive crypto/results/crypto_btc_seed1_12h.json `
+  --label-mode mfe `
   --top 5
 ```
 
@@ -121,6 +123,7 @@ Chay nhieu rank cu the:
 ```powershell
 python -m crypto.analyze `
   --archive crypto/results/crypto_btc_seed1_12h.json `
+  --label-mode mfe `
   --rank 1 3 7
 ```
 
@@ -148,6 +151,7 @@ Train rank 1:
 ```powershell
 python -m crypto.prod.train_model `
   --archive crypto/results/crypto_btc_seed1_12h.json `
+  --label-mode mfe `
   --rank 1 `
   --run-name crypto_btc_seed1_12h
 ```
@@ -157,6 +161,7 @@ Train top 3:
 ```powershell
 python -m crypto.prod.train_model `
   --archive crypto/results/crypto_btc_seed1_12h.json `
+  --label-mode mfe `
   --top 3 `
   --run-name crypto_btc_seed1_12h_top3
 ```
@@ -166,6 +171,7 @@ Train rank 1 va 5:
 ```powershell
 python -m crypto.prod.train_model `
   --archive crypto/results/crypto_btc_seed1_12h.json `
+  --label-mode mfe `
   --rank 1 5 `
   --run-name crypto_btc_seed1_12h_r1_r5
 ```

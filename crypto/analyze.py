@@ -79,6 +79,7 @@ def analyze(
     val_start: str = config.VAL_START,
     test_start: str = config.TEST_START,
     test_end: str | None = config.TEST_END,
+    label_mode: str = config.LABEL_MODE,
 ) -> list[Path]:
     entries = _filter_entries(_load_archive_entries(Path(archive_path)), top=top, ranks=ranks)
     output_path = Path(output_dir)
@@ -86,10 +87,12 @@ def analyze(
 
     logger.info("Loading crypto data from %s", data_path)
     raw_df = load_ohlcv(data_path)
+    label_mode = str(label_mode).strip().lower()
     labeled_df = add_binary_labels(
         raw_df,
         horizons=config.HOLDING_HORIZONS,
         threshold=config.LABEL_THRESHOLD,
+        return_fn=config.get_label_return_fn(label_mode),
     )
     purge_bars = config.purge_bars_for_horizons(config.HOLDING_HORIZONS)
     train_df, val_df, test_df = split_labeled_by_dates(
@@ -712,6 +715,12 @@ def main() -> None:
     parser.add_argument("--val-start", default=config.VAL_START)
     parser.add_argument("--test-start", default=config.TEST_START)
     parser.add_argument("--test-end", default=config.TEST_END)
+    parser.add_argument(
+        "--label-mode",
+        choices=sorted(config.LABEL_RETURN_FNS),
+        default=config.LABEL_MODE,
+        help=f"Label mode used when recalculating labels. Default: {config.LABEL_MODE}.",
+    )
     args = parser.parse_args()
 
     charts = analyze(
@@ -723,6 +732,7 @@ def main() -> None:
         val_start=args.val_start,
         test_start=args.test_start,
         test_end=args.test_end,
+        label_mode=args.label_mode,
     )
     logger.info("Done. Saved %d chart(s).", len(charts))
 
