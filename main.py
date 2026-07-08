@@ -239,7 +239,14 @@ def run(
         else:
             parent = _safe_parent_for_evolution(archive.random_individual(rng))
 
+        logger.info(
+            "Parent selected: n_genes=%d | genes=%s",
+            len(parent),
+            _short_gene_list(parent.formulas),
+        )
+
         # mutate
+        mutation_start = time.perf_counter()
         try:
             child = mutator.mutate(parent, wf_feature_df)
         except Exception as exc:
@@ -249,6 +256,13 @@ def run(
         if len(child) == 0:
             logger.warning("Mutation produced empty individual — skipping.")
             continue
+
+        logger.info(
+            "Mutation produced child: %.1fs | n_genes=%d | genes=%s",
+            time.perf_counter() - mutation_start,
+            len(child),
+            _short_gene_list(child.formulas),
+        )
 
         # evaluate + archive
         admitted = _evaluate_and_archive_wf(
@@ -298,8 +312,23 @@ def _evaluate_and_archive_wf(
     """Train and score an individual over all walk-forward folds."""
     fold_predictions = []
     last_booster = None
+    eval_start = time.perf_counter()
+
+    logger.info(
+        "WF eval start: n_genes=%d | genes=%s",
+        len(individual),
+        _short_gene_list(individual.formulas),
+    )
 
     for fold in wf_folds:
+        fold_start = time.perf_counter()
+        logger.info(
+            "WF fold %s start: train=%d rows | val=%d rows | n_genes=%d",
+            fold.name,
+            len(fold.train_df),
+            len(fold.val_df),
+            len(individual),
+        )
         try:
             booster, train_pred, val_pred, train_labels, val_labels = trainer.train(
                 individual, fold.train_df, fold.val_df,
@@ -308,6 +337,12 @@ def _evaluate_and_archive_wf(
         except Exception as exc:
             logger.warning("WF training failed on %s: %s", fold.name, exc)
             return False
+        logger.info(
+            "WF fold %s done: %.1fs | best_iter=%s",
+            fold.name,
+            time.perf_counter() - fold_start,
+            _booster_iteration(booster),
+        )
         last_booster = booster
         fold_predictions.append(
             FoldPrediction(
@@ -322,12 +357,44 @@ def _evaluate_and_archive_wf(
         )
 
     try:
+        logger.info("WF fitness aggregation start: folds=%d", len(fold_predictions))
         evaluator.evaluate_walk_forward(individual, fold_predictions)
     except Exception as exc:
         logger.warning("WF fitness evaluation failed: %s", exc)
         return False
 
-    return archive.try_add(individual, last_booster)
+    admitted = archive.try_add(individual, last_booster)
+    logger.info(
+        "WF eval done: %.1fs | score=%.4f | admitted=%s",
+        time.perf_counter() - eval_start,
+        individual.score if individual.score is not None else float("nan"),
+        admitted,
+    )
+    return admitted
+
+
+def _short_gene_list(
+    formulas: list[str] | tuple[str, ...],
+    max_items: int = 8,
+    max_chars: int = 260,
+) -> str:
+    shown = [str(formula) for formula in list(formulas)[:max_items]]
+    text = "; ".join(shown)
+    if len(formulas) > max_items:
+        text += f"; ... (+{len(formulas) - max_items} more)"
+    if len(text) > max_chars:
+        text = text[: max_chars - 3] + "..."
+    return text
+
+
+def _booster_iteration(booster) -> int | str:
+    best_iter = getattr(booster, "best_iteration", None)
+    if best_iter:
+        return int(best_iter)
+    try:
+        return int(booster.current_iteration())
+    except Exception:
+        return "unknown"
 
 
 def _handle_missing_sector_mapping(missing_sector: list[str]) -> None:

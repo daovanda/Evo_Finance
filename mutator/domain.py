@@ -15,10 +15,11 @@ import time
 from typing import List, Optional
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
 
 from config.settings import (
     CORR_THRESHOLD,
+    CORR_CHECK_MAX_ROWS,
+    DOMAIN_CORR_MAX_CHECKS,
     FEATURE_MAX_DOMINANT_VALUE_RATIO,
     FEATURE_MIN_VALID_RATIO,
     WINDOWS,
@@ -180,7 +181,10 @@ class Domain:
                 return False
             new_series = full_series.dropna()
 
-            for existing_formula in self._formulas:
+            checked = 0
+            corr_start = time.perf_counter()
+            for existing_formula in _bounded_domain_corr_formulas(self._formulas):
+                checked += 1
                 ex_series = self._cache.get(existing_formula)
                 if ex_series is None:
                     try:
@@ -192,6 +196,15 @@ class Domain:
                     return False
 
             # passed — cache it
+            elapsed = time.perf_counter() - corr_start
+            if elapsed >= 5.0:
+                logger.info(
+                    "Domain.try_add corr check: %.1fs | checked=%d/%d | %r",
+                    elapsed,
+                    checked,
+                    len(self._formulas),
+                    gene.formula,
+                )
             self._cache[gene.formula] = new_series
 
         self._formulas.append(gene.formula)
@@ -516,13 +529,19 @@ def _safe_corr(a: pd.Series, b: pd.Series) -> float:
         if len(aligned) < 10:
             return 1.0  # quá ít data → coi như duplicate, reject
         # Hằng số → corr = NaN → nếu không chặn sẽ pass threshold
+        max_rows = int(CORR_CHECK_MAX_ROWS)
+        if max_rows > 0 and len(aligned) > max_rows:
+            step = int(np.ceil(len(aligned) / max_rows))
+            aligned = aligned.iloc[::step]
         std_a = aligned.iloc[:, 0].std()
         std_b = aligned.iloc[:, 1].std()
         if std_a < 1e-8:
             return 1.0  # reject: gene không có thông tin
         if std_b < 1e-8:
             return 0.0
-        corr, _ = spearmanr(aligned.iloc[:, 0], aligned.iloc[:, 1])
+        corr = aligned.iloc[:, 0].rank(method="average").corr(
+            aligned.iloc[:, 1].rank(method="average")
+        )
         return float(corr) if np.isfinite(corr) else 0.0
     except Exception:
         return 0.0
@@ -530,6 +549,14 @@ def _safe_corr(a: pd.Series, b: pd.Series) -> float:
 
 def _evaluate_clean(formula: str, df: pd.DataFrame) -> pd.Series:
     return evaluate(formula, df).replace([np.inf, -np.inf], np.nan)
+
+
+def _bounded_domain_corr_formulas(formulas: List[str]) -> List[str]:
+    candidates = [formula for formula in formulas if not str(formula).startswith("const(")]
+    max_checks = int(DOMAIN_CORR_MAX_CHECKS)
+    if max_checks <= 0 or len(candidates) <= max_checks:
+        return list(candidates)
+    return list(candidates[:max_checks])
 
 
 def _feature_quality_violation(

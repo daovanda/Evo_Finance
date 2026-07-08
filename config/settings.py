@@ -49,6 +49,8 @@ FEATURE_MAX_DOMINANT_VALUE_RATIO: float = 0.98  # reject near-constant new featu
 # ─── Correlation threshold ────────────────────────────────────────────────────
 
 CORR_THRESHOLD: float = 0.70       # used for domain & individual dedup
+CORR_CHECK_MAX_ROWS: int = 30000   # deterministic row sample for faster Spearman checks
+DOMAIN_CORR_MAX_CHECKS: int = 100   # max existing domain formulas checked per new gene
 
 # Full startup precompute can be very slow once the domain contains many
 # sector/market primitives. Keep it lazy by default; set True for debugging.
@@ -201,6 +203,10 @@ def validate_config() -> None:
         raise ValueError("WINDOWS must not contain duplicates.")
     if not 0.0 <= CORR_THRESHOLD <= 1.0:
         raise ValueError("CORR_THRESHOLD must be in [0, 1].")
+    if int(CORR_CHECK_MAX_ROWS) < 0:
+        raise ValueError("CORR_CHECK_MAX_ROWS must be non-negative.")
+    if int(DOMAIN_CORR_MAX_CHECKS) < 0:
+        raise ValueError("DOMAIN_CORR_MAX_CHECKS must be non-negative.")
 
     if HOLDING_HORIZON < 1:
         raise ValueError("HOLDING_HORIZON must be positive.")
