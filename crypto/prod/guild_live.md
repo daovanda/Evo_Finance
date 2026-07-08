@@ -28,6 +28,7 @@ Quan trong nhat:
 ```python
 HOLDING_HORIZONS = [3, 5]
 LABEL_THRESHOLD = 0.001
+LABEL_MODE = "close_exit"  # "close_exit" hoac "mfe"
 VAL_START = "2024-01-01"
 TEST_START = "2025-01-01"
 TRADE_TOP_FRACTION = 0.20
@@ -40,6 +41,9 @@ LGBM_PARAMS = {...}
 rank_01_h3.txt
 rank_01_h5.txt
 ```
+
+`LABEL_MODE="close_exit"` dung return tu `open(t+1)` den `close(t+h)`.
+`LABEL_MODE="mfe"` dung return tu `open(t+1)` den high lon nhat trong khoang `t+1..t+h`.
 
 ### Trading config
 
@@ -420,7 +424,7 @@ Moi loop trader:
    - Tinh `avg_entry`.
    - Dat LIMIT SELL TP tai `avg_entry * (1 + TAKE_PROFIT_PCT)`.
 10. Neu TP filled -> dong vi the.
-11. Neu toi deadline `close(t+h)`:
+11. Neu toi deadline ket thuc horizon:
    - Kiem tra TP co filled chua.
    - Huy TP neu con treo.
    - Market sell phan con lai.

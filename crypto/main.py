@@ -232,6 +232,7 @@ def _save_archive(
         metadata={
             "pipeline": "crypto",
             "horizons": horizons,
+            "label_mode": config.LABEL_MODE,
             "label_threshold": label_threshold,
             "fitness": config.FITNESS_WEIGHTS,
             "trade_top_fraction": config.TRADE_TOP_FRACTION,

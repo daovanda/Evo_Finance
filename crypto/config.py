@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
+
+import pandas as pd
 
 
 # Data
@@ -16,6 +20,55 @@ DEFAULT_ARCHIVE_PATH: Path = RESULTS_DIR / "crypto_btc_archive.json"
 # Multi-horizon binary labels. Edit this list freely, for example [3, 7, 10, 20].
 HOLDING_HORIZONS: list[int] = [3, 5]
 LABEL_THRESHOLD: float = 0.003 # label=1 when future return > 0.1%
+LABEL_MODE: str = "close_exit"  # "close_exit" or "mfe"
+
+
+def close_exit_future_return(df: Any, horizon: int) -> Any:
+    """
+    Default label return.
+
+    future_return(t, h) = (close(t+h) - open(t+1)) / open(t+1)
+
+    Edit or replace LABEL_RETURN_FN below when you want a different label,
+    for example a max-high/MFE label instead of close-at-horizon return.
+    """
+    h = int(horizon)
+    entry_open = df["open"].shift(-1)
+    exit_close = df["close"].shift(-h)
+    return (exit_close - entry_open) / entry_open
+
+
+def mfe_future_return(df: Any, horizon: int) -> Any:
+    """
+    Max favorable excursion label return.
+
+    future_return(t, h) = (max(high(t+1)..high(t+h)) - open(t+1)) / open(t+1)
+    """
+    h = int(horizon)
+    entry_open = df["open"].shift(-1)
+    future_highs = pd.concat(
+        [df["high"].shift(-offset) for offset in range(1, h + 1)],
+        axis=1,
+    )
+    max_high = future_highs.max(axis=1, skipna=False)
+    return (max_high - entry_open) / entry_open
+
+
+LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
+    "close_exit": close_exit_future_return,
+    "mfe": mfe_future_return,
+}
+
+
+def get_label_return_fn(mode: str | None = None) -> Callable[[Any, int], Any]:
+    selected_mode = str(mode or LABEL_MODE).strip().lower()
+    if selected_mode not in LABEL_RETURN_FNS:
+        allowed = ", ".join(sorted(LABEL_RETURN_FNS))
+        raise ValueError(f"Unknown LABEL_MODE={selected_mode!r}. Allowed: {allowed}.")
+    return LABEL_RETURN_FNS[selected_mode]
+
+
+LABEL_RETURN_FN: Callable[[Any, int], Any] = get_label_return_fn()
 
 # Final split, kept separate from the stock settings.
 VAL_START: str = "2024-01-01"
@@ -57,7 +110,7 @@ MAX_RETRY: int = 5
 # cannot dominate merely by being on a wider numerical scale.
 TRADE_TOP_FRACTION: float = 0.20
 MIN_TRADES_PER_SPLIT: int = 20
-TRADE_COST: float = 0.001  # 0.1% breakeven cost per selected trade
+TRADE_COST: float = 0.002  # 0.1% breakeven cost per selected trade
 RETURN_SCORE_SCALE: float = 0.01
 BAD_AUC_THRESHOLD: float = 0.50
 
@@ -110,6 +163,7 @@ def validate_config() -> None:
         raise ValueError("HOLDING_HORIZONS must contain positive integers.")
     if LABEL_THRESHOLD < 0:
         raise ValueError("LABEL_THRESHOLD must be non-negative.")
+    get_label_return_fn()
     if FEATURE_MIN < 1 or FEATURE_MAX < FEATURE_MIN:
         raise ValueError("Require 1 <= FEATURE_MIN <= FEATURE_MAX.")
     if EXPR_MAX_DEPTH < 1:

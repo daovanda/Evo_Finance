@@ -749,7 +749,7 @@ def _exit_deadline_time(prediction: dict[str, Any], entry: dict[str, Any], inter
     horizon = _max_horizon(entry)
     if horizon is None:
         raise ValueError("Cannot compute exit deadline without horizon.")
-    # label uses close(t+h), available at the next candle open after t+h.
+    # Exit at the first candle open after the selected horizon ends.
     deadline = signal_time + pd.to_timedelta(_interval_ms(interval) * (horizon + 1), unit="ms")
     return str(deadline)
 
@@ -987,7 +987,7 @@ def _status_description(status: str) -> str:
             "Lenh chot loi da khop, bot coi vi the da dong va co the nhan tin hieu moi."
         ),
         "FINAL_SELL_PENDING": (
-            "Da toi deadline close(t+h), bot huy TP neu co va dat MARKET SELL de thoat lenh."
+            "Da toi deadline horizon, bot huy TP neu co va dat MARKET SELL de thoat lenh."
         ),
         "FINAL_SELL_FILLED": (
             "Lenh MARKET SELL cuoi da khop, bot coi vi the da dong."

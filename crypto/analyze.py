@@ -115,6 +115,10 @@ def analyze(
         int(horizon): _max_high_return(raw_df, int(horizon))
         for horizon in config.HOLDING_HORIZONS
     }
+    close_return_by_horizon = {
+        int(horizon): _close_exit_return(raw_df, int(horizon))
+        for horizon in config.HOLDING_HORIZONS
+    }
 
     charts: list[Path] = []
     for entry in entries:
@@ -135,6 +139,7 @@ def analyze(
                 test_df=test_df,
                 feature_space=feature_space,
                 mfe=mfe_by_horizon[int(horizon)],
+                close_return=close_return_by_horizon[int(horizon)],
             )
             if result is not None:
                 horizon_results.append(result)
@@ -207,6 +212,7 @@ def _analyze_horizon(
     test_df: pd.DataFrame,
     feature_space: CryptoFeatureSpace,
     mfe: pd.Series,
+    close_return: pd.Series,
 ) -> HorizonAnalysis | None:
     label_col = f"label_h{horizon}"
     ret_col = f"future_return_h{horizon}"
@@ -236,14 +242,14 @@ def _analyze_horizon(
         split="val",
         y_true=y_val,
         pred=val_pred,
-        close_return=val[ret_col],
+        close_return=close_return,
         mfe=mfe,
     )
     test_result = _split_prediction(
         split="test",
         y_true=y_test,
         pred=test_pred,
-        close_return=test[ret_col],
+        close_return=close_return,
         mfe=mfe,
     )
     return HorizonAnalysis(horizon=horizon, val=val_result, test=test_result)
@@ -292,7 +298,7 @@ def _split_prediction(
             {
                 "label": y_true,
                 "pred": pred,
-                "close_return": close_return,
+                "close_return": close_return.reindex(pred.index),
                 "mfe": mfe.reindex(pred.index),
             }
         )
@@ -457,6 +463,13 @@ def _max_high_return(raw_df: pd.DataFrame, horizon: int) -> pd.Series:
         axis=1,
     ).max(axis=1, skipna=False)
     return (max_high / entry - 1.0).replace([np.inf, -np.inf], np.nan)
+
+
+def _close_exit_return(raw_df: pd.DataFrame, horizon: int) -> pd.Series:
+    data = raw_df.sort_index()
+    entry = pd.to_numeric(data["open"], errors="coerce").shift(-1)
+    close = pd.to_numeric(data["close"], errors="coerce").shift(-int(horizon))
+    return (close / entry - 1.0).replace([np.inf, -np.inf], np.nan)
 
 
 def _plot_individual(

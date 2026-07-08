@@ -28,13 +28,76 @@ class CryptoPipelineTests(unittest.TestCase):
             index=idx,
         )
 
-        labeled = add_binary_labels(df, horizons=[2], threshold=0.001)
+        labeled = add_binary_labels(
+            df,
+            horizons=[2],
+            threshold=0.001,
+            return_fn=config.close_exit_future_return,
+        )
 
         expected = (df["close"].shift(-2) - df["open"].shift(-1)) / df["open"].shift(-1)
         pd.testing.assert_series_equal(
             labeled["future_return_h2"],
             expected.rename("future_return_h2"),
         )
+        self.assertEqual(labeled["label_h2"].iloc[0], 1.0)
+        self.assertTrue(pd.isna(labeled["label_h2"].iloc[-1]))
+
+    def test_mfe_label_uses_next_open_and_future_max_high(self):
+        idx = pd.date_range("2024-01-01", periods=5, freq="15min")
+        df = pd.DataFrame(
+            {
+                "open": [100.0] * 5,
+                "high": [100.0, 102.0, 101.0, 104.0, 103.0],
+                "low": [99.0] * 5,
+                "close": [100.0] * 5,
+                "volume": [10.0] * 5,
+                "trade_count": [10] * 5,
+                "taker_buy_base_volume": [5.0] * 5,
+                "taker_buy_quote_volume": [500.0] * 5,
+            },
+            index=idx,
+        )
+
+        labeled = add_binary_labels(
+            df,
+            horizons=[3],
+            threshold=0.03,
+            return_fn=config.mfe_future_return,
+        )
+
+        expected = pd.Series(
+            [0.04, 0.04, np.nan, np.nan, np.nan],
+            index=idx,
+            name="future_return_h3",
+        )
+        pd.testing.assert_series_equal(labeled["future_return_h3"], expected)
+        self.assertEqual(labeled["label_h3"].iloc[0], 1.0)
+        self.assertTrue(pd.isna(labeled["label_h3"].iloc[-1]))
+
+    def test_label_mode_mfe_is_used_by_default_labeling(self):
+        idx = pd.date_range("2024-01-01", periods=5, freq="15min")
+        df = pd.DataFrame(
+            {
+                "open": [100.0] * 5,
+                "high": [100.0, 100.5, 101.5, 100.2, 100.1],
+                "low": [99.0] * 5,
+                "close": [100.0] * 5,
+                "volume": [10.0] * 5,
+                "trade_count": [10] * 5,
+                "taker_buy_base_volume": [5.0] * 5,
+                "taker_buy_quote_volume": [500.0] * 5,
+            },
+            index=idx,
+        )
+
+        old_mode = config.LABEL_MODE
+        try:
+            config.LABEL_MODE = "mfe"
+            labeled = add_binary_labels(df, horizons=[2], threshold=0.01)
+        finally:
+            config.LABEL_MODE = old_mode
+
         self.assertEqual(labeled["label_h2"].iloc[0], 1.0)
         self.assertTrue(pd.isna(labeled["label_h2"].iloc[-1]))
 

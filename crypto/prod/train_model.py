@@ -295,6 +295,7 @@ def _config_snapshot(
 ) -> dict[str, Any]:
     return {
         "horizons": list(config.HOLDING_HORIZONS),
+        "label_mode": config.LABEL_MODE,
         "label_threshold": float(config.LABEL_THRESHOLD),
         "val_start": val_start,
         "test_start": test_start,

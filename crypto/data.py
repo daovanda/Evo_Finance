@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -71,18 +72,19 @@ def add_binary_labels(
     df: pd.DataFrame,
     horizons: list[int] | tuple[int, ...] = tuple(config.HOLDING_HORIZONS),
     threshold: float = config.LABEL_THRESHOLD,
+    return_fn: Callable[[pd.DataFrame, int], pd.Series] | None = None,
 ) -> pd.DataFrame:
     """
     Add future_return_h{h} and label_h{h}.
 
-    future_return(t, h) = (close(t+h) - open(t+1)) / open(t+1)
+    The future_return formula is controlled by config.LABEL_MODE.
     label = 1 if future_return > threshold, else 0.
     """
     labeled = df.sort_index().copy()
-    next_open = labeled["open"].shift(-1)
+    label_return_fn = return_fn or config.get_label_return_fn()
     for h in horizons:
         h = int(h)
-        future_return = (labeled["close"].shift(-h) - next_open) / next_open
+        future_return = label_return_fn(labeled, h)
         labeled[f"future_return_h{h}"] = future_return
         labeled[f"label_h{h}"] = (future_return > float(threshold)).astype("float")
         labeled.loc[future_return.isna(), f"label_h{h}"] = np.nan

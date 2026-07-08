@@ -54,9 +54,24 @@ Sua trong `crypto/config.py`.
 ```python
 HOLDING_HORIZONS = [3, 5]
 LABEL_THRESHOLD = 0.001
+LABEL_MODE = "close_exit"  # "close_exit" hoac "mfe"
 ```
 
 Nghia la tao label cho `h3` va `h5`; label = 1 khi future return vuot `0.1%`.
+
+`LABEL_MODE="close_exit"`:
+
+```text
+future_return(t, h) = (close(t+h) - open(t+1)) / open(t+1)
+```
+
+`LABEL_MODE="mfe"`:
+
+```text
+future_return(t, h) = (max(high(t+1)..high(t+h)) - open(t+1)) / open(t+1)
+```
+
+Mode `mfe` phu hop hon voi chien luoc dat TP, vi chi can gia cham muc loi trong horizon la label duong.
 
 ### Final split
 
@@ -428,4 +443,3 @@ Neu co checkpoint thi resume tu checkpoint.
 ### Archive khong co final metrics
 
 Final metrics chi duoc tinh sau khi het budget. Neu process crash truoc khi het budget, checkpoint co the chua co final val/test metrics. Resume tiep hoac chay budget ngan de ket thuc va ghi final.
-
