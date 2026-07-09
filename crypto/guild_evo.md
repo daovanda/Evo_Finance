@@ -79,6 +79,18 @@ Co the override label mode bang CLI, khong can sua file config:
 python -m crypto.main --label-mode mfe --help
 ```
 
+Co the override threshold bang CLI:
+
+```powershell
+python -m crypto.main --label-mode mfe --label-threshold 0.003 --help
+```
+
+Luu y:
+
+- `--label-mode` va `--label-threshold` trong `crypto.main` anh huong truc tiep den label khi tien hoa.
+- `--label-mode` va `--label-threshold` trong `crypto.analyze` la label/threshold dung de train lai va ve chart.
+- Neu archive duoc tien hoa bang mode/threshold A nhung analyze bang mode/threshold B thi chart la ket qua tai danh gia theo B, khong phai score goc trong archive.
+
 ### Final split
 
 ```python
@@ -289,6 +301,7 @@ python -m crypto.main \
   --data data/crypto/BTCUSDT_15m.csv \
   --budget 43200 \
   --seed 1 \
+  --label-mode mfe \
   --save crypto/results/crypto_btc_seed1_12h.json \
   --checkpoint-every 3600 \
   2>&1 | tee crypto/results/run_crypto_btc_seed1_12h.log
@@ -331,6 +344,7 @@ python -m crypto.main \
   --data data/crypto/BTCUSDT_15m.csv \
   --budget 43200 \
   --seed 2 \
+  --label-mode mfe \
   --save crypto/results/crypto_btc_seed2_12h.json \
   --checkpoint-every 3600 \
   2>&1 | tee crypto/results/run_crypto_btc_seed2_12h.log
@@ -347,6 +361,7 @@ python -m crypto.main \
   --data data/crypto/BTCUSDT_15m.csv \
   --budget 43200 \
   --seed 3 \
+  --label-mode mfe \
   --save crypto/results/crypto_btc_seed3_12h.json \
   --checkpoint-every 3600 \
   2>&1 | tee crypto/results/run_crypto_btc_seed3_12h.log
@@ -363,6 +378,7 @@ python -m crypto.main \
   --budget 43200 \
   --seed 1 \
   --resume crypto/results/crypto_btc_seed1_12h.checkpoint.json \
+  --label-mode mfe \
   --save crypto/results/crypto_btc_seed1_12h.json \
   --checkpoint-every 3600 \
   2>&1 | tee -a crypto/results/run_crypto_btc_seed1_12h.log
@@ -409,10 +425,14 @@ Sau do chay lai `gcloud compute scp`.
 
 ## 11. Kiem tra archive sau khi tai ve
 
+### Analyze mot individual
+
 ```powershell
 python -m crypto.analyze `
   --archive crypto/results/crypto_btc_seed1_12h.json `
-  --rank 1
+  --rank 1 `
+  --label-mode mfe `
+  --label-threshold 0.003
 ```
 
 Bieu do se luu trong:
@@ -420,6 +440,88 @@ Bieu do se luu trong:
 ```text
 crypto/results/chart/
 ```
+
+Ten file chart co dang:
+
+```text
+rank_01_score_0.2186_mode_mfe_thr_0p300pct.png
+```
+
+Trong moi anh chart:
+
+- Bang metrics chinh: AUC, Base, Top precision, PE, threshold, MFE hit, Base MFE, Excess, Top MFE, Close.
+- Bieu do daily: ty le `MFE > threshold` cua top trade so voi baseline, rolling theo `DAILY_ROLLING_WINDOW_DAYS`.
+- Bang `P(MFE > x) by threshold`: xac suat MFE vuot tung moc tu `0.00%` den `0.70%`, buoc `0.05%`.
+
+Y nghia cac dong trong bang `P(MFE > x)`:
+
+- `val top`: nhom trade model chon tren val.
+- `val base`: tat ca nen tren val.
+- `test top`: nhom trade model chon tren test.
+- `test base`: tat ca nen tren test.
+
+### Analyze voi threshold khac TP that
+
+Neu TP live dang la `0.35%`, co the analyze bang:
+
+```powershell
+python -m crypto.analyze `
+  --archive crypto/results/crypto_btc_seed1_12h.json `
+  --rank 1 `
+  --label-mode mfe `
+  --label-threshold 0.0035
+```
+
+### Ensemble giua cac horizon trong mot individual
+
+Mac dinh chart cua mot individual da co them section:
+
+```text
+ensemble h3+h5 -> close h5
+```
+
+Section nay chi tinh trade khi cac model horizon trong cung individual cung dong y.
+
+### Ensemble nhieu individual tu nhieu archive
+
+Dung `--ensemble-individual` thay cho `--archive`.
+
+Cu phap moi member:
+
+```text
+ARCHIVE#RANK[#MODE[#THRESHOLD]]
+```
+
+Vi du ensemble 2 individual, moi individual dung label rieng khi train lai:
+
+```powershell
+python -m crypto.analyze `
+  --ensemble-individual `
+    "crypto/results/crypto_btc_mfe_seed1_12h.json#1#mfe#0.003" `
+    "crypto/results/crypto_btc_close_exit_seed1_12h.json#1#close_exit#0.001" `
+  --label-mode mfe `
+  --label-threshold 0.003
+```
+
+Logic:
+
+1. Moi member se train lai cac model theo horizon voi `MODE/THRESHOLD` rieng cua member.
+2. Moi member tao mot horizon-ensemble rieng, vi du `h3+h5`.
+3. Section cuoi cung ensemble cac horizon-ensemble cua tung member voi nhau.
+4. `--label-mode` va `--label-threshold` o cuoi lenh la chuan danh gia cho section ensemble tong.
+
+Neu bo qua `MODE/THRESHOLD` trong member:
+
+```powershell
+python -m crypto.analyze `
+  --ensemble-individual `
+    "crypto/results/a.json#1" `
+    "crypto/results/b.json#3" `
+  --label-mode mfe `
+  --label-threshold 0.003
+```
+
+thi moi member se dung chung `--label-mode mfe --label-threshold 0.003`.
 
 ## 12. Loi thuong gap
 
