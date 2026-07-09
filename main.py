@@ -42,7 +42,11 @@ from config.settings import (
 )
 from mutator.gene       import Gene, Individual
 from mutator.domain     import Domain
-from mutator.formula_guard import const_threshold_violation, raw_scale_violation
+from mutator.formula_guard import (
+    const_threshold_violation,
+    expression_complexity_violation,
+    raw_scale_violation,
+)
 from mutator.mutator    import Mutator
 from model.trainer      import Trainer
 from model.data_utils   import (
@@ -529,7 +533,11 @@ def _archive_row_to_individual(row: dict) -> Individual:
 def _legacy_guard_violations(individual: Individual) -> list[tuple[str, str]]:
     violations: list[tuple[str, str]] = []
     for formula in individual.formulas:
-        reason = const_threshold_violation(formula) or raw_scale_violation(formula)
+        reason = (
+            const_threshold_violation(formula)
+            or expression_complexity_violation(formula)
+            or raw_scale_violation(formula)
+        )
         if reason is not None:
             violations.append((formula, reason))
     return violations
@@ -555,7 +563,11 @@ def _safe_parent_for_evolution(individual: Optional[Individual]) -> Individual:
 
     safe_formulas: list[str] = []
     for formula in individual.formulas:
-        reason = const_threshold_violation(formula) or raw_scale_violation(formula)
+        reason = (
+            const_threshold_violation(formula)
+            or expression_complexity_violation(formula)
+            or raw_scale_violation(formula)
+        )
         if reason is None and formula not in safe_formulas:
             safe_formulas.append(formula)
 

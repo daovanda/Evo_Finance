@@ -22,7 +22,11 @@ from mutator.gene import (
     PAIR_TS_OPS, BINARY_OPS,
 )
 from mutator.domain import Domain, individual_corr_check
-from mutator.formula_guard import const_threshold_violation, raw_scale_violation
+from mutator.formula_guard import (
+    const_threshold_violation,
+    expression_complexity_violation,
+    raw_scale_violation,
+)
 
 logger = logging.getLogger(__name__)
 CONSTANT_BINARY_PROB = 0.25
@@ -36,6 +40,7 @@ def _feature_signature(individual: Individual) -> tuple[str, ...]:
 def _is_selectable_formula(formula: str) -> bool:
     return (
         const_threshold_violation(formula) is None
+        and expression_complexity_violation(formula) is None
         and raw_scale_violation(formula) is None
     )
 

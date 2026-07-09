@@ -6,6 +6,8 @@ from mutator.domain import Domain, individual_corr_check
 from mutator.formula_guard import (
     BLOCKED_EVOLUTION_PRIMITIVES,
     const_threshold_violation,
+    expression_complexity_violation,
+    expression_depth,
     is_const_threshold_safe,
     is_normalized_for_const_threshold,
     is_raw_scale_safe,
@@ -21,6 +23,23 @@ from main import (
 
 
 class FormulaGuardTests(unittest.TestCase):
+    def test_expression_complexity_guard(self):
+        allowed = (
+            "(cross_below(where(gt(ret(close_1, 20), const(0.156233)), "
+            "const(-1), const(0)), sector_neutralize(rel_sector_ret(20))))_w20"
+        )
+        too_deep = "ret(close_1, 1)"
+        for _ in range(5):
+            too_deep = f"sign({too_deep})"
+        too_long = "x" * 481
+
+        self.assertEqual(6, expression_depth(allowed))
+        self.assertIsNone(expression_complexity_violation(allowed))
+        self.assertIsNotNone(expression_complexity_violation(too_deep))
+        self.assertIn("depth", expression_complexity_violation(too_deep))
+        self.assertIsNotNone(expression_complexity_violation(too_long))
+        self.assertIn("length", expression_complexity_violation(too_long))
+
     def test_rejects_absolute_const_thresholds(self):
         unsafe = [
             "lt(low_60, const(48.1738))",
@@ -236,6 +255,10 @@ class FormulaGuardTests(unittest.TestCase):
         breadth_count_gene = Gene("advance_count()")
         breadth_spread_gene = Gene("advance_decline_spread()")
         constant_gene = Gene("const(1)")
+        too_deep_formula = "ret(close_1, 1)"
+        for _ in range(5):
+            too_deep_formula = f"sign({too_deep_formula})"
+        too_deep_gene = Gene(too_deep_formula)
 
         domain = Domain()
         self.assertFalse(domain.try_add(unsafe_gene, empty_df))
@@ -247,6 +270,7 @@ class FormulaGuardTests(unittest.TestCase):
         self.assertFalse(domain.try_add(breadth_count_gene, empty_df))
         self.assertFalse(domain.try_add(breadth_spread_gene, empty_df))
         self.assertFalse(domain.try_add(constant_gene, empty_df))
+        self.assertFalse(domain.try_add(too_deep_gene, empty_df))
         self.assertNotIn(unsafe_gene.formula, domain.formulas)
         self.assertFalse(individual_corr_check(unsafe_gene, [], empty_df))
         self.assertFalse(individual_corr_check(raw_scale_gene, [], empty_df))
@@ -257,6 +281,7 @@ class FormulaGuardTests(unittest.TestCase):
         self.assertFalse(individual_corr_check(breadth_count_gene, [], empty_df))
         self.assertFalse(individual_corr_check(breadth_spread_gene, [], empty_df))
         self.assertFalse(individual_corr_check(constant_gene, [], empty_df))
+        self.assertFalse(individual_corr_check(too_deep_gene, [], empty_df))
 
     def test_blocked_sector_and_breadth_primitives_are_not_evolvable(self):
         empty_df = pd.DataFrame()

@@ -35,6 +35,7 @@ from mutator.evaluator import evaluate, has_division_by_zero
 from mutator.formula_guard import (
     BLOCKED_EVOLUTION_PRIMITIVES,
     const_threshold_violation,
+    expression_complexity_violation,
     raw_scale_violation,
 )
 
@@ -71,7 +72,11 @@ class Domain:
         finance_formulas = []
         skipped_unsafe = 0
         for formula in _finance_seed_formulas():
-            violation = const_threshold_violation(formula) or raw_scale_violation(formula)
+            violation = (
+                const_threshold_violation(formula)
+                or expression_complexity_violation(formula)
+                or raw_scale_violation(formula)
+            )
             if violation is not None:
                 skipped_unsafe += 1
                 logger.debug("Domain.seed: skip unsafe formula %r - %s", formula, violation)
@@ -132,6 +137,14 @@ class Domain:
         if violation is not None:
             logger.debug(
                 "Domain.try_add: reject unsafe const threshold %r - %s",
+                gene.formula,
+                violation,
+            )
+            return False
+        violation = expression_complexity_violation(gene.formula)
+        if violation is not None:
+            logger.debug(
+                "Domain.try_add: reject expression complexity %r - %s",
                 gene.formula,
                 violation,
             )
@@ -608,6 +621,14 @@ def individual_corr_check(
     if violation is not None:
         logger.debug(
             "corr_check: reject unsafe const threshold %r - %s",
+            new_gene.formula,
+            violation,
+        )
+        return False
+    violation = expression_complexity_violation(new_gene.formula)
+    if violation is not None:
+        logger.debug(
+            "corr_check: reject expression complexity %r - %s",
             new_gene.formula,
             violation,
         )

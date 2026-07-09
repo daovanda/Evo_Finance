@@ -43,6 +43,8 @@ WF_PURGE_DAYS: int = HOLDING_HORIZON
 
 FEATURE_MIN: int = 3
 FEATURE_MAX: int = 30
+EXPR_MAX_DEPTH: int = 4
+EXPR_MAX_LENGTH: int = 320
 FEATURE_MIN_VALID_RATIO: float = 0.70  # reject new features with too many NaN rows
 FEATURE_MAX_DOMINANT_VALUE_RATIO: float = 0.98  # reject near-constant new features
 
@@ -193,6 +195,10 @@ def validate_config() -> None:
 
     if FEATURE_MIN < 1 or FEATURE_MAX < FEATURE_MIN:
         raise ValueError("Feature limits require 1 <= FEATURE_MIN <= FEATURE_MAX.")
+    if int(EXPR_MAX_DEPTH) < 1:
+        raise ValueError("EXPR_MAX_DEPTH must be >= 1.")
+    if int(EXPR_MAX_LENGTH) < 1:
+        raise ValueError("EXPR_MAX_LENGTH must be >= 1.")
     if not 0.0 <= float(FEATURE_MIN_VALID_RATIO) <= 1.0:
         raise ValueError("FEATURE_MIN_VALID_RATIO must be in [0, 1].")
     if not 0.0 <= float(FEATURE_MAX_DOMINANT_VALUE_RATIO) <= 1.0:

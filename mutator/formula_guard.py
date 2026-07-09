@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 
+from config.settings import EXPR_MAX_DEPTH, EXPR_MAX_LENGTH
 from mutator.evaluator import (
     _balanced,
     _parse_float_arg,
@@ -112,6 +113,31 @@ def is_normalized_for_const_threshold(expr: str) -> bool:
 def is_raw_scale_safe(formula: str) -> bool:
     """Return True when the formula output is not raw price/volume scale."""
     return raw_scale_violation(formula) is None
+
+
+def expression_complexity_violation(formula: str) -> str | None:
+    """Return a violation when a formula is too deep or too long."""
+    formula = str(formula).strip()
+    max_length = int(EXPR_MAX_LENGTH)
+    if len(formula) > max_length:
+        return (
+            f"expression length {len(formula)} exceeds "
+            f"EXPR_MAX_LENGTH={max_length}: {formula!r}"
+        )
+
+    max_depth = int(EXPR_MAX_DEPTH)
+    depth = expression_depth(formula)
+    if depth > max_depth:
+        return (
+            f"expression depth {depth} exceeds "
+            f"EXPR_MAX_DEPTH={max_depth}: {formula!r}"
+        )
+    return None
+
+
+def expression_depth(formula: str) -> int:
+    """Return parser-based expression depth used by the mutation guard."""
+    return _expression_depth(str(formula).strip())
 
 
 def raw_scale_violation(formula: str) -> str | None:
@@ -802,6 +828,34 @@ def _canonical(expr: str) -> str:
     while expr.startswith("(") and expr.endswith(")") and _balanced(expr):
         expr = expr[1:-1].strip()
     return expr
+
+
+def _expression_depth(expr: str) -> int:
+    expr = _canonical(expr)
+    if not expr:
+        return 0
+    if _is_numeric_literal(expr):
+        return 1
+
+    parsed_tag = _parse_window_tag(expr)
+    if parsed_tag is not None:
+        inner, _ = parsed_tag
+        return 1 + _expression_depth(inner)
+
+    op, left, right = _split_binary(expr)
+    if op is not None:
+        return 1 + max(_expression_depth(left), _expression_depth(right))
+
+    fn, args = _parse_fn(expr)
+    if fn is not None:
+        depths = [
+            _expression_depth(part)
+            for part in _split_top_level(args, ",")
+            if part.strip() and not _is_numeric_literal(part)
+        ]
+        return 1 + (max(depths) if depths else 0)
+
+    return 1
 
 
 def _is_numeric_literal(text: str) -> bool:

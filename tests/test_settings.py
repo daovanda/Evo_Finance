@@ -27,6 +27,15 @@ class SettingsValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "FEATURE_MIN_VALID_RATIO"):
                 settings.validate_config()
 
+    def test_expression_limits_must_be_positive(self):
+        with patch.object(settings, "EXPR_MAX_DEPTH", 0):
+            with self.assertRaisesRegex(ValueError, "EXPR_MAX_DEPTH"):
+                settings.validate_config()
+
+        with patch.object(settings, "EXPR_MAX_LENGTH", 0):
+            with self.assertRaisesRegex(ValueError, "EXPR_MAX_LENGTH"):
+                settings.validate_config()
+
     def test_feature_max_dominant_value_ratio_must_be_probability(self):
         with patch.object(settings, "FEATURE_MAX_DOMINANT_VALUE_RATIO", 1.5):
             with self.assertRaisesRegex(ValueError, "FEATURE_MAX_DOMINANT_VALUE_RATIO"):
