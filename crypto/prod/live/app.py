@@ -315,11 +315,37 @@ function render(data) {{
   const payload = data.prediction || {{}};
   const entries = payload.entries || [];
   const error = data.last_error || payload.error || data.error || '';
-  const hasTrade = entries.some(entry => entry.ensemble_signal === true);
+  const finalEnsemble = payload.final_ensemble || null;
+  const hasTrade = finalEnsemble
+    ? finalEnsemble.ensemble_signal === true
+    : entries.some(entry => entry.ensemble_signal === true);
   const status = error ? 'ERROR' : (data.running ? 'running' : (hasTrade ? 'TRADE' : 'NO TRADE'));
   const statusClass = hasTrade && !error ? 'status-trade' : 'status-no-trade';
 
-  document.getElementById('entries').innerHTML = entries.map(entry => `
+  const finalHtml = finalEnsemble ? `
+    <table>
+      <thead>
+        <tr><th colspan="5">Final ensemble | members: ${{finalEnsemble.member_count}}
+          | signal: <span class="${{finalEnsemble.ensemble_signal ? 'signal' : 'nosignal'}}">${{finalEnsemble.ensemble_signal}}</span>
+          | pred mean ${{fmt(finalEnsemble.pred_mean, 6)}}
+        </th></tr>
+        <tr><th>Member</th><th>Rank</th><th>Label</th><th>Signal</th><th>Pred mean</th></tr>
+      </thead>
+      <tbody>
+        ${{(finalEnsemble.members || []).map(m => `
+          <tr>
+            <td>${{m.entry_id || ''}}</td>
+            <td>${{m.rank ?? ''}}</td>
+            <td>${{m.label_mode || ''}} @ ${{fmt(m.label_threshold, 4)}}</td>
+            <td class="${{m.ensemble_signal ? 'signal' : 'nosignal'}}">${{m.ensemble_signal}}</td>
+            <td>${{fmt(m.pred_mean, 6)}}</td>
+          </tr>
+        `).join('')}}
+      </tbody>
+    </table>
+  ` : '';
+
+  const entryHtml = entries.map(entry => `
     <table>
       <thead>
         <tr><th colspan="5">Rank ${{entry.rank}} | ensemble:
@@ -341,11 +367,13 @@ function render(data) {{
       </tbody>
     </table>
   `).join('');
+  document.getElementById('entries').innerHTML = finalHtml + entryHtml;
 
   const decision = [
     ['Signal time', payload.signal_time],
     ['Entry candle', payload.entry_candle_time],
     ['Entry open', fmt(payload.entry_open, 2)],
+    ['Final ensemble', finalEnsemble ? finalEnsemble.ensemble_signal : ''],
     ['Status', status, statusClass]
   ];
   document.getElementById('decision').innerHTML = decision.map(([k, v, cls]) => `

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -139,6 +140,7 @@ def run_once(
                 signal_time=signal_time,
             )
         )
+    final_ensemble = _predict_final_ensemble(entries, manifest)
 
     payload = {
         "created_at": _utc_now_iso(),
@@ -161,6 +163,7 @@ def run_once(
         },
         "data_update": update_info,
         "entries": entries,
+        "final_ensemble": final_ensemble,
     }
     _write_payload(output_path, payload)
     _notify_prediction_once(payload)
@@ -293,12 +296,26 @@ def _prediction_telegram_message(payload: dict[str, Any]) -> str:
                     ]
                 )
             )
+    final_ensemble = payload.get("final_ensemble")
+    if isinstance(final_ensemble, dict):
+        lines.append(
+            f"Final ensemble | signal={final_ensemble.get('ensemble_signal')} "
+            f"| members={final_ensemble.get('member_count')} "
+            f"| pred_mean={_fmt_value(final_ensemble.get('pred_mean'), 6)}"
+        )
     return "\n".join(lines)
 
 
 def _decision_status(payload: dict[str, Any]) -> str:
     if payload.get("status") == "ERROR" or payload.get("error"):
         return "ERROR"
+    final_ensemble = payload.get("final_ensemble")
+    if isinstance(final_ensemble, dict):
+        signal = final_ensemble.get("ensemble_signal")
+        if signal is True:
+            return "TRADE"
+        if signal is False:
+            return "NO TRADE"
     has_trade = any(entry.get("ensemble_signal") is True for entry in payload.get("entries", []))
     return "TRADE" if has_trade else "NO TRADE"
 
@@ -327,9 +344,17 @@ def _save_notify_state(path: Path, state: dict[str, Any]) -> None:
 
 
 def _atomic_write_json(path: Path, payload: Any) -> None:
-    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    tmp_path.replace(path)
+    last_exc: PermissionError | None = None
+    for attempt in range(20):
+        try:
+            tmp_path.replace(path)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            time.sleep(0.05 * (attempt + 1))
+    raise last_exc if last_exc is not None else PermissionError(f"Could not replace {path}")
 
 
 def _fmt_value(value: Any, digits: int) -> str:
@@ -488,13 +513,94 @@ def _predict_entry(
         ensemble_signal = None
 
     return {
+        "entry_id": entry.get("entry_id"),
         "rank": int(entry.get("rank", 0) or 0),
+        "archive": entry.get("archive"),
+        "label_mode": entry.get("label_mode"),
+        "label_threshold": entry.get("label_threshold"),
         "score": entry.get("score"),
         "n_features": len(features),
         "ensemble_signal": ensemble_signal,
         "pred_mean": float(np.mean([item["pred"] for item in predictions])) if predictions else None,
         "predictions": predictions,
     }
+
+
+def _predict_final_ensemble(
+    entries: list[dict[str, Any]],
+    manifest: dict[str, Any],
+) -> dict[str, Any] | None:
+    if len(entries) < 2:
+        return None
+    ensemble_config = manifest.get("ensemble") if isinstance(manifest.get("ensemble"), dict) else None
+    if not ensemble_config:
+        return None
+    members = [str(member) for member in ensemble_config.get("members", []) if str(member)]
+    if not members:
+        return None
+    if members:
+        by_id = {str(entry.get("entry_id")): entry for entry in entries if entry.get("entry_id")}
+        selected_entries = [by_id[member] for member in members if member in by_id]
+        missing = [member for member in members if member not in by_id]
+    if not selected_entries:
+        return None
+
+    signals = [entry.get("ensemble_signal") for entry in selected_entries]
+    known = [signal for signal in signals if signal is not None]
+    if len(known) != len(signals) or missing:
+        ensemble_signal: bool | None = None
+    else:
+        ensemble_signal = bool(known) and all(signal is True for signal in known)
+
+    pred_values = [
+        float(entry["pred_mean"])
+        for entry in selected_entries
+        if entry.get("pred_mean") is not None and np.isfinite(float(entry["pred_mean"]))
+    ]
+    pred_mean = float(np.mean(pred_values)) if pred_values else None
+    horizon = _max_entry_horizon(selected_entries)
+    return {
+        "entry_id": "final_ensemble",
+        "rank": "ensemble",
+        "horizon": horizon,
+        "ensemble_signal": ensemble_signal,
+        "pred_mean": pred_mean,
+        "member_count": int(len(selected_entries)),
+        "required_members": members,
+        "missing_members": missing,
+        "members": [
+            {
+                "entry_id": entry.get("entry_id"),
+                "rank": entry.get("rank"),
+                "archive": entry.get("archive"),
+                "label_mode": entry.get("label_mode"),
+                "label_threshold": entry.get("label_threshold"),
+                "ensemble_signal": entry.get("ensemble_signal"),
+                "pred_mean": entry.get("pred_mean"),
+            }
+            for entry in selected_entries
+        ],
+        "predictions": [
+            {
+                "horizon": horizon,
+                "pred": pred_mean,
+                "threshold": None,
+                "is_signal": ensemble_signal,
+                "model_path": "final_ensemble",
+            }
+        ],
+    }
+
+
+def _max_entry_horizon(entries: list[dict[str, Any]]) -> int | None:
+    horizons: list[int] = []
+    for entry in entries:
+        if entry.get("horizon") is not None:
+            horizons.append(int(entry["horizon"]))
+        for item in entry.get("predictions", []):
+            if item.get("horizon") is not None:
+                horizons.append(int(item["horizon"]))
+    return max(horizons) if horizons else None
 
 
 def _resolve_model_path(model_path_value: Any, model_dir: Path) -> Path:

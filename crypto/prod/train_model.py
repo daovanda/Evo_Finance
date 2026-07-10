@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,14 @@ logger = logging.getLogger("crypto.prod.train_model")
 DEFAULT_MODEL_DIR = Path("crypto/prod/model")
 
 
+@dataclass(frozen=True)
+class EnsembleIndividualSpec:
+    archive_path: Path
+    rank: int
+    label_mode: str | None = None
+    label_threshold: float | None = None
+
+
 def train_from_archive(
     archive_path: str | Path,
     data_path: str | Path = config.DATA_PATH,
@@ -45,6 +54,7 @@ def train_from_archive(
     test_start: str = config.TEST_START,
     test_end: str | None = config.TEST_END,
     label_mode: str = config.LABEL_MODE,
+    label_threshold: float = config.LABEL_THRESHOLD,
 ) -> Path:
     """Train one LightGBM model per selected individual and horizon."""
     config.validate_config()
@@ -61,7 +71,7 @@ def train_from_archive(
     labeled_df = add_binary_labels(
         raw_df,
         horizons=config.HOLDING_HORIZONS,
-        threshold=config.LABEL_THRESHOLD,
+        threshold=float(label_threshold),
         return_fn=config.get_label_return_fn(label_mode),
     )
     purge_bars = config.purge_bars_for_horizons(config.HOLDING_HORIZONS)
@@ -97,6 +107,7 @@ def train_from_archive(
             test_end=test_end,
             purge_bars=purge_bars,
             label_mode=label_mode,
+            label_threshold=float(label_threshold),
         ),
         "entries": [],
     }
@@ -113,6 +124,15 @@ def train_from_archive(
 
         entry_record: dict[str, Any] = {
             "rank": rank,
+            "entry_id": _entry_id(
+                archive_path=archive_path,
+                rank=rank,
+                label_mode=label_mode,
+                label_threshold=float(label_threshold),
+            ),
+            "archive": str(archive_path),
+            "label_mode": label_mode,
+            "label_threshold": float(label_threshold),
             "score": _json_safe(entry.get("score")),
             "generation": int(entry.get("generation", 0) or 0),
             "features": features,
@@ -141,6 +161,151 @@ def train_from_archive(
     return manifest_path
 
 
+def train_ensemble_from_specs(
+    specs: list[EnsembleIndividualSpec],
+    data_path: str | Path = config.DATA_PATH,
+    output_dir: str | Path = DEFAULT_MODEL_DIR,
+    run_name: str | None = None,
+    val_start: str = config.VAL_START,
+    test_start: str = config.TEST_START,
+    test_end: str | None = config.TEST_END,
+    default_label_mode: str = config.LABEL_MODE,
+    default_label_threshold: float = config.LABEL_THRESHOLD,
+) -> Path:
+    """Train one production model bundle from archive/rank specs."""
+    if len(specs) < 1:
+        raise ValueError("Need at least one ensemble individual spec.")
+    config.validate_config()
+    run_name = run_name or "crypto_ensemble"
+    model_dir = Path(output_dir) / _safe_name(run_name)
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Loading crypto data from %s", data_path)
+    raw_df = load_ohlcv(data_path)
+    purge_bars = config.purge_bars_for_horizons(config.HOLDING_HORIZONS)
+
+    logger.info("Building crypto feature matrix; quality filter uses default final train rows.")
+    default_labeled_df = add_binary_labels(
+        raw_df,
+        horizons=config.HOLDING_HORIZONS,
+        threshold=float(default_label_threshold),
+        return_fn=config.get_label_return_fn(default_label_mode),
+    )
+    default_train_df, _, _ = split_labeled_by_dates(
+        default_labeled_df,
+        val_start=val_start,
+        test_start=test_start,
+        test_end=test_end,
+        purge_bars=purge_bars,
+    )
+    feature_df = build_feature_frame(raw_df, quality_index=default_train_df.index)
+    feature_pool = selectable_features(feature_df)
+    feature_space = CryptoFeatureSpace(feature_df, feature_pool)
+
+    manifest: dict[str, Any] = {
+        "pipeline": "crypto_prod_train",
+        "manifest_version": 2,
+        "bundle_type": "individual_ensemble",
+        "data": str(data_path),
+        "run_name": run_name,
+        "model_dir": str(model_dir),
+        "config": _config_snapshot(
+            val_start=val_start,
+            test_start=test_start,
+            test_end=test_end,
+            purge_bars=purge_bars,
+            label_mode=str(default_label_mode).strip().lower(),
+            label_threshold=float(default_label_threshold),
+        ),
+        "entries": [],
+        "ensemble": {
+            "type": "all_entries",
+            "members": [],
+            "exit_horizon": int(max(config.HOLDING_HORIZONS)),
+        },
+    }
+
+    label_cache: dict[tuple[str, float], tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]] = {}
+    for spec in specs:
+        label_mode = str(spec.label_mode or default_label_mode).strip().lower()
+        label_threshold = (
+            float(spec.label_threshold)
+            if spec.label_threshold is not None
+            else float(default_label_threshold)
+        )
+        if label_mode not in config.LABEL_RETURN_FNS:
+            allowed = ", ".join(sorted(config.LABEL_RETURN_FNS))
+            raise ValueError(f"Unknown label mode {label_mode!r}. Allowed: {allowed}.")
+        cache_key = (label_mode, label_threshold)
+        if cache_key not in label_cache:
+            labeled_df = add_binary_labels(
+                raw_df,
+                horizons=config.HOLDING_HORIZONS,
+                threshold=label_threshold,
+                return_fn=config.get_label_return_fn(label_mode),
+            )
+            label_cache[cache_key] = split_labeled_by_dates(
+                labeled_df,
+                val_start=val_start,
+                test_start=test_start,
+                test_end=test_end,
+                purge_bars=purge_bars,
+            )
+        train_df, val_df, _test_df = label_cache[cache_key]
+
+        entry = _load_rank_entry(spec.archive_path, spec.rank)
+        features = _clean_features(entry)
+        rank = int(entry.get("rank", spec.rank) or spec.rank)
+        entry_id = _entry_id(
+            archive_path=spec.archive_path,
+            rank=rank,
+            label_mode=label_mode,
+            label_threshold=label_threshold,
+        )
+        logger.info(
+            "Training ensemble member %s | label=%s threshold=%.6f | features=%d",
+            entry_id,
+            label_mode,
+            label_threshold,
+            len(features),
+        )
+        entry_record: dict[str, Any] = {
+            "rank": rank,
+            "entry_id": entry_id,
+            "archive": str(spec.archive_path),
+            "label_mode": label_mode,
+            "label_threshold": label_threshold,
+            "score": _json_safe(entry.get("score")),
+            "generation": int(entry.get("generation", 0) or 0),
+            "features": features,
+            "models": [],
+        }
+        for horizon in config.HOLDING_HORIZONS:
+            model_record = _train_one_horizon(
+                rank=rank,
+                horizon=int(horizon),
+                features=features,
+                train_df=train_df,
+                val_df=val_df,
+                feature_space=feature_space,
+                model_dir=model_dir,
+                entry_id=entry_id,
+            )
+            model_record["label_mode"] = label_mode
+            model_record["label_threshold"] = label_threshold
+            entry_record["models"].append(model_record)
+        manifest["entries"].append(entry_record)
+        manifest["ensemble"]["members"].append(entry_id)
+
+    manifest_path = model_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(_json_safe(manifest), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    logger.info("Saved ensemble manifest: %s", manifest_path)
+    return manifest_path
+
+
 def _train_one_horizon(
     rank: int,
     horizon: int,
@@ -149,6 +314,7 @@ def _train_one_horizon(
     val_df: pd.DataFrame,
     feature_space: CryptoFeatureSpace,
     model_dir: Path,
+    entry_id: str | None = None,
 ) -> dict[str, Any]:
     label_col = f"label_h{horizon}"
     ret_col = f"future_return_h{horizon}"
@@ -172,7 +338,11 @@ def _train_one_horizon(
         else pd.Series(dtype=float)
     )
     val_trade_threshold = _top_prediction_threshold(val_pred)
-    model_name = f"rank_{rank:02d}_h{horizon}.txt"
+    model_name = (
+        f"{_safe_name(entry_id)}_h{horizon}.txt"
+        if entry_id
+        else f"rank_{rank:02d}_h{horizon}.txt"
+    )
     model_path = model_dir / model_name
     booster.save_model(str(model_path))
     logger.info(
@@ -251,6 +421,13 @@ def _load_archive_entries(path: Path) -> list[dict[str, Any]]:
     return [dict(entry) for entry in entries]
 
 
+def _load_rank_entry(path: Path, rank: int) -> dict[str, Any]:
+    entries = _filter_entries(_load_archive_entries(path), top=None, ranks=[int(rank)])
+    entry = dict(entries[0])
+    entry["_archive_path"] = str(path)
+    return entry
+
+
 def _filter_entries(
     entries: list[dict[str, Any]],
     top: int | None,
@@ -297,11 +474,12 @@ def _config_snapshot(
     test_end: str | None,
     purge_bars: int,
     label_mode: str,
+    label_threshold: float,
 ) -> dict[str, Any]:
     return {
         "horizons": list(config.HOLDING_HORIZONS),
         "label_mode": label_mode,
-        "label_threshold": float(config.LABEL_THRESHOLD),
+        "label_threshold": float(label_threshold),
         "val_start": val_start,
         "test_start": test_start,
         "test_end": test_end,
@@ -317,6 +495,22 @@ def _config_snapshot(
 def _safe_name(value: str) -> str:
     clean = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(value))
     return clean.strip("._") or "crypto_model"
+
+
+def _entry_id(
+    archive_path: Path,
+    rank: int,
+    label_mode: str,
+    label_threshold: float,
+) -> str:
+    return _safe_name(
+        f"{Path(archive_path).stem}_r{int(rank):02d}_{label_mode}_thr_"
+        f"{_threshold_token(float(label_threshold))}"
+    )
+
+
+def _threshold_token(value: float) -> str:
+    return f"{value * 100.0:.3f}pct".replace(".", "p").replace("-", "m")
 
 
 def _json_safe(value: Any) -> Any:
@@ -347,9 +541,50 @@ def _parse_ranks(values: list[str] | None) -> list[int] | None:
     return [int(value) for value in values]
 
 
+def _parse_ensemble_specs(values: list[str] | None) -> list[EnsembleIndividualSpec]:
+    if not values:
+        return []
+    specs: list[EnsembleIndividualSpec] = []
+    for raw_value in values:
+        value = str(raw_value).strip()
+        if not value:
+            continue
+        mode_text: str | None = None
+        threshold_text: str | None = None
+        if "#" in value:
+            parts = [part.strip() for part in value.split("#")]
+            if len(parts) not in {2, 3, 4}:
+                raise ValueError(
+                    "Invalid --ensemble-individual spec. Use "
+                    f"ARCHIVE#RANK[#MODE[#THRESHOLD]], got: {raw_value!r}"
+                )
+            path_text, rank_text = parts[0], parts[1]
+            if len(parts) >= 3 and parts[2]:
+                mode_text = parts[2]
+            if len(parts) >= 4 and parts[3]:
+                threshold_text = parts[3]
+        else:
+            raise ValueError(
+                "Invalid --ensemble-individual spec. Use ARCHIVE#RANK[#MODE[#THRESHOLD]], "
+                f"got: {raw_value!r}"
+            )
+        if mode_text is not None and mode_text not in config.LABEL_RETURN_FNS:
+            allowed = ", ".join(sorted(config.LABEL_RETURN_FNS))
+            raise ValueError(f"Invalid label mode {mode_text!r}. Allowed: {allowed}.")
+        specs.append(
+            EnsembleIndividualSpec(
+                archive_path=Path(path_text),
+                rank=int(rank_text),
+                label_mode=mode_text,
+                label_threshold=float(threshold_text) if threshold_text is not None else None,
+            )
+        )
+    return specs
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--archive", required=True, help="Crypto archive JSON path.")
+    parser.add_argument("--archive", default=None, help="Crypto archive JSON path.")
     parser.add_argument("--data", default=str(config.DATA_PATH), help="Crypto OHLCV CSV path.")
     parser.add_argument(
         "--out-dir",
@@ -368,6 +603,16 @@ def main() -> None:
         default=None,
         help="Train specific archive rank(s), for example --rank 1 3 10.",
     )
+    parser.add_argument(
+        "--ensemble-individual",
+        nargs="+",
+        default=None,
+        help=(
+            "Train a production ensemble bundle from specs "
+            "ARCHIVE#RANK[#MODE[#THRESHOLD]]. Example: "
+            "crypto/results/a.json#1#mfe#0.003 crypto/results/b.json#1#close_exit#0.001"
+        ),
+    )
     parser.add_argument("--val-start", default=config.VAL_START)
     parser.add_argument("--test-start", default=config.TEST_START)
     parser.add_argument("--test-end", default=config.TEST_END)
@@ -377,20 +622,43 @@ def main() -> None:
         default=config.LABEL_MODE,
         help=f"Label mode used when training production models. Default: {config.LABEL_MODE}.",
     )
+    parser.add_argument(
+        "--label-threshold",
+        type=float,
+        default=float(config.LABEL_THRESHOLD),
+        help=f"Label threshold used when training production models. Default: {config.LABEL_THRESHOLD}.",
+    )
     args = parser.parse_args()
 
-    manifest_path = train_from_archive(
-        archive_path=args.archive,
-        data_path=args.data,
-        output_dir=args.out_dir,
-        top=args.top,
-        ranks=_parse_ranks(args.rank),
-        run_name=args.run_name,
-        val_start=args.val_start,
-        test_start=args.test_start,
-        test_end=args.test_end,
-        label_mode=args.label_mode,
-    )
+    specs = _parse_ensemble_specs(args.ensemble_individual)
+    if specs:
+        manifest_path = train_ensemble_from_specs(
+            specs=specs,
+            data_path=args.data,
+            output_dir=args.out_dir,
+            run_name=args.run_name,
+            val_start=args.val_start,
+            test_start=args.test_start,
+            test_end=args.test_end,
+            default_label_mode=args.label_mode,
+            default_label_threshold=float(args.label_threshold),
+        )
+    else:
+        if not args.archive:
+            parser.error("--archive is required unless --ensemble-individual is provided.")
+        manifest_path = train_from_archive(
+            archive_path=args.archive,
+            data_path=args.data,
+            output_dir=args.out_dir,
+            top=args.top,
+            ranks=_parse_ranks(args.rank),
+            run_name=args.run_name,
+            val_start=args.val_start,
+            test_start=args.test_start,
+            test_end=args.test_end,
+            label_mode=args.label_mode,
+            label_threshold=float(args.label_threshold),
+        )
     logger.info("Done. Manifest: %s", manifest_path)
 
 

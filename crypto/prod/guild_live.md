@@ -106,6 +106,7 @@ Chay rank 1:
 python -m crypto.analyze `
   --archive crypto/results/crypto_btc_seed1_12h.json `
   --label-mode mfe `
+  --label-threshold 0.003 `
   --rank 1
 ```
 
@@ -141,6 +142,7 @@ Trong chart:
 - MFE: max favorable excursion, tuc muc high lon nhat trong horizon so voi entry.
 - Base MFE: ty le MFE baseline cua toan bo ngay.
 - Ensemble: chi trade khi cac horizon trong cung individual deu dong y.
+- `--label-threshold`: co the dung de analyze dung TP/label mong muon ma khong can sua `crypto/config.py`.
 
 ## 4. Train model production
 
@@ -176,6 +178,26 @@ python -m crypto.prod.train_model `
   --run-name crypto_btc_seed1_12h_r1_r5
 ```
 
+Train ensemble production tu nhieu individual nam o nhieu archive khac nhau:
+
+```powershell
+python -m crypto.prod.train_model `
+  --ensemble-individual `
+    "crypto/results/crypto_btc_mfe_seed1_12h.json#1#mfe#0.003" `
+    "crypto/results/crypto_btc_close_exit_seed1_12h.json#1#close_exit#0.001" `
+  --label-mode mfe `
+  --label-threshold 0.003 `
+  --run-name crypto_btc_ensemble_mfe_close_r1
+```
+
+Cu phap moi member:
+
+```text
+ARCHIVE#RANK[#MODE[#THRESHOLD]]
+```
+
+Neu bo `MODE/THRESHOLD`, member se dung mac dinh tu CLI `--label-mode` va `--label-threshold`.
+
 Output:
 
 ```text
@@ -193,6 +215,14 @@ crypto/prod/model/crypto_btc_seed1_12h/
 - threshold lay tu top prediction tren val
 - config snapshot
 
+Voi bundle ensemble, `manifest.json` co them:
+
+- `entry_id` cho moi individual.
+- `label_mode` va `label_threshold` rieng cua moi individual.
+- `ensemble.members`: danh sach member can dong thuan.
+
+Live backend se tao them `final_ensemble` trong `latest_prediction.json`. Trader se uu tien `final_ensemble`; neu co `final_ensemble` thi bot chi trade khi tat ca member trong ensemble deu dong thuan.
+
 ## 5. Chay live prediction local
 
 Backend se:
@@ -209,7 +239,7 @@ Chay mot lan:
 
 ```powershell
 python -m crypto.prod.live_backend `
-  --model-dir crypto/prod/model/crypto_btc_seed1_12h `
+  --model-dir crypto/prod/model/crypto_btc_ensemble_mfe_close_r1 `
   --data data/crypto/BTCUSDT_15m.csv `
   --out crypto/prod/live/latest_prediction.json
 ```
@@ -218,7 +248,7 @@ Chay loop moi nen:
 
 ```powershell
 python -m crypto.prod.live_backend `
-  --model-dir crypto/prod/model/crypto_btc_seed1_12h `
+  --model-dir crypto/prod/model/crypto_btc_ensemble_mfe_close_r1 `
   --data data/crypto/BTCUSDT_15m.csv `
   --out crypto/prod/live/latest_prediction.json `
   --loop `
@@ -350,6 +380,324 @@ python -m crypto.prod.trader `
 ```
 
 CLI override khong sua file `trade_config.py`; no chi ap dung cho process dang chay.
+
+## 9A. Chay live that voi final ensemble nhieu individuals
+
+Muc nay dung khi muon trade that voi nhieu individual nam o nhieu archive khac nhau. Flow se co 2 tang dong thuan:
+
+1. Trong moi individual: tat ca model horizon, vi du `h3` va `h5`, phai cung vuot threshold.
+2. Final ensemble: tat ca individual member phai cung co `ensemble_signal = true`.
+
+Neu `final_ensemble` ton tai trong `latest_prediction.json`, trader se uu tien no. Khi do bot chi trade neu:
+
+```text
+final_ensemble.ensemble_signal = true
+```
+
+### Buoc 1: Chon member ensemble
+
+Cu phap moi member:
+
+```text
+ARCHIVE#RANK[#LABEL_MODE[#LABEL_THRESHOLD]]
+```
+
+Vi du:
+
+```text
+crypto/results/crypto_btc_mfe_seed1_12h.json#1#mfe#0.003
+crypto/results/crypto_btc_close_exit_seed1_12h.json#1#close_exit#0.001
+```
+
+Y nghia:
+
+- File MFE lay rank 1, train lai voi label `mfe`, threshold `0.003`.
+- File close_exit lay rank 1, train lai voi label `close_exit`, threshold `0.001`.
+- Neu bo `LABEL_MODE/LABEL_THRESHOLD`, member se dung mac dinh tu CLI `--label-mode` va `--label-threshold`.
+
+### Buoc 2: Train production bundle
+
+Local PowerShell:
+
+```powershell
+cd D:\Evo_Finance
+
+python -m crypto.prod.train_model `
+  --ensemble-individual `
+    "crypto/results/crypto_btc_mfe_seed1_12h.json#1#mfe#0.003" `
+    "crypto/results/crypto_btc_close_exit_seed1_12h.json#1#close_exit#0.001" `
+  --label-mode mfe `
+  --label-threshold 0.003 `
+  --run-name crypto_btc_ensemble_mfe_close_r1
+```
+
+Linux/VM:
+
+```bash
+cd ~/Evo_Finance
+source .venv/bin/activate
+
+python -m crypto.prod.train_model \
+  --ensemble-individual \
+    "crypto/results/crypto_btc_mfe_seed1_12h.json#1#mfe#0.003" \
+    "crypto/results/crypto_btc_close_exit_seed1_12h.json#1#close_exit#0.001" \
+  --label-mode mfe \
+  --label-threshold 0.003 \
+  --run-name crypto_btc_ensemble_mfe_close_r1
+```
+
+Output:
+
+```text
+crypto/prod/model/crypto_btc_ensemble_mfe_close_r1/
+  manifest.json
+  crypto_btc_mfe_seed1_12h_r01_mfe_thr_0p300pct_h3.txt
+  crypto_btc_mfe_seed1_12h_r01_mfe_thr_0p300pct_h5.txt
+  crypto_btc_close_exit_seed1_12h_r01_close_exit_thr_0p100pct_h3.txt
+  crypto_btc_close_exit_seed1_12h_r01_close_exit_thr_0p100pct_h5.txt
+```
+
+Kiem tra nhanh manifest:
+
+```powershell
+Get-Content crypto/prod/model/crypto_btc_ensemble_mfe_close_r1/manifest.json
+```
+
+Can thay cac field:
+
+```text
+bundle_type = individual_ensemble
+ensemble.members = [...]
+entries[].label_mode
+entries[].label_threshold
+```
+
+### Buoc 3: Kiem tra tai khoan va Telegram
+
+```powershell
+python -m crypto.prod.trader --account-test --live
+python -m crypto.prod.trader --telegram-test
+```
+
+Ket qua `--account-test --live` can co:
+
+- `canTrade: true`
+- `symbol_status: TRADING`
+- USDT free >= `--quote-order-qty`
+
+### Buoc 4: Reset state truoc khi live
+
+Chi xoa state khi chac chan khong con vi the bot dang mo va khong co open order BTCUSDT tren Binance.
+
+PowerShell:
+
+```powershell
+cd D:\Evo_Finance
+Remove-Item crypto/prod/live/trade_state.json -ErrorAction SilentlyContinue
+```
+
+Linux/VM:
+
+```bash
+cd ~/Evo_Finance
+rm -f crypto/prod/live/trade_state.json
+```
+
+### Buoc 5: Terminal 1 - live backend
+
+Backend crawl data moi, tinh feature, chay tat ca model va tao `final_ensemble`.
+
+PowerShell:
+
+```powershell
+cd D:\Evo_Finance
+
+python -m crypto.prod.live_backend `
+  --model-dir crypto/prod/model/crypto_btc_ensemble_mfe_close_r1 `
+  --data data/crypto/BTCUSDT_15m.csv `
+  --out crypto/prod/live/latest_prediction.json `
+  --loop `
+  --sleep-after-open 5 `
+  --feature-lookback-bars 5000
+```
+
+Linux/VM:
+
+```bash
+tmux new -s live_backend
+cd ~/Evo_Finance
+source .venv/bin/activate
+
+python -m crypto.prod.live_backend \
+  --model-dir crypto/prod/model/crypto_btc_ensemble_mfe_close_r1 \
+  --data data/crypto/BTCUSDT_15m.csv \
+  --out crypto/prod/live/latest_prediction.json \
+  --loop \
+  --sleep-after-open 5 \
+  --feature-lookback-bars 5000 \
+  2>&1 | tee crypto/prod/live/live_backend.log
+```
+
+Sau khi backend chay xong moi nen, `latest_prediction.json` se co:
+
+```text
+entries[]
+final_ensemble
+final_ensemble.ensemble_signal
+```
+
+### Buoc 6: Terminal 2 - UI
+
+PowerShell:
+
+```powershell
+cd D:\Evo_Finance
+
+python -m crypto.prod.live.app `
+  --host 127.0.0.1 `
+  --port 8765 `
+  --prediction crypto/prod/live/latest_prediction.json `
+  --trade-state crypto/prod/live/trade_state.json `
+  --model-dir crypto/prod/model/crypto_btc_ensemble_mfe_close_r1
+```
+
+Linux/VM:
+
+```bash
+tmux new -s live_ui
+cd ~/Evo_Finance
+source .venv/bin/activate
+
+python -m crypto.prod.live.app \
+  --host 127.0.0.1 \
+  --port 8765 \
+  --prediction crypto/prod/live/latest_prediction.json \
+  --trade-state crypto/prod/live/trade_state.json \
+  --model-dir crypto/prod/model/crypto_btc_ensemble_mfe_close_r1
+```
+
+Mo local:
+
+```text
+http://127.0.0.1:8765
+```
+
+Neu UI chay tren VM, dung SSH tunnel:
+
+```powershell
+gcloud compute ssh evo-finance-crypto-live --zone asia-southeast1-a -- -L 8765:127.0.0.1:8765
+```
+
+### Buoc 7: Terminal 3 - trader dry-run truoc
+
+Nen chay dry-run it nhat vai nen de xem state co cap nhat dung khong.
+
+PowerShell:
+
+```powershell
+cd D:\Evo_Finance
+
+python -m crypto.prod.trader `
+  --prediction crypto/prod/live/latest_prediction.json `
+  --state crypto/prod/live/trade_state.json `
+  --loop `
+  --quote-order-qty 7
+```
+
+Linux/VM:
+
+```bash
+tmux new -s live_trader_dry
+cd ~/Evo_Finance
+source .venv/bin/activate
+
+python -m crypto.prod.trader \
+  --prediction crypto/prod/live/latest_prediction.json \
+  --state crypto/prod/live/trade_state.json \
+  --loop \
+  --quote-order-qty 7 \
+  2>&1 | tee crypto/prod/live/trader_dry.log
+```
+
+Dry-run khong gui lenh that len Binance.
+
+### Buoc 8: Terminal 3 - trader live that
+
+Chi chay khi:
+
+- `.env` da co Binance API key/secret.
+- `ALLOW_REAL_TRADING = True`.
+- Da test `--account-test --live`.
+- Khong co open order BTCUSDT thu cong.
+- Chap nhan rui ro that tien.
+
+PowerShell:
+
+```powershell
+cd D:\Evo_Finance
+
+python -m crypto.prod.trader `
+  --prediction crypto/prod/live/latest_prediction.json `
+  --state crypto/prod/live/trade_state.json `
+  --execute `
+  --live `
+  --loop `
+  --quote-order-qty 7
+```
+
+Linux/VM:
+
+```bash
+tmux new -s live_trader
+cd ~/Evo_Finance
+source .venv/bin/activate
+
+python -m crypto.prod.trader \
+  --prediction crypto/prod/live/latest_prediction.json \
+  --state crypto/prod/live/trade_state.json \
+  --execute \
+  --live \
+  --loop \
+  --quote-order-qty 7 \
+  2>&1 | tee crypto/prod/live/trader.log
+```
+
+`--quote-order-qty 7` override so USDT moi lenh cho process dang chay, khong sua `trade_config.py`.
+
+### Buoc 9: Theo doi khi dang live
+
+Xem prediction:
+
+```powershell
+Get-Content crypto/prod/live/latest_prediction.json
+```
+
+Xem state:
+
+```powershell
+Get-Content crypto/prod/live/trade_state.json
+```
+
+Tren VM:
+
+```bash
+tail -f crypto/prod/live/live_backend.log
+tail -f crypto/prod/live/trader.log
+tmux ls
+tmux attach -t live_backend
+tmux attach -t live_trader
+```
+
+Trang thai binh thuong:
+
+- `NO_SIGNAL`: chua co final ensemble trade.
+- `WAITING_ENTRY`: co signal nhung chua toi entry candle.
+- `TP_PLACED`: da mua va da dat LIMIT SELL TP.
+- `TP_FILLED`: TP da khop, bot san sang lenh moi.
+- `FINAL_SELL_PENDING`: toi deadline va bot da dat MARKET SELL thoat.
+- `FINAL_SELL_FILLED`: da thoat bang MARKET SELL.
+
+Neu `ERROR` hoac `requires_manual_check=true`, can kiem tra thu cong tren Binance truoc khi xoa state.
 
 ## 10. Chay 3 terminal local
 

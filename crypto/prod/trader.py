@@ -688,6 +688,9 @@ def _preflight_error(
 def _selected_signal_entry(prediction: dict[str, Any]) -> dict[str, Any] | None:
     if prediction.get("status") != "OK" or not prediction.get("can_trade"):
         return None
+    final_ensemble = prediction.get("final_ensemble")
+    if isinstance(final_ensemble, dict):
+        return final_ensemble if final_ensemble.get("ensemble_signal") is True else None
     for entry in prediction.get("entries", []):
         if entry.get("ensemble_signal") is True:
             return entry
@@ -719,6 +722,8 @@ def _base_state(
         "entry_candle_time": prediction.get("entry_candle_time"),
         "entry_open": prediction.get("entry_open"),
         "rank": selected_entry.get("rank") if selected_entry else None,
+        "entry_id": selected_entry.get("entry_id") if selected_entry else None,
+        "member_count": selected_entry.get("member_count") if selected_entry else None,
         "horizon": _max_horizon(selected_entry) if selected_entry else None,
     }
     if extra:
@@ -740,6 +745,8 @@ def _is_blocking_state(state: dict[str, Any]) -> bool:
 def _max_horizon(entry: dict[str, Any] | None) -> int | None:
     if not entry:
         return None
+    if entry.get("horizon") is not None:
+        return int(entry["horizon"])
     horizons = [int(item["horizon"]) for item in entry.get("predictions", []) if item.get("horizon")]
     return max(horizons) if horizons else None
 
@@ -854,9 +861,17 @@ def _save_state(path: Path, state: dict[str, Any]) -> dict[str, Any]:
 
 
 def _atomic_write_json(path: Path, payload: Any) -> None:
-    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    tmp_path.replace(path)
+    last_exc: PermissionError | None = None
+    for attempt in range(20):
+        try:
+            tmp_path.replace(path)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            time.sleep(0.05 * (attempt + 1))
+    raise last_exc if last_exc is not None else PermissionError(f"Could not replace {path}")
 
 
 def _maybe_notify_state(state: dict[str, Any], previous: dict[str, Any]) -> None:
@@ -908,6 +923,7 @@ def _telegram_event_key(state: dict[str, Any]) -> str | None:
         status,
         str(state.get("signal_time") or ""),
         str(state.get("entry_candle_time") or ""),
+        str(state.get("entry_id") or ""),
         str(state.get("rank") or ""),
         str(state.get("horizon") or ""),
         order_id,
@@ -926,7 +942,12 @@ def _telegram_message(state: dict[str, Any]) -> str:
         f"Signal: {state.get('signal_time')}",
         f"Entry candle: {state.get('entry_candle_time')}",
     ]
-    if state.get("rank") is not None:
+    if state.get("entry_id") == "final_ensemble":
+        lines.append(
+            f"Rank/Horizon: final ensemble ({state.get('member_count')} members) / "
+            f"h{state.get('horizon')}"
+        )
+    elif state.get("rank") is not None:
         lines.append(f"Rank/Horizon: {state.get('rank')} / h{state.get('horizon')}")
     if state.get("entry_open") is not None:
         lines.append(f"Entry open: {state.get('entry_open')}")

@@ -453,6 +453,7 @@ def _analyze_horizon(
         close_return=close_return,
         mfe=mfe,
         label_threshold=float(label_threshold),
+        pred_threshold=val_result.selected_pred_threshold,
     )
     return HorizonAnalysis(horizon=horizon, val=val_result, test=test_result)
 
@@ -495,6 +496,7 @@ def _split_prediction(
     close_return: pd.Series,
     mfe: pd.Series,
     label_threshold: float,
+    pred_threshold: float | None = None,
 ) -> SplitPrediction:
     data = (
         pd.DataFrame(
@@ -511,19 +513,25 @@ def _split_prediction(
     if data.empty:
         return _empty_split_prediction(split, data, label_threshold=float(label_threshold))
 
-    n_select = min(
-        len(data),
-        max(
-            int(config.MIN_TRADES_PER_SPLIT),
-            int(np.ceil(len(data) * float(config.TRADE_TOP_FRACTION))),
-        ),
-    )
-    selected = data.nlargest(n_select, "pred")
+    if pred_threshold is None:
+        n_select = min(
+            len(data),
+            max(
+                int(config.MIN_TRADES_PER_SPLIT),
+                int(np.ceil(len(data) * float(config.TRADE_TOP_FRACTION))),
+            ),
+        )
+        selected = data.nlargest(n_select, "pred")
+        selected_pred_threshold = float(selected["pred"].min()) if len(selected) else 0.0
+    else:
+        selected_pred_threshold = float(pred_threshold)
+        selected = data[data["pred"] >= selected_pred_threshold]
     return _split_prediction_from_data(
         split=split,
         data=data,
         selected=selected,
         label_threshold=float(label_threshold),
+        selected_pred_threshold=selected_pred_threshold,
     )
 
 
@@ -532,6 +540,7 @@ def _split_prediction_from_data(
     data: pd.DataFrame,
     selected: pd.DataFrame,
     label_threshold: float,
+    selected_pred_threshold: float | None = None,
 ) -> SplitPrediction:
     data = data.replace([np.inf, -np.inf], np.nan).dropna(
         subset=["label", "pred", "close_return", "mfe"]
@@ -545,7 +554,11 @@ def _split_prediction_from_data(
     chart_days = _unique_calendar_days(data.index)
     base_rate = float(data["label"].mean())
     precision = float(selected["label"].mean()) if len(selected) else 0.0
-    selected_pred_threshold = float(selected["pred"].min()) if len(selected) else 0.0
+    selected_pred_threshold = (
+        float(selected_pred_threshold)
+        if selected_pred_threshold is not None
+        else float(selected["pred"].min()) if len(selected) else 0.0
+    )
     threshold = float(label_threshold)
     baseline_mfe_hit_rate = _daily_baseline_mfe_hit_rate(data, threshold)
     return SplitPrediction(
@@ -792,7 +805,7 @@ def _plot_individual(
     feature_count = int(entry.get("n_features", len(entry.get("features", []))) or 0)
     fig.suptitle(
         f"Crypto rank {rank:02d} | score={score:.4f} | features={feature_count} | "
-        f"top={config.TRADE_TOP_FRACTION:.0%}",
+        f"val-threshold top={config.TRADE_TOP_FRACTION:.0%}",
         fontsize=13,
     )
     mode_name = _filename_token(label_mode)
@@ -839,7 +852,7 @@ def _plot_ensemble_individuals(
     member_text = ", ".join(_member_title(spec, entry) for spec, entry in zip(specs, entries))
     fig.suptitle(
         f"Crypto ensemble across individuals | {member_text} | "
-        f"top={config.TRADE_TOP_FRACTION:.0%}",
+        f"val-threshold top={config.TRADE_TOP_FRACTION:.0%}",
         fontsize=12,
     )
     mode_name = _filename_token(label_mode)
@@ -888,13 +901,13 @@ def _plot_metrics_table(ax: plt.Axes, result: HorizonAnalysis) -> None:
         "Split",
         "AUC",
         "Base",
-        "Top precision",
+        "Signal precision",
         "PE",
         "Threshold",
         f"MFE>{threshold_pct:.2f}%",
         "Base MFE",
         "Excess",
-        "Top MFE",
+        "Signal MFE",
         "Close",
         "Trades",
         "Trades/day",
@@ -954,9 +967,9 @@ def _plot_mfe_probability_table(ax: plt.Axes, result: HorizonAnalysis) -> None:
     thresholds = _mfe_probability_thresholds()
     columns = ["Group"] + [_fmt_threshold_pct(threshold) for threshold in thresholds]
     rows = [
-        ["val top"] + _mfe_probability_row(result.val.selected, thresholds),
+        ["val signal"] + _mfe_probability_row(result.val.selected, thresholds),
         ["val base"] + _mfe_probability_row(result.val.data, thresholds),
-        ["test top"] + _mfe_probability_row(result.test.selected, thresholds),
+        ["test signal"] + _mfe_probability_row(result.test.selected, thresholds),
         ["test base"] + _mfe_probability_row(result.test.data, thresholds),
     ]
     table = ax.table(
@@ -1052,7 +1065,7 @@ def _plot_daily_axis(ax: plt.Axes, result: HorizonAnalysis) -> None:
             markersize=2.5,
             linewidth=0.9,
             alpha=0.90,
-            label=f"{label} top MFE hit",
+            label=f"{label} signal MFE hit",
         )
         ax.plot(
             daily.index,

@@ -108,7 +108,7 @@ MAX_RETRY: int = 5
 
 # Fitness. RETURN_SCORE_SCALE normalizes mean trade return so that one metric
 # cannot dominate merely by being on a wider numerical scale.
-TRADE_TOP_FRACTION: float = 0.20
+TRADE_TOP_FRACTION: float = 0.30
 MIN_TRADES_PER_SPLIT: int = 20
 TRADE_COST: float = 0.002  # 0.1% breakeven cost per selected trade
 RETURN_SCORE_SCALE: float = 0.01
