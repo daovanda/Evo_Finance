@@ -18,7 +18,7 @@ RESULTS_DIR: Path = Path("crypto/results")
 DEFAULT_ARCHIVE_PATH: Path = RESULTS_DIR / "crypto_btc_archive.json"
 
 # Multi-horizon binary labels. Edit this list freely, for example [3, 7, 10, 20].
-HOLDING_HORIZONS: list[int] = [3, 5]
+HOLDING_HORIZONS: list[int] = [5]
 LABEL_THRESHOLD: float = 0.003  # label=1 when future_return > threshold
 LABEL_MODE: str = "mfe"  # "close_exit", "mfe", or "payoff"
 PAYOFF_TP: float = 0.003  # only used by LABEL_MODE="payoff"
@@ -136,6 +136,7 @@ MAX_RETRY: int = 5
 
 # Fitness. RETURN_SCORE_SCALE normalizes mean trade return so that one metric
 # cannot dominate merely by being on a wider numerical scale.
+FITNESS_HORIZON_MODE: str = "mean"  # "mean" keeps old behavior; "ensemble" requires all H signals
 TRADE_TOP_FRACTION: float = 0.1
 MIN_TRADES_PER_SPLIT: int = 20
 TRADE_COST: float = 0.002  # 0.2% breakeven round-trip cost per selected trade
@@ -204,6 +205,8 @@ def validate_config() -> None:
         raise ValueError("EXPR_MAX_ABS_QUANTILE must be positive.")
     if not 0 < TRADE_TOP_FRACTION <= 1:
         raise ValueError("TRADE_TOP_FRACTION must be in (0, 1].")
+    if FITNESS_HORIZON_MODE not in {"mean", "ensemble"}:
+        raise ValueError("FITNESS_HORIZON_MODE must be 'mean' or 'ensemble'.")
     if MIN_TRADES_PER_SPLIT < 1:
         raise ValueError("MIN_TRADES_PER_SPLIT must be positive.")
     if TRADE_COST < 0:

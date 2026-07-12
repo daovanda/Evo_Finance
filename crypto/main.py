@@ -254,6 +254,7 @@ def _save_archive(
             "label_mode": label_mode,
             "label_threshold": label_threshold,
             "payoff_tp": config.PAYOFF_TP,
+            "fitness_horizon_mode": config.FITNESS_HORIZON_MODE,
             "fitness": config.FITNESS_WEIGHTS,
             "trade_top_fraction": config.TRADE_TOP_FRACTION,
             "trade_cost": config.TRADE_COST,
@@ -281,6 +282,11 @@ def _validate_resume_metadata(
         ("horizons", [int(h) for h in metadata.get("horizons", [])], [int(h) for h in horizons]),
         ("label_mode", str(metadata.get("label_mode", "")).strip().lower(), label_mode),
         ("label_threshold", metadata.get("label_threshold"), float(label_threshold)),
+        (
+            "fitness_horizon_mode",
+            str(metadata.get("fitness_horizon_mode", "")).strip().lower(),
+            config.FITNESS_HORIZON_MODE,
+        ),
         ("trade_top_fraction", metadata.get("trade_top_fraction"), float(config.TRADE_TOP_FRACTION)),
         ("trade_cost", metadata.get("trade_cost"), float(config.TRADE_COST)),
     ]

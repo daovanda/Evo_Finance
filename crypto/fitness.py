@@ -49,6 +49,13 @@ class CryptoFitnessEvaluator:
         feature_data: CryptoFeatureSpace | pd.DataFrame,
     ) -> float:
         feature_space = _feature_space_for(individual, feature_data)
+        if config.FITNESS_HORIZON_MODE == "ensemble" and len(self.horizons) > 1:
+            return self._evaluate_walk_forward_ensemble(
+                individual=individual,
+                folds=folds,
+                feature_space=feature_space,
+            )
+
         fold_rows: list[dict[str, float]] = []
 
         for horizon in self.horizons:
@@ -131,6 +138,81 @@ class CryptoFitnessEvaluator:
         )
         return float(score)
 
+    def _evaluate_walk_forward_ensemble(
+        self,
+        individual: CryptoIndividual,
+        folds: list[CryptoFold],
+        feature_space: CryptoFeatureSpace,
+    ) -> float:
+        exit_horizon = int(max(self.horizons))
+        fold_rows: list[dict[str, float]] = []
+
+        for fold in folds:
+            row = self._evaluate_one_ensemble_fold(
+                individual=individual,
+                fold=fold,
+                feature_space=feature_space,
+                exit_horizon=exit_horizon,
+            )
+            if row is not None:
+                fold_rows.append(row)
+
+        if not fold_rows:
+            raise ValueError("No valid crypto ensemble fold metrics were produced.")
+
+        metrics_df = pd.DataFrame(fold_rows)
+        val_auc = metrics_df["val_auc"].astype(float)
+        auc_edge = float((val_auc - 0.5).mean())
+        precision_excess = float(metrics_df["val_precision_excess"].mean())
+        trade_return_score = float(metrics_df["val_trade_return_score"].mean())
+        auc_std = float(val_auc.std(ddof=0)) if len(val_auc) > 1 else 0.0
+        overfit_gap = float(metrics_df["overfit_gap"].mean())
+        bad_fold_ratio = float(metrics_df["bad_fold"].mean())
+
+        w = config.FITNESS_WEIGHTS
+        score = (
+            w["auc_edge"] * auc_edge
+            + w["precision_excess"] * precision_excess
+            + w["trade_return_score"] * trade_return_score
+            + w["auc_std"] * auc_std
+            + w["overfit_gap"] * overfit_gap
+            + w["bad_fold_ratio"] * bad_fold_ratio
+        )
+
+        individual.score = float(score)
+        individual.metrics = {
+            "score": float(score),
+            "fitness_horizon_mode": "ensemble",
+            "ensemble_exit_horizon": float(exit_horizon),
+            "mean_auc": float(val_auc.mean()),
+            "auc_edge": auc_edge,
+            "precision_at_trade": float(metrics_df["val_precision_at_trade"].mean()),
+            "base_rate": float(metrics_df["val_base_rate"].mean()),
+            "precision_excess": precision_excess,
+            "trade_return_mean": float(metrics_df["val_trade_return_mean"].mean()),
+            "trade_return_score": trade_return_score,
+            "auc_std": auc_std,
+            "overfit_gap": overfit_gap,
+            "bad_fold_ratio": bad_fold_ratio,
+            "n_fold_horizon_scores": float(len(metrics_df)),
+            "n_horizons": float(len(self.horizons)),
+            "ensemble_selected_rate": float(metrics_df["val_selected_rate"].mean()),
+        }
+        logger.info(
+            "Crypto WF ensemble fitness: score=%.4f | AUC=%.4f | "
+            "precision_excess=%.4f | ret_score=%.4f | std=%.4f | "
+            "gap=%.4f | bad=%.2f | folds=%d",
+            score,
+            individual.metrics["mean_auc"],
+            precision_excess,
+            trade_return_score,
+            auc_std,
+            overfit_gap,
+            bad_fold_ratio,
+            len(metrics_df),
+        )
+        return float(score)
+
     def evaluate_final(
         self,
         individual: CryptoIndividual,
@@ -146,6 +228,28 @@ class CryptoFitnessEvaluator:
         metrics are diagnostic fields saved into the JSON after evolution ends.
         """
         feature_space = _feature_space_for(individual, feature_data)
+        if config.FITNESS_HORIZON_MODE == "ensemble" and len(self.horizons) > 1:
+            metrics = self._evaluate_final_ensemble(
+                individual=individual,
+                train_df=train_df,
+                val_df=val_df,
+                test_df=test_df,
+                feature_space=feature_space,
+            )
+            individual.metrics.update(metrics)
+            logger.info(
+                "Crypto final ensemble: WF score=%.4f | val_auc=%.4f | "
+                "test_auc=%.4f | test_precision_excess=%.4f | "
+                "test_ret_score=%.4f | test_gap=%.4f",
+                float(individual.score) if individual.score is not None else float("nan"),
+                metrics["final_val_mean_auc"],
+                metrics["final_test_mean_auc"],
+                metrics["final_test_precision_excess"],
+                metrics["final_test_trade_return_score"],
+                metrics["final_test_overfit_gap"],
+            )
+            return metrics
+
         rows: list[dict[str, float]] = []
 
         for horizon in self.horizons:
@@ -238,6 +342,174 @@ class CryptoFitnessEvaluator:
         )
         return metrics
 
+    def _evaluate_final_ensemble(
+        self,
+        individual: CryptoIndividual,
+        train_df: pd.DataFrame,
+        val_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        feature_space: CryptoFeatureSpace,
+    ) -> dict[str, float]:
+        exit_horizon = int(max(self.horizons))
+        train_preds: list[pd.Series] = []
+        val_preds: list[pd.Series] = []
+        test_preds: list[pd.Series] = []
+        common_train_index: pd.Index | None = None
+        common_val_index: pd.Index | None = None
+        common_test_index: pd.Index | None = None
+
+        for horizon in self.horizons:
+            label_col = f"label_h{horizon}"
+            ret_col = f"future_return_h{horizon}"
+            train = _valid_labeled_frame(train_df, label_col, ret_col)
+            val = _valid_labeled_frame(val_df, label_col, ret_col)
+            test = _valid_labeled_frame(test_df, label_col, ret_col)
+            if train.empty or val.empty or test.empty:
+                continue
+
+            X_train = feature_space.matrix(individual.features, train.index)
+            X_val = feature_space.matrix(individual.features, val.index)
+            X_test = feature_space.matrix(individual.features, test.index)
+            y_train = train[label_col].astype(int)
+            y_val = val[label_col].astype(int)
+
+            if y_train.nunique() < 2 or y_val.nunique() < 2:
+                continue
+
+            booster = self._train_booster(X_train, y_train, X_val, y_val)
+            train_pred = pd.Series(
+                booster.predict(X_train),
+                index=train.index,
+                name=f"pred_h{horizon}",
+            )
+            val_pred = pd.Series(
+                booster.predict(X_val),
+                index=val.index,
+                name=f"pred_h{horizon}",
+            )
+            test_pred = pd.Series(
+                booster.predict(X_test),
+                index=test.index,
+                name=f"pred_h{horizon}",
+            )
+            train_preds.append(train_pred)
+            val_preds.append(val_pred)
+            test_preds.append(test_pred)
+            common_train_index = (
+                train.index
+                if common_train_index is None
+                else common_train_index.intersection(train.index)
+            )
+            common_val_index = (
+                val.index
+                if common_val_index is None
+                else common_val_index.intersection(val.index)
+            )
+            common_test_index = (
+                test.index
+                if common_test_index is None
+                else common_test_index.intersection(test.index)
+            )
+
+        if len(train_preds) != len(self.horizons):
+            raise ValueError("Could not train all horizon models for final ensemble.")
+
+        exit_label_col = f"label_h{exit_horizon}"
+        exit_ret_col = f"future_return_h{exit_horizon}"
+        train_exit = _valid_labeled_frame(train_df, exit_label_col, exit_ret_col)
+        val_exit = _valid_labeled_frame(val_df, exit_label_col, exit_ret_col)
+        test_exit = _valid_labeled_frame(test_df, exit_label_col, exit_ret_col)
+
+        train_pred_df, train_exit = _align_ensemble_predictions(
+            train_preds,
+            train_exit,
+            common_train_index,
+            exit_label_col,
+            exit_ret_col,
+        )
+        val_pred_df, val_exit = _align_ensemble_predictions(
+            val_preds,
+            val_exit,
+            common_val_index,
+            exit_label_col,
+            exit_ret_col,
+        )
+        test_pred_df, test_exit = _align_ensemble_predictions(
+            test_preds,
+            test_exit,
+            common_test_index,
+            exit_label_col,
+            exit_ret_col,
+        )
+        if train_pred_df.empty or val_pred_df.empty or test_pred_df.empty:
+            raise ValueError("No aligned rows for final ensemble metrics.")
+
+        train_metrics = _ensemble_trade_metrics(
+            y_true=train_exit[exit_label_col],
+            pred_df=train_pred_df,
+            future_return=train_exit[exit_ret_col],
+        )
+        val_thresholds = _ensemble_thresholds(val_pred_df)
+        val_metrics = _ensemble_trade_metrics(
+            y_true=val_exit[exit_label_col],
+            pred_df=val_pred_df,
+            future_return=val_exit[exit_ret_col],
+            thresholds=val_thresholds,
+        )
+        test_metrics = _ensemble_trade_metrics(
+            y_true=test_exit[exit_label_col],
+            pred_df=test_pred_df,
+            future_return=test_exit[exit_ret_col],
+            thresholds=val_thresholds,
+        )
+
+        return {
+            "final_horizon_mode": "ensemble",
+            "final_ensemble_exit_horizon": float(exit_horizon),
+            "final_n_horizon_scores": float(len(self.horizons)),
+            "final_train_rows": float(train_metrics.n_samples),
+            "final_val_rows": float(val_metrics.n_samples),
+            "final_test_rows": float(test_metrics.n_samples),
+            "final_val_mean_auc": float(val_metrics.auc),
+            "final_val_auc_edge": float(val_metrics.auc - 0.5),
+            "final_val_precision_at_trade": float(val_metrics.precision_at_trade),
+            "final_val_base_rate": float(val_metrics.base_rate),
+            "final_val_precision_excess": float(val_metrics.precision_excess),
+            "final_val_trade_return_mean": float(val_metrics.trade_return_mean),
+            "final_val_trade_return_score": float(val_metrics.trade_return_score),
+            "final_val_auc_std": 0.0,
+            "final_val_bad_ratio": float(
+                val_metrics.auc <= config.BAD_AUC_THRESHOLD
+                or val_metrics.precision_excess <= 0.0
+                or val_metrics.trade_return_score <= 0.0
+            ),
+            "final_test_mean_auc": float(test_metrics.auc),
+            "final_test_auc_edge": float(test_metrics.auc - 0.5),
+            "final_test_precision_at_trade": float(test_metrics.precision_at_trade),
+            "final_test_base_rate": float(test_metrics.base_rate),
+            "final_test_precision_excess": float(test_metrics.precision_excess),
+            "final_test_trade_return_mean": float(test_metrics.trade_return_mean),
+            "final_test_trade_return_score": float(test_metrics.trade_return_score),
+            "final_test_auc_std": 0.0,
+            "final_test_bad_ratio": float(
+                test_metrics.auc <= config.BAD_AUC_THRESHOLD
+                or test_metrics.precision_excess <= 0.0
+                or test_metrics.trade_return_score <= 0.0
+            ),
+            "final_val_overfit_gap": float(max(0.0, train_metrics.auc - val_metrics.auc)),
+            "final_test_overfit_gap": float(max(0.0, train_metrics.auc - test_metrics.auc)),
+            "final_val_selected_rate": (
+                float(val_metrics.n_trades / val_metrics.n_samples)
+                if val_metrics.n_samples
+                else 0.0
+            ),
+            "final_test_selected_rate": (
+                float(test_metrics.n_trades / test_metrics.n_samples)
+                if test_metrics.n_samples
+                else 0.0
+            ),
+        }
+
     def _evaluate_one_fold(
         self,
         individual: CryptoIndividual,
@@ -294,6 +566,114 @@ class CryptoFitnessEvaluator:
             "bad_fold": bad_fold,
             "val_n_samples": float(val_metrics.n_samples),
             "val_n_trades": float(val_metrics.n_trades),
+        }
+
+    def _evaluate_one_ensemble_fold(
+        self,
+        individual: CryptoIndividual,
+        fold: CryptoFold,
+        feature_space: CryptoFeatureSpace,
+        exit_horizon: int,
+    ) -> dict[str, float] | None:
+        train_preds: list[pd.Series] = []
+        val_preds: list[pd.Series] = []
+        common_train_index: pd.Index | None = None
+        common_val_index: pd.Index | None = None
+
+        for horizon in self.horizons:
+            label_col = f"label_h{horizon}"
+            ret_col = f"future_return_h{horizon}"
+            train = _valid_labeled_frame(fold.train_df, label_col, ret_col)
+            val = _valid_labeled_frame(fold.val_df, label_col, ret_col)
+            if train.empty or val.empty:
+                return None
+
+            X_train = feature_space.matrix(individual.features, train.index)
+            X_val = feature_space.matrix(individual.features, val.index)
+            y_train = train[label_col].astype(int)
+            y_val = val[label_col].astype(int)
+
+            if y_train.nunique() < 2 or y_val.nunique() < 2:
+                return None
+
+            booster = self._train_booster(X_train, y_train, X_val, y_val)
+            train_pred = pd.Series(
+                booster.predict(X_train),
+                index=train.index,
+                name=f"pred_h{horizon}",
+            )
+            val_pred = pd.Series(
+                booster.predict(X_val),
+                index=val.index,
+                name=f"pred_h{horizon}",
+            )
+            train_preds.append(train_pred)
+            val_preds.append(val_pred)
+            common_train_index = (
+                train.index
+                if common_train_index is None
+                else common_train_index.intersection(train.index)
+            )
+            common_val_index = (
+                val.index
+                if common_val_index is None
+                else common_val_index.intersection(val.index)
+            )
+
+        exit_label_col = f"label_h{exit_horizon}"
+        exit_ret_col = f"future_return_h{exit_horizon}"
+        train_exit = _valid_labeled_frame(fold.train_df, exit_label_col, exit_ret_col)
+        val_exit = _valid_labeled_frame(fold.val_df, exit_label_col, exit_ret_col)
+        common_train_index = common_train_index.intersection(train_exit.index) if common_train_index is not None else train_exit.index
+        common_val_index = common_val_index.intersection(val_exit.index) if common_val_index is not None else val_exit.index
+        if len(common_train_index) == 0 or len(common_val_index) == 0:
+            return None
+
+        train_pred_df = pd.concat(train_preds, axis=1).reindex(common_train_index).dropna()
+        val_pred_df = pd.concat(val_preds, axis=1).reindex(common_val_index).dropna()
+        train_exit = train_exit.reindex(train_pred_df.index).dropna(subset=[exit_label_col, exit_ret_col])
+        val_exit = val_exit.reindex(val_pred_df.index).dropna(subset=[exit_label_col, exit_ret_col])
+        train_pred_df = train_pred_df.reindex(train_exit.index)
+        val_pred_df = val_pred_df.reindex(val_exit.index)
+        if train_pred_df.empty or val_pred_df.empty:
+            return None
+
+        train_metrics = _ensemble_trade_metrics(
+            y_true=train_exit[exit_label_col],
+            pred_df=train_pred_df,
+            future_return=train_exit[exit_ret_col],
+        )
+        val_metrics = _ensemble_trade_metrics(
+            y_true=val_exit[exit_label_col],
+            pred_df=val_pred_df,
+            future_return=val_exit[exit_ret_col],
+        )
+
+        overfit_gap = max(0.0, train_metrics.auc - val_metrics.auc)
+        bad_fold = float(
+            val_metrics.auc <= config.BAD_AUC_THRESHOLD
+            or val_metrics.precision_excess <= 0.0
+            or val_metrics.trade_return_score <= 0.0
+            or val_metrics.n_trades <= 0
+        )
+        return {
+            "horizon": float(exit_horizon),
+            "train_auc": train_metrics.auc,
+            "val_auc": val_metrics.auc,
+            "val_precision_at_trade": val_metrics.precision_at_trade,
+            "val_base_rate": val_metrics.base_rate,
+            "val_precision_excess": val_metrics.precision_excess,
+            "val_trade_return_mean": val_metrics.trade_return_mean,
+            "val_trade_return_score": val_metrics.trade_return_score,
+            "overfit_gap": overfit_gap,
+            "bad_fold": bad_fold,
+            "val_n_samples": float(val_metrics.n_samples),
+            "val_n_trades": float(val_metrics.n_trades),
+            "val_selected_rate": (
+                float(val_metrics.n_trades / val_metrics.n_samples)
+                if val_metrics.n_samples
+                else 0.0
+            ),
         }
 
     def _evaluate_one_final_horizon(
@@ -472,6 +852,22 @@ def _feature_space_for(
     return CryptoFeatureSpace(feature_data, base_features)
 
 
+def _align_ensemble_predictions(
+    pred_series: list[pd.Series],
+    exit_frame: pd.DataFrame,
+    common_index: pd.Index | None,
+    label_col: str,
+    ret_col: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if common_index is None or len(pred_series) == 0:
+        return pd.DataFrame(), pd.DataFrame()
+    pred_df = pd.concat(pred_series, axis=1).reindex(common_index).dropna()
+    aligned_exit = exit_frame.reindex(pred_df.index).dropna(subset=[label_col, ret_col])
+    pred_df = pred_df.reindex(aligned_exit.index).dropna()
+    aligned_exit = aligned_exit.reindex(pred_df.index).dropna(subset=[label_col, ret_col])
+    return pred_df, aligned_exit
+
+
 def _classification_trade_metrics(
     y_true: pd.Series,
     pred: pd.Series,
@@ -509,6 +905,84 @@ def _classification_trade_metrics(
         n_samples=int(len(data)),
         n_trades=int(n_trades),
     )
+
+
+def _ensemble_trade_metrics(
+    y_true: pd.Series,
+    pred_df: pd.DataFrame,
+    future_return: pd.Series,
+    thresholds: dict[str, float] | None = None,
+) -> SplitMetrics:
+    data = (
+        pd.concat(
+            [
+                pd.Series(y_true, name="y"),
+                pd.Series(future_return, name="ret"),
+                pred_df,
+            ],
+            axis=1,
+        )
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
+    if data.empty:
+        return SplitMetrics(0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0)
+
+    pred_cols = [col for col in pred_df.columns if col in data.columns]
+    if not pred_cols:
+        return SplitMetrics(0.5, 0.0, 0.0, 0.0, 0.0, 0.0, len(data), 0)
+
+    y = data["y"].astype(int)
+    score = data[pred_cols].astype(float).mean(axis=1)
+    auc = _binary_auc(y, score)
+    base_rate = float(y.mean())
+    selected_mask = pd.Series(True, index=data.index)
+    selected_thresholds = thresholds or _ensemble_thresholds(data[pred_cols])
+    for col in pred_cols:
+        threshold = selected_thresholds.get(col)
+        if threshold is None:
+            selected_mask &= False
+        else:
+            selected_mask &= data[col].astype(float) >= float(threshold)
+
+    traded = data[selected_mask]
+    precision = float(traded["y"].mean()) if len(traded) else 0.0
+    net_return = traded["ret"].astype(float) - float(config.TRADE_COST)
+    trade_return_mean = float(net_return.mean()) if len(net_return) else 0.0
+    trade_return_score = float(
+        np.clip(trade_return_mean / float(config.RETURN_SCORE_SCALE), -1.0, 1.0)
+    )
+    return SplitMetrics(
+        auc=float(auc),
+        precision_at_trade=precision,
+        base_rate=base_rate,
+        precision_excess=precision - base_rate,
+        trade_return_mean=trade_return_mean,
+        trade_return_score=trade_return_score,
+        n_samples=int(len(data)),
+        n_trades=int(len(traded)),
+    )
+
+
+def _ensemble_thresholds(pred_df: pd.DataFrame) -> dict[str, float]:
+    thresholds: dict[str, float] = {}
+    for col in pred_df.columns:
+        pred = (
+            pd.to_numeric(pred_df[col], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+        )
+        if pred.empty:
+            continue
+        n_select = min(
+            len(pred),
+            max(
+                int(config.MIN_TRADES_PER_SPLIT),
+                int(np.ceil(len(pred) * config.TRADE_TOP_FRACTION)),
+            ),
+        )
+        thresholds[str(col)] = float(pred.nlargest(n_select).min())
+    return thresholds
 
 
 def _internal_early_stop_split(
