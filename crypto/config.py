@@ -21,7 +21,7 @@ DEFAULT_ARCHIVE_PATH: Path = RESULTS_DIR / "crypto_btc_archive.json"
 HOLDING_HORIZONS: list[int] = [5]
 LABEL_THRESHOLD: float = 0.003  # label=1 when future_return > threshold
 LABEL_MODE: str = "mfe"  # "close_exit", "mfe", or "payoff"
-PAYOFF_TP: float = 0.003  # only used by LABEL_MODE="payoff"
+PAYOFF_TP: float = 0.004  # only used by LABEL_MODE="payoff"
 
 
 def close_exit_future_return(df: Any, horizon: int) -> Any:
