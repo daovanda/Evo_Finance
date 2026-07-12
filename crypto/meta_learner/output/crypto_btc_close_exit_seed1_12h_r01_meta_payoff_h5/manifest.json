@@ -1,0 +1,220 @@
+{
+  "pipeline": "crypto_meta_learner",
+  "archive": "crypto\\results\\crypto_btc_close_exit_seed1_12h.json",
+  "rank": 1,
+  "score": -0.21793082731639382,
+  "generation": 28,
+  "data": "data\\crypto\\BTCUSDT_15m.csv",
+  "run_name": "crypto_btc_close_exit_seed1_12h_r01_meta_payoff_h5",
+  "output_dir": "crypto\\meta_learner\\output\\crypto_btc_close_exit_seed1_12h_r01_meta_payoff_h5",
+  "model_path": "crypto\\meta_learner\\output\\crypto_btc_close_exit_seed1_12h_r01_meta_payoff_h5\\meta_model.txt",
+  "dataset_path": "crypto\\meta_learner\\output\\crypto_btc_close_exit_seed1_12h_r01_meta_payoff_h5\\meta_dataset.csv",
+  "holdout_predictions_path": "crypto\\meta_learner\\output\\crypto_btc_close_exit_seed1_12h_r01_meta_payoff_h5\\meta_holdout_predictions.csv",
+  "final_val_predictions_path": "crypto\\meta_learner\\output\\crypto_btc_close_exit_seed1_12h_r01_meta_payoff_h5\\final_val_predictions.csv",
+  "final_test_predictions_path": "crypto\\meta_learner\\output\\crypto_btc_close_exit_seed1_12h_r01_meta_payoff_h5\\final_test_predictions.csv",
+  "chart_path": "crypto\\meta_learner\\output\\crypto_btc_close_exit_seed1_12h_r01_meta_payoff_h5\\meta_summary.png",
+  "base": {
+    "label_mode": "close_exit",
+    "label_threshold": 0.001,
+    "horizons": [
+      3,
+      5
+    ],
+    "trade_top_fraction": 0.3,
+    "min_trades_per_split": 20
+  },
+  "meta": {
+    "label_mode": "payoff",
+    "label_threshold": 0.002,
+    "exit_horizon": 5,
+    "signals_only": true,
+    "feature_cols": [
+      "pred_h3",
+      "threshold_h3",
+      "margin_h3",
+      "pred_h5",
+      "threshold_h5",
+      "margin_h5",
+      "pred_mean",
+      "pred_std",
+      "margin_min",
+      "margin_mean",
+      "signal_count",
+      "vol_regime_z_50",
+      "range_pct_mean_14",
+      "realized_vol_z_120",
+      "buy_pressure_mean_10",
+      "signed_volume_sum_ratio_50",
+      "taker_buy_base_volume_ratio_14",
+      "quote_volume_proxy_log_delta_40",
+      "ret_close_20"
+    ],
+    "context_features": [
+      "vol_regime_z_50",
+      "range_pct_mean_14",
+      "realized_vol_z_120",
+      "buy_pressure_mean_10",
+      "signed_volume_sum_ratio_50",
+      "taker_buy_base_volume_ratio_14",
+      "quote_volume_proxy_log_delta_40",
+      "ret_close_20"
+    ],
+    "missing_context_features": [],
+    "valid_fraction": 0.2,
+    "final_val_start": "2024-01-01",
+    "final_test_start": "2025-01-01",
+    "final_test_end": null
+  },
+  "folds": [
+    {
+      "name": "wf_01",
+      "train_rows": 104748,
+      "val_rows": 17337,
+      "val_start": "2021-01-01 00:00:00",
+      "val_end": "2021-07-01 00:00:00"
+    },
+    {
+      "name": "wf_02",
+      "train_rows": 122085,
+      "val_rows": 17638,
+      "val_start": "2021-07-01 00:00:00",
+      "val_end": "2022-01-01 00:00:00"
+    },
+    {
+      "name": "wf_03",
+      "train_rows": 139723,
+      "val_rows": 17376,
+      "val_start": "2022-01-01 00:00:00",
+      "val_end": "2022-07-01 00:00:00"
+    },
+    {
+      "name": "wf_04",
+      "train_rows": 157099,
+      "val_rows": 17664,
+      "val_start": "2022-07-01 00:00:00",
+      "val_end": "2023-01-01 00:00:00"
+    },
+    {
+      "name": "wf_05",
+      "train_rows": 174763,
+      "val_rows": 17371,
+      "val_start": "2023-01-01 00:00:00",
+      "val_end": "2023-07-01 00:00:00"
+    },
+    {
+      "name": "wf_06",
+      "train_rows": 192134,
+      "val_rows": 17664,
+      "val_start": "2023-07-01 00:00:00",
+      "val_end": "2024-01-01 00:00:00"
+    },
+    {
+      "name": "wf_07",
+      "train_rows": 209798,
+      "val_rows": 17472,
+      "val_start": "2024-01-01 00:00:00",
+      "val_end": "2024-07-01 00:00:00"
+    },
+    {
+      "name": "wf_08",
+      "train_rows": 227270,
+      "val_rows": 17664,
+      "val_start": "2024-07-01 00:00:00",
+      "val_end": "2025-01-01 00:00:00"
+    }
+  ],
+  "features": [
+    "clip(quote_volume_proxy_log_delta_7)",
+    "ts_corr(trade_size_base_ratio_30, trade_size_quote_log_delta_7, 20)",
+    "q75((signed_volume_sum_ratio_14 / taker_buy_base_volume_log_delta_120), 14)",
+    "range_pct_mean_14",
+    "(vol_regime_z_14 - ts_corr(trade_size_base_ratio_30, trade_size_quote_log_delta_7, 20))",
+    "buy_pressure_mean_10",
+    "rolling_logret_mean_120",
+    "taker_buy_quote_volume_log_delta_120",
+    "trade_count_ratio_480",
+    "rolling_logret_mean_400",
+    "realized_vol_z_480",
+    "volatility_x_buy_pressure_120",
+    "taker_buy_base_volume_log_z_20",
+    "trade_size_base_log_delta_320",
+    "(ret_close_20 * (vol_regime_z_14 * buy_pressure_negative_ratio_50))"
+  ],
+  "metrics": {
+    "oof": {
+      "before_meta": {
+        "rows": 34932,
+        "base_rate": 0.6863907019351884,
+        "net_return_mean": -0.0017406791332890959
+      },
+      "train": {
+        "auc": 0.6834221864187948,
+        "base_rate": 0.6920021470746108,
+        "precision_at_trade": 0.8504293893129771,
+        "precision_excess": 0.15842724223836624,
+        "trade_threshold": 0.7527520371091847,
+        "n_samples": 27945,
+        "n_trades": 8384,
+        "net_return_mean": -0.0012868560610165018
+      },
+      "holdout": {
+        "auc": 0.6210465452336736,
+        "base_rate": 0.6639473307571203,
+        "precision_at_trade": 0.7739628040057225,
+        "precision_excess": 0.11001547324860217,
+        "trade_threshold": 0.7282969720839634,
+        "n_samples": 6987,
+        "n_trades": 2097,
+        "net_return_mean": -0.0015760474745010506
+      },
+      "rows_total": 34932,
+      "rows_train": 27945,
+      "rows_holdout": 6987,
+      "best_iteration": 115
+    },
+    "final": {
+      "val": {
+        "before_meta": {
+          "rows": 9091,
+          "base_rate": 0.6736332636673633,
+          "net_return_mean": -0.0018363869823457004
+        },
+        "after_meta": {
+          "auc": 0.6260006379779138,
+          "base_rate": 0.6736332636673633,
+          "trade_threshold": 0.7357223715191915,
+          "n_samples": 9091,
+          "n_trades": 2728,
+          "precision_at_trade": 0.7848240469208211,
+          "precision_excess": 0.11119078325345777,
+          "net_return_mean": -0.0016358223236634755,
+          "selected_rows": 2728,
+          "selected_rate": 0.3000769992300077,
+          "selected_net_return_mean": -0.0016358223236634755,
+          "selected_precision": 0.7848240469208211
+        }
+      },
+      "test": {
+        "before_meta": {
+          "rows": 14036,
+          "base_rate": 0.621758335708179,
+          "net_return_mean": -0.001978977490256032
+        },
+        "after_meta": {
+          "auc": 0.6083246389513965,
+          "base_rate": 0.621758335708179,
+          "trade_threshold": 0.7357223715191915,
+          "n_samples": 14036,
+          "n_trades": 1897,
+          "precision_at_trade": 0.7891407485503427,
+          "precision_excess": 0.1673824128421637,
+          "net_return_mean": -0.0016726344026984012,
+          "selected_rows": 1897,
+          "selected_rate": 0.13515246508976916,
+          "selected_net_return_mean": -0.0016726344026984012,
+          "selected_precision": 0.7891407485503427
+        }
+      }
+    }
+  }
+}
