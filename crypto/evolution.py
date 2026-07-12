@@ -45,9 +45,14 @@ class CryptoIndividual:
 
 
 class CryptoArchive:
-    def __init__(self, max_size: int = config.ARCHIVE_SIZE):
+    def __init__(
+        self,
+        max_size: int = config.ARCHIVE_SIZE,
+        metadata: dict[str, Any] | None = None,
+    ):
         self.max_size = int(max_size)
         self._entries: list[CryptoIndividual] = []
+        self.metadata: dict[str, Any] = dict(metadata or {})
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -132,8 +137,11 @@ class CryptoArchive:
 
     @classmethod
     def load(cls, path: str | Path, max_size: int = config.ARCHIVE_SIZE) -> "CryptoArchive":
-        archive = cls(max_size=max_size)
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        archive = cls(
+            max_size=max_size,
+            metadata=payload.get("metadata", {}) if isinstance(payload, dict) else {},
+        )
         entries = payload.get("entries", payload if isinstance(payload, list) else [])
         for row in entries:
             metrics = _flatten_loaded_metrics(row)

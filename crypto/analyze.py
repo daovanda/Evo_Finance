@@ -82,6 +82,17 @@ class EnsembleIndividualSpec:
     label_threshold: float | None = None
 
 
+def _resolve_spec_label_threshold(
+    spec: EnsembleIndividualSpec,
+    default_label_threshold: float,
+) -> float:
+    if spec.label_threshold is not None:
+        return float(spec.label_threshold)
+    if spec.label_mode is not None:
+        return config.default_label_threshold(spec.label_mode)
+    return float(default_label_threshold)
+
+
 def analyze(
     archive_path: str | Path,
     data_path: str | Path = config.DATA_PATH,
@@ -92,7 +103,7 @@ def analyze(
     test_start: str = config.TEST_START,
     test_end: str | None = config.TEST_END,
     label_mode: str = config.LABEL_MODE,
-    label_threshold: float = config.LABEL_THRESHOLD,
+    label_threshold: float | None = None,
 ) -> list[Path]:
     entries = _filter_entries(_load_archive_entries(Path(archive_path)), top=top, ranks=ranks)
     output_path = Path(output_dir)
@@ -101,11 +112,13 @@ def analyze(
     logger.info("Loading crypto data from %s", data_path)
     raw_df = load_ohlcv(data_path)
     label_mode = str(label_mode).strip().lower()
+    label_threshold = config.default_label_threshold(label_mode, label_threshold)
     labeled_df = add_binary_labels(
         raw_df,
         horizons=config.HOLDING_HORIZONS,
-        threshold=float(label_threshold),
+        threshold=label_threshold,
         return_fn=config.get_label_return_fn(label_mode),
+        label_mode=label_mode,
     )
     purge_bars = config.purge_bars_for_horizons(config.HOLDING_HORIZONS)
     train_df, val_df, test_df = split_labeled_by_dates(
@@ -129,6 +142,10 @@ def analyze(
     feature_space = CryptoFeatureSpace(feature_df, feature_pool)
     mfe_by_horizon = {
         int(horizon): _max_high_return(raw_df, int(horizon))
+        for horizon in config.HOLDING_HORIZONS
+    }
+    path_by_horizon = {
+        int(horizon): _horizon_path_returns(raw_df, int(horizon))
         for horizon in config.HOLDING_HORIZONS
     }
     close_return_by_horizon = {
@@ -155,6 +172,7 @@ def analyze(
                 test_df=test_df,
                 feature_space=feature_space,
                 mfe=mfe_by_horizon[int(horizon)],
+                path_returns=path_by_horizon[int(horizon)],
                 close_return=close_return_by_horizon[int(horizon)],
                 label_threshold=float(label_threshold),
             )
@@ -188,7 +206,7 @@ def analyze_ensemble_individuals(
     test_start: str = config.TEST_START,
     test_end: str | None = config.TEST_END,
     label_mode: str = config.LABEL_MODE,
-    label_threshold: float = config.LABEL_THRESHOLD,
+    label_threshold: float | None = None,
 ) -> Path:
     if len(specs) < 2:
         raise ValueError("Need at least two --ensemble-individual specs.")
@@ -199,11 +217,13 @@ def analyze_ensemble_individuals(
     logger.info("Loading crypto data from %s", data_path)
     raw_df = load_ohlcv(data_path)
     label_mode = str(label_mode).strip().lower()
+    label_threshold = config.default_label_threshold(label_mode, label_threshold)
     labeled_df = add_binary_labels(
         raw_df,
         horizons=config.HOLDING_HORIZONS,
-        threshold=float(label_threshold),
+        threshold=label_threshold,
         return_fn=config.get_label_return_fn(label_mode),
+        label_mode=label_mode,
     )
     purge_bars = config.purge_bars_for_horizons(config.HOLDING_HORIZONS)
     train_df, val_df, test_df = split_labeled_by_dates(
@@ -229,6 +249,10 @@ def analyze_ensemble_individuals(
         int(horizon): _max_high_return(raw_df, int(horizon))
         for horizon in config.HOLDING_HORIZONS
     }
+    path_by_horizon = {
+        int(horizon): _horizon_path_returns(raw_df, int(horizon))
+        for horizon in config.HOLDING_HORIZONS
+    }
     close_return_by_horizon = {
         int(horizon): _close_exit_return(raw_df, int(horizon))
         for horizon in config.HOLDING_HORIZONS
@@ -239,6 +263,7 @@ def analyze_ensemble_individuals(
         split_df=val_df,
         horizon=exit_horizon,
         mfe=mfe_by_horizon[exit_horizon],
+        path_returns=path_by_horizon[exit_horizon],
         close_return=close_return_by_horizon[exit_horizon],
         label_threshold=float(label_threshold),
     )
@@ -247,6 +272,7 @@ def analyze_ensemble_individuals(
         split_df=test_df,
         horizon=exit_horizon,
         mfe=mfe_by_horizon[exit_horizon],
+        path_returns=path_by_horizon[exit_horizon],
         close_return=close_return_by_horizon[exit_horizon],
         label_threshold=float(label_threshold),
     )
@@ -258,11 +284,7 @@ def analyze_ensemble_individuals(
         entry = _load_rank_entry(spec.archive_path, spec.rank)
         individual = _entry_to_individual(entry)
         member_label_mode = str(spec.label_mode or label_mode).strip().lower()
-        member_label_threshold = (
-            float(spec.label_threshold)
-            if spec.label_threshold is not None
-            else float(label_threshold)
-        )
+        member_label_threshold = _resolve_spec_label_threshold(spec, float(label_threshold))
         if member_label_mode == label_mode and member_label_threshold == float(label_threshold):
             member_train_df, member_val_df, member_test_df = train_df, val_df, test_df
         else:
@@ -271,6 +293,7 @@ def analyze_ensemble_individuals(
                 horizons=config.HOLDING_HORIZONS,
                 threshold=member_label_threshold,
                 return_fn=config.get_label_return_fn(member_label_mode),
+                label_mode=member_label_mode,
             )
             member_train_df, member_val_df, member_test_df = split_labeled_by_dates(
                 member_labeled_df,
@@ -297,6 +320,7 @@ def analyze_ensemble_individuals(
                 test_df=member_test_df,
                 feature_space=feature_space,
                 mfe=mfe_by_horizon[int(horizon)],
+                path_returns=path_by_horizon[int(horizon)],
                 close_return=close_return_by_horizon[int(horizon)],
                 label_threshold=member_label_threshold,
             )
@@ -328,16 +352,25 @@ def analyze_ensemble_individuals(
     if len(individual_ensembles) < 2:
         raise ValueError("Fewer than two individual horizon ensembles were available.")
 
-    final_ensemble = _build_ensemble_of_ensembles(
+    final_ensemble_and = _build_ensemble_of_ensembles(
         individual_ensembles,
         reference_val=reference_val,
         reference_test=reference_test,
         label_mode=label_mode,
         label_threshold=float(label_threshold),
+        selection="and",
+    )
+    final_ensemble_or = _build_ensemble_of_ensembles(
+        individual_ensembles,
+        reference_val=reference_val,
+        reference_test=reference_test,
+        label_mode=label_mode,
+        label_threshold=float(label_threshold),
+        selection="or",
     )
     path = _plot_ensemble_individuals(
         sections=individual_ensembles,
-        final_ensemble=final_ensemble,
+        final_ensembles=[final_ensemble_and, final_ensemble_or],
         output_dir=output_path,
         specs=active_specs,
         entries=active_entries,
@@ -411,6 +444,7 @@ def _analyze_horizon(
     test_df: pd.DataFrame,
     feature_space: CryptoFeatureSpace,
     mfe: pd.Series,
+    path_returns: pd.DataFrame,
     close_return: pd.Series,
     label_threshold: float,
 ) -> HorizonAnalysis | None:
@@ -444,6 +478,7 @@ def _analyze_horizon(
         pred=val_pred,
         close_return=close_return,
         mfe=mfe,
+        path_returns=path_returns,
         label_threshold=float(label_threshold),
     )
     test_result = _split_prediction(
@@ -452,6 +487,7 @@ def _analyze_horizon(
         pred=test_pred,
         close_return=close_return,
         mfe=mfe,
+        path_returns=path_returns,
         label_threshold=float(label_threshold),
         pred_threshold=val_result.selected_pred_threshold,
     )
@@ -495,10 +531,11 @@ def _split_prediction(
     pred: pd.Series,
     close_return: pd.Series,
     mfe: pd.Series,
+    path_returns: pd.DataFrame | None,
     label_threshold: float,
     pred_threshold: float | None = None,
 ) -> SplitPrediction:
-    data = (
+    pieces = [
         pd.DataFrame(
             {
                 "label": y_true,
@@ -507,8 +544,13 @@ def _split_prediction(
                 "mfe": mfe.reindex(pred.index),
             }
         )
+    ]
+    if path_returns is not None and not path_returns.empty:
+        pieces.append(path_returns.reindex(pred.index))
+    data = (
+        pd.concat(pieces, axis=1)
         .replace([np.inf, -np.inf], np.nan)
-        .dropna()
+        .dropna(subset=["label", "pred", "close_return", "mfe"])
     )
     if data.empty:
         return _empty_split_prediction(split, data, label_threshold=float(label_threshold))
@@ -645,6 +687,7 @@ def _ensemble_split_prediction(
     split: str,
     split_results: list[SplitPrediction],
     exit_split: SplitPrediction,
+    selection: str = "and",
 ) -> SplitPrediction:
     if not split_results or exit_split.data.empty:
         return _empty_split_prediction(
@@ -653,14 +696,17 @@ def _ensemble_split_prediction(
             label_threshold=exit_split.label_threshold,
         )
 
-    common_index: pd.Index | None = None
+    selected_index: pd.Index | None = None
     for result in split_results:
-        selected_index = pd.Index(result.selected.index)
-        common_index = selected_index if common_index is None else common_index.intersection(
-            selected_index
-        )
-    if common_index is None:
-        common_index = pd.Index([])
+        current_index = pd.Index(result.selected.index)
+        if selected_index is None:
+            selected_index = current_index
+        elif str(selection).lower() == "or":
+            selected_index = selected_index.union(current_index)
+        else:
+            selected_index = selected_index.intersection(current_index)
+    if selected_index is None:
+        selected_index = pd.Index([])
 
     data = exit_split.data.copy()
     pred_frame = pd.concat(
@@ -669,7 +715,7 @@ def _ensemble_split_prediction(
     )
     data["pred"] = pred_frame.mean(axis=1)
     data = data.dropna(subset=["pred"])
-    selected = data.reindex(data.index.intersection(common_index)).dropna()
+    selected = data.reindex(data.index.intersection(selected_index)).dropna()
     return _split_prediction_from_data(
         split=split,
         data=data,
@@ -684,25 +730,29 @@ def _build_ensemble_of_ensembles(
     reference_test: SplitPrediction,
     label_mode: str,
     label_threshold: float,
+    selection: str = "and",
 ) -> HorizonAnalysis:
     if len(individual_ensembles) < 2:
         raise ValueError("Need at least two individual ensembles.")
     ordered = sorted(individual_ensembles, key=lambda item: _analysis_label(item))
     labels = " + ".join(_analysis_label(item) for item in ordered)
+    selection_name = "OR" if str(selection).lower() == "or" else "AND"
     return HorizonAnalysis(
         horizon=max(int(item.horizon) for item in ordered),
         val=_ensemble_split_prediction(
             split="val",
             split_results=[item.val for item in ordered],
             exit_split=reference_val,
+            selection=selection,
         ),
         test=_ensemble_split_prediction(
             split="test",
             split_results=[item.test for item in ordered],
             exit_split=reference_test,
+            selection=selection,
         ),
         label=(
-            f"ensemble of individuals ({labels}) | "
+            f"ensemble of individuals {selection_name} ({labels}) | "
             f"eval={label_mode} thr={float(label_threshold):.4g}"
         ),
     )
@@ -713,6 +763,7 @@ def _reference_split_prediction(
     split_df: pd.DataFrame,
     horizon: int,
     mfe: pd.Series,
+    path_returns: pd.DataFrame,
     close_return: pd.Series,
     label_threshold: float,
 ) -> SplitPrediction:
@@ -720,13 +771,19 @@ def _reference_split_prediction(
     ret_col = f"future_return_h{horizon}"
     frame = _valid_frame(split_df, label_col, ret_col)
     data = (
-        pd.DataFrame(
-            {
-                "label": frame[label_col].astype(int),
-                "pred": 0.0,
-                "close_return": close_return.reindex(frame.index),
-                "mfe": mfe.reindex(frame.index),
-            }
+        pd.concat(
+            [
+                pd.DataFrame(
+                    {
+                        "label": frame[label_col].astype(int),
+                        "pred": 0.0,
+                        "close_return": close_return.reindex(frame.index),
+                        "mfe": mfe.reindex(frame.index),
+                    }
+                ),
+                path_returns.reindex(frame.index),
+            ],
+            axis=1,
         )
         .replace([np.inf, -np.inf], np.nan)
         .dropna(subset=["label", "pred", "close_return", "mfe"])
@@ -763,6 +820,18 @@ def _max_high_return(raw_df: pd.DataFrame, horizon: int) -> pd.Series:
     return (max_high / entry - 1.0).replace([np.inf, -np.inf], np.nan)
 
 
+def _horizon_path_returns(raw_df: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    data = raw_df.sort_index()
+    entry = pd.to_numeric(data["open"], errors="coerce").shift(-1)
+    high = pd.to_numeric(data["high"], errors="coerce")
+    low = pd.to_numeric(data["low"], errors="coerce")
+    columns: dict[str, pd.Series] = {}
+    for step in range(1, int(horizon) + 1):
+        columns[f"high_h{step}"] = high.shift(-step) / entry - 1.0
+        columns[f"low_h{step}"] = low.shift(-step) / entry - 1.0
+    return pd.DataFrame(columns, index=data.index).replace([np.inf, -np.inf], np.nan)
+
+
 def _close_exit_return(raw_df: pd.DataFrame, horizon: int) -> pd.Series:
     data = raw_df.sort_index()
     entry = pd.to_numeric(data["open"], errors="coerce").shift(-1)
@@ -783,31 +852,15 @@ def _plot_individual(
     sections = list(horizons)
     if ensemble is not None:
         sections.append(ensemble)
-    nrows = len(sections) * 3
-    fig, axes = plt.subplots(
-        nrows=nrows,
-        ncols=1,
-        figsize=(16, max(8.5, 6.4 * len(sections))),
-        sharex=False,
-        constrained_layout=True,
-        gridspec_kw={"height_ratios": [0.95, 2.8, 1.55] * len(sections)},
-    )
-    if nrows == 1:
-        axes = [axes]
-    axes = list(np.ravel(axes))
-
-    for idx, result in enumerate(sections):
-        row_base = idx * 3
-        _plot_metrics_table(axes[row_base], result)
-        _plot_daily_axis(axes[row_base + 1], result)
-        _plot_mfe_probability_table(axes[row_base + 2], result)
-
     feature_count = int(entry.get("n_features", len(entry.get("features", []))) or 0)
-    fig.suptitle(
-        f"Crypto rank {rank:02d} | score={score:.4f} | features={feature_count} | "
-        f"val-threshold top={config.TRADE_TOP_FRACTION:.0%}",
-        fontsize=13,
-    )
+    section_titles = [
+        (
+            f"rank {rank:02d} | {_analysis_label(result)} | "
+            f"mode={label_mode} | thr={float(label_threshold):.4g} | "
+            f"score={score:.4f} | features={feature_count}"
+        )
+        for result in sections
+    ]
     mode_name = _filename_token(label_mode)
     threshold_name = _threshold_filename_token(float(label_threshold))
     filename = (
@@ -815,46 +868,27 @@ def _plot_individual(
         f"thr_{threshold_name}.png"
     )
     path = output_dir / filename
-    fig.savefig(path, dpi=140)
-    plt.close(fig)
+    _plot_sections_vertical(sections=sections, section_titles=section_titles, path=path)
     return path
 
 
 def _plot_ensemble_individuals(
     sections: list[HorizonAnalysis],
-    final_ensemble: HorizonAnalysis,
+    final_ensembles: list[HorizonAnalysis],
     output_dir: Path,
     specs: list[EnsembleIndividualSpec],
     entries: list[dict[str, Any]],
     label_mode: str = config.LABEL_MODE,
     label_threshold: float = config.LABEL_THRESHOLD,
 ) -> Path:
-    all_sections = list(sections) + [final_ensemble]
-    nrows = len(all_sections) * 3
-    fig, axes = plt.subplots(
-        nrows=nrows,
-        ncols=1,
-        figsize=(16, max(8.5, 6.4 * len(all_sections))),
-        sharex=False,
-        constrained_layout=True,
-        gridspec_kw={"height_ratios": [0.95, 2.8, 1.55] * len(all_sections)},
-    )
-    if nrows == 1:
-        axes = [axes]
-    axes = list(np.ravel(axes))
-
-    for idx, result in enumerate(all_sections):
-        row_base = idx * 3
-        _plot_metrics_table(axes[row_base], result)
-        _plot_daily_axis(axes[row_base + 1], result)
-        _plot_mfe_probability_table(axes[row_base + 2], result)
-
-    member_text = ", ".join(_member_title(spec, entry) for spec, entry in zip(specs, entries))
-    fig.suptitle(
-        f"Crypto ensemble across individuals | {member_text} | "
-        f"val-threshold top={config.TRADE_TOP_FRACTION:.0%}",
-        fontsize=12,
-    )
+    all_sections = list(sections) + list(final_ensembles)
+    section_titles = [
+        _member_section_title(spec, entry)
+        for spec, entry in zip(specs, entries)
+    ] + [
+        _final_ensemble_section_title(label_mode, label_threshold, selection)
+        for selection in ["AND", "OR"][: len(final_ensembles)]
+    ]
     mode_name = _filename_token(label_mode)
     threshold_name = _threshold_filename_token(float(label_threshold))
     member_name = "_".join(_member_filename_token(spec) for spec in specs)
@@ -863,9 +897,56 @@ def _plot_ensemble_individuals(
         f"thr_{threshold_name}.png"
     )
     path = output_dir / filename
+    _plot_sections_vertical(sections=all_sections, section_titles=section_titles, path=path)
+    return path
+
+
+def _plot_sections_vertical(
+    sections: list[HorizonAnalysis],
+    section_titles: list[str],
+    path: Path,
+) -> None:
+    rows_per_section = 5
+    nrows = len(sections) * rows_per_section
+    height_ratios = [0.34, 2.30, 0.92, 1.55, 3.20] * len(sections)
+    fig = plt.figure(
+        figsize=(20, max(8.5, 8.05 * len(sections))),
+        constrained_layout=True,
+    )
+    gs = fig.add_gridspec(
+        nrows=nrows,
+        ncols=1,
+        height_ratios=height_ratios,
+    )
+
+    for idx, result in enumerate(sections):
+        row_base = idx * rows_per_section
+        title = section_titles[idx] if idx < len(section_titles) else _analysis_label(result)
+        _plot_section_title(fig.add_subplot(gs[row_base]), title)
+        _plot_daily_axis(fig.add_subplot(gs[row_base + 1]), result)
+        _plot_metrics_table(fig.add_subplot(gs[row_base + 2]), result)
+        _plot_mfe_probability_table(fig.add_subplot(gs[row_base + 3]), result)
+        _plot_path_profile_table(
+            fig.add_subplot(gs[row_base + 4]),
+            result,
+        )
+
     fig.savefig(path, dpi=140)
     plt.close(fig)
-    return path
+
+
+def _plot_section_title(ax: plt.Axes, title: str) -> None:
+    ax.axis("off")
+    ax.text(
+        0.0,
+        0.5,
+        title,
+        transform=ax.transAxes,
+        ha="left",
+        va="center",
+        fontsize=10,
+        weight="bold",
+    )
 
 
 def _member_ensemble_label(
@@ -874,8 +955,40 @@ def _member_ensemble_label(
     label_threshold: float,
 ) -> str:
     return (
-        f"{spec.archive_path.stem} rank {spec.rank:02d} h-ensemble "
-        f"[{label_mode}, thr={float(label_threshold):.4g}]"
+        f"{spec.archive_path.stem} | rank {spec.rank:02d} | "
+        f"mode={label_mode} | thr={float(label_threshold):.4g}"
+    )
+
+
+def _member_section_title(spec: EnsembleIndividualSpec, entry: dict[str, Any]) -> str:
+    score = entry.get("score")
+    score_text = ""
+    if score is not None:
+        try:
+            score_text = f" | score={float(score):.4f}"
+        except (TypeError, ValueError):
+            score_text = f" | score={score}"
+    mode_text = spec.label_mode or config.LABEL_MODE
+    threshold_text = (
+        float(spec.label_threshold)
+        if spec.label_threshold is not None
+        else float(config.default_label_threshold(mode_text))
+    )
+    return (
+        f"{spec.archive_path.stem} | rank {spec.rank:02d} | "
+        f"mode={mode_text} | thr={threshold_text:.4g}{score_text}"
+    )
+
+
+def _final_ensemble_section_title(
+    label_mode: str,
+    label_threshold: float,
+    selection: str = "AND",
+) -> str:
+    return (
+        f"final ensemble {selection} | mode={label_mode} | "
+        f"thr={float(label_threshold):.4g} | "
+        f"val-threshold top={config.TRADE_TOP_FRACTION:.0%}"
     )
 
 
@@ -935,12 +1048,6 @@ def _plot_metrics_table(ax: plt.Axes, result: HorizonAnalysis) -> None:
             cell.set_facecolor("#fff4e6")
         if col == 0 and row > 0:
             cell.set_text_props(weight="bold")
-    ax.set_title(
-        f"{_analysis_label(result)} final val/test metrics",
-        loc="left",
-        fontsize=10,
-        pad=2,
-    )
 
 
 def _metrics_table_row(split_name: str, split: SplitPrediction) -> list[str]:
@@ -962,46 +1069,331 @@ def _metrics_table_row(split_name: str, split: SplitPrediction) -> list[str]:
     ]
 
 
+def _plot_path_profile_table(ax: plt.Axes, result: HorizonAnalysis) -> None:
+    ax.axis("off")
+    val_frame = result.val.selected
+    test_frame = result.test.selected
+    steps = _path_steps(val_frame, test_frame)
+    if not steps:
+        ax.text(
+            0.0,
+            0.95,
+            "Signal path",
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8,
+        )
+        ax.text(
+            0.0,
+            0.45,
+            "No path columns available",
+            transform=ax.transAxes,
+            ha="left",
+            va="center",
+            fontsize=8,
+        )
+        return
+
+    _draw_path_table(
+        ax,
+        rows=_path_profile_split_rows(val_frame, test_frame, steps),
+        columns=["Group"] + [f"H{step}" for step in steps],
+        bbox=[0.0, 0.49, 1.0, 0.42],
+        title="Signal path",
+        title_y=0.98,
+    )
+    _draw_path_summary_table(
+        ax,
+        rows=_path_summary_metric_rows(val_frame, test_frame, steps),
+        bbox=[0.0, 0.00, 1.0, 0.41],
+    )
+
+
+def _path_summary_metric_rows(
+    val_frame: pd.DataFrame,
+    test_frame: pd.DataFrame,
+    steps: list[int],
+) -> list[list[str]]:
+    val_mid_neg_high_all = _path_mid_h1_max_high_ratio(
+        val_frame, steps=steps, high_threshold=-0.001, mid_positive=False
+    )
+    test_mid_neg_high_all = _path_mid_h1_max_high_ratio(
+        test_frame, steps=steps, high_threshold=-0.001, mid_positive=False
+    )
+    val_mid_pos_high_all = _path_mid_h1_max_high_ratio(
+        val_frame, steps=steps, high_threshold=0.003, mid_positive=True
+    )
+    test_mid_pos_high_all = _path_mid_h1_max_high_ratio(
+        test_frame, steps=steps, high_threshold=0.003, mid_positive=True
+    )
+    val_win_mid = _path_h1_mid_ratio(val_frame, label_value=1, positive=True)
+    test_win_mid = _path_h1_mid_ratio(test_frame, label_value=1, positive=True)
+    val_lost_mid = _path_h1_mid_ratio(val_frame, label_value=0, positive=False)
+    test_lost_mid = _path_h1_mid_ratio(test_frame, label_value=0, positive=False)
+    val_mid_neg = _path_h1_mid_all_ratio(val_frame, positive=False)
+    test_mid_neg = _path_h1_mid_all_ratio(test_frame, positive=False)
+    return [
+        ["Mid_H1_Neg_High_All_H_Val_01", _fmt_optional_pct(val_mid_neg_high_all)],
+        ["Mid_H1_Neg_High_All_H_Test_01", _fmt_optional_pct(test_mid_neg_high_all)],
+        ["Mid_H1_Pos_High_All_H_Val_03", _fmt_optional_pct(val_mid_pos_high_all)],
+        ["Mid_H1_Pos_High_All_H_Test_03", _fmt_optional_pct(test_mid_pos_high_all)],
+        ["H1_mid_neg_val", _fmt_optional_pct(val_mid_neg)],
+        ["H1_mid_neg_test", _fmt_optional_pct(test_mid_neg)],
+        ["H1_mid_win_val_pos", _fmt_optional_pct(val_win_mid)],
+        ["H1_mid_win_test_pos", _fmt_optional_pct(test_win_mid)],
+        ["H1_mid_lost_val_neg", _fmt_optional_pct(val_lost_mid)],
+        ["H1_mid_lost_test_neg", _fmt_optional_pct(test_lost_mid)],
+    ]
+
+
+def _path_mid_h1_max_high_ratio(
+    frame: pd.DataFrame,
+    steps: list[int],
+    high_threshold: float,
+    mid_positive: bool,
+) -> float | None:
+    if frame is None or frame.empty or not steps:
+        return None
+    future_steps = [step for step in steps if int(step) >= 2]
+    if not future_steps:
+        return None
+    high_cols = list(dict.fromkeys(f"high_h{step}" for step in future_steps))
+    required = list(dict.fromkeys(["high_h1", "low_h1"] + high_cols))
+    if any(column not in frame.columns for column in required):
+        return None
+    values = (
+        frame[required]
+        .apply(pd.to_numeric, errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
+    if values.empty:
+        return None
+    mid_h1 = (values["high_h1"] + values["low_h1"]) / 2.0
+    subset = values[mid_h1 > 0] if mid_positive else values[mid_h1 < 0]
+    if subset.empty:
+        return None
+    max_high = subset[high_cols].max(axis=1)
+    return float((max_high > float(high_threshold)).mean())
+
+
+def _path_h1_mid_ratio(
+    frame: pd.DataFrame,
+    label_value: int,
+    positive: bool,
+) -> float | None:
+    subset = _path_label_subset(frame, label_value)
+    if subset.empty or "high_h1" not in subset.columns or "low_h1" not in subset.columns:
+        return None
+    values = (
+        subset[["high_h1", "low_h1"]]
+        .apply(pd.to_numeric, errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
+    if values.empty:
+        return None
+    mid = (values["high_h1"] + values["low_h1"]) / 2.0
+    mask = mid > 0 if positive else mid < 0
+    return float(mask.mean()) if len(mask) else None
+
+
+def _path_h1_mid_all_ratio(
+    frame: pd.DataFrame,
+    positive: bool,
+) -> float | None:
+    if frame is None or frame.empty or "high_h1" not in frame.columns or "low_h1" not in frame.columns:
+        return None
+    values = (
+        frame[["high_h1", "low_h1"]]
+        .apply(pd.to_numeric, errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
+    if values.empty:
+        return None
+    mid = (values["high_h1"] + values["low_h1"]) / 2.0
+    mask = mid > 0 if positive else mid < 0
+    return float(mask.mean()) if len(mask) else None
+
+
+def _path_label_subset(frame: pd.DataFrame, label_value: int) -> pd.DataFrame:
+    if frame is None or frame.empty or "label" not in frame.columns:
+        return pd.DataFrame()
+    label = pd.to_numeric(frame["label"], errors="coerce")
+    return frame[label == int(label_value)]
+
+
+def _fmt_optional_pct(value: float | None) -> str:
+    if value is None or not np.isfinite(value):
+        return "n/a"
+    return _fmt_pct(float(value))
+
+
+def _path_steps(*frames: pd.DataFrame) -> list[int]:
+    steps: set[int] = set()
+    for frame in frames:
+        if frame is None or frame.empty:
+            continue
+        for column in frame.columns:
+            text = str(column)
+            if text.startswith("high_h"):
+                try:
+                    steps.add(int(text.removeprefix("high_h")))
+                except ValueError:
+                    continue
+    return sorted(steps)
+
+
+def _path_profile_split_rows(
+    val_frame: pd.DataFrame,
+    test_frame: pd.DataFrame,
+    steps: list[int],
+) -> list[list[str]]:
+    return [
+        ["High_win_val"] + _path_profile_values(val_frame, steps, prefix="high", label_value=1),
+        ["Low_win_val"] + _path_profile_values(val_frame, steps, prefix="low", label_value=1),
+        ["High_lost_val"] + _path_profile_values(val_frame, steps, prefix="high", label_value=0),
+        ["Low_lost_val"] + _path_profile_values(val_frame, steps, prefix="low", label_value=0),
+        ["High_win_test"] + _path_profile_values(test_frame, steps, prefix="high", label_value=1),
+        ["Low_win_test"] + _path_profile_values(test_frame, steps, prefix="low", label_value=1),
+        ["High_lost_test"] + _path_profile_values(test_frame, steps, prefix="high", label_value=0),
+        ["Low_lost_test"] + _path_profile_values(test_frame, steps, prefix="low", label_value=0),
+    ]
+
+
+def _path_profile_values(
+    frame: pd.DataFrame,
+    steps: list[int],
+    prefix: str,
+    label_value: int,
+) -> list[str]:
+    if frame.empty or "label" not in frame.columns:
+        return ["n/a" for _ in steps]
+    label = pd.to_numeric(frame["label"], errors="coerce")
+    subset = frame[label == int(label_value)]
+    if subset.empty:
+        return ["n/a" for _ in steps]
+
+    values: list[str] = []
+    for step in steps:
+        column = f"{prefix}_h{step}"
+        if column not in subset.columns:
+            values.append("n/a")
+            continue
+        series = (
+            pd.to_numeric(subset[column], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+        )
+        values.append(_fmt_pct(float(series.mean()), signed=True) if len(series) else "n/a")
+    return values
+
+
+def _draw_path_table(
+    ax: plt.Axes,
+    rows: list[list[str]],
+    columns: list[str],
+    bbox: list[float],
+    title: str,
+    title_y: float,
+) -> None:
+    ax.text(
+        bbox[0],
+        title_y,
+        title,
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8.2,
+    )
+    table = ax.table(
+        cellText=rows,
+        colLabels=columns,
+        bbox=bbox,
+        cellLoc="center",
+        colLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(6.2)
+    table.scale(1.0, 1.0)
+    for (row, col), cell in table.get_celld().items():
+        cell.set_linewidth(0.30)
+        if row == 0:
+            cell.set_facecolor("#222831")
+            cell.set_text_props(color="white", weight="bold")
+        elif row in {1, 2, 5, 6}:
+            cell.set_facecolor("#eef5ff")
+        elif row in {3, 4, 7, 8}:
+            cell.set_facecolor("#fff4e6")
+        if col == 0 and row > 0:
+            cell.set_text_props(weight="bold")
+
+
+def _draw_path_summary_table(
+    ax: plt.Axes,
+    rows: list[list[str]],
+    bbox: list[float],
+) -> None:
+    table = ax.table(
+        cellText=rows,
+        colLabels=["Metric", "Value"],
+        bbox=bbox,
+        cellLoc="center",
+        colLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(7.2)
+    table.scale(1.0, 1.0)
+    for (row, col), cell in table.get_celld().items():
+        cell.set_linewidth(0.30)
+        if row == 0:
+            cell.set_facecolor("#222831")
+            cell.set_text_props(color="white", weight="bold")
+        elif row in {1, 2, 5, 6}:
+            cell.set_facecolor("#eef5ff")
+        else:
+            cell.set_facecolor("#fff4e6")
+        if col == 0 and row > 0:
+            cell.set_text_props(weight="bold")
+
+
 def _plot_mfe_probability_table(ax: plt.Axes, result: HorizonAnalysis) -> None:
     ax.axis("off")
     thresholds = _mfe_probability_thresholds()
     columns = ["Group"] + [_fmt_threshold_pct(threshold) for threshold in thresholds]
     rows = [
         ["val signal"] + _mfe_probability_row(result.val.selected, thresholds),
+        ["val miss close"] + _mfe_miss_close_row(result.val.selected, thresholds),
+        ["E val"] + _mfe_expected_net_row(result.val.selected, thresholds),
         ["val base"] + _mfe_probability_row(result.val.data, thresholds),
         ["test signal"] + _mfe_probability_row(result.test.selected, thresholds),
+        ["test miss close"] + _mfe_miss_close_row(result.test.selected, thresholds),
+        ["E test"] + _mfe_expected_net_row(result.test.selected, thresholds),
         ["test base"] + _mfe_probability_row(result.test.data, thresholds),
     ]
     table = ax.table(
         cellText=rows,
         colLabels=columns,
-        bbox=[0.0, 0.02, 1.0, 0.76],
+        bbox=[0.0, 0.0, 1.0, 1.0],
         cellLoc="center",
         colLoc="center",
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(6.6)
-    table.scale(1.0, 1.18)
+    table.set_fontsize(5.4)
+    table.scale(1.0, 1.02)
     for (row, col), cell in table.get_celld().items():
         cell.set_linewidth(0.30)
         if row == 0:
             cell.set_facecolor("#222831")
             cell.set_text_props(color="white", weight="bold")
-        elif row in {1, 2}:
+        elif row in {1, 2, 3, 4}:
             cell.set_facecolor("#eef5ff")
-        elif row in {3, 4}:
+        elif row in {5, 6, 7, 8}:
             cell.set_facecolor("#fff4e6")
         if col == 0 and row > 0:
             cell.set_text_props(weight="bold")
-    ax.text(
-        0.0,
-        0.98,
-        f"{_analysis_label(result)} P(MFE > x) by threshold",
-        transform=ax.transAxes,
-        ha="left",
-        va="top",
-        fontsize=9,
-    )
 
 
 def _mfe_probability_thresholds() -> list[float]:
@@ -1021,6 +1413,58 @@ def _mfe_probability_row(frame: pd.DataFrame, thresholds: list[float]) -> list[s
     if mfe.empty:
         return ["0.00%" for _ in thresholds]
     return [_fmt_pct(float((mfe > threshold).mean())) for threshold in thresholds]
+
+
+def _mfe_miss_close_row(frame: pd.DataFrame, thresholds: list[float]) -> list[str]:
+    if frame.empty or "mfe" not in frame.columns or "close_return" not in frame.columns:
+        return ["n/a" for _ in thresholds]
+    data = (
+        pd.DataFrame(
+            {
+                "mfe": pd.to_numeric(frame["mfe"], errors="coerce"),
+                "close_return": pd.to_numeric(frame["close_return"], errors="coerce"),
+            }
+        )
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna(subset=["mfe", "close_return"])
+    )
+    if data.empty:
+        return ["n/a" for _ in thresholds]
+
+    values: list[str] = []
+    for threshold in thresholds:
+        miss = data[data["mfe"] <= threshold]
+        if miss.empty:
+            values.append("n/a")
+        else:
+            values.append(_fmt_pct(float(miss["close_return"].mean()), signed=True))
+    return values
+
+
+def _mfe_expected_net_row(frame: pd.DataFrame, thresholds: list[float]) -> list[str]:
+    if frame.empty or "mfe" not in frame.columns or "close_return" not in frame.columns:
+        return ["n/a" for _ in thresholds]
+    data = (
+        pd.DataFrame(
+            {
+                "mfe": pd.to_numeric(frame["mfe"], errors="coerce"),
+                "close_return": pd.to_numeric(frame["close_return"], errors="coerce"),
+            }
+        )
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna(subset=["mfe", "close_return"])
+    )
+    if data.empty:
+        return ["n/a" for _ in thresholds]
+
+    values: list[str] = []
+    trade_cost = float(config.TRADE_COST)
+    for threshold in thresholds:
+        hit = data["mfe"] > threshold
+        gross = np.where(hit.to_numpy(), float(threshold), data["close_return"].to_numpy())
+        expected_net = float(np.mean(gross)) - trade_cost
+        values.append(_fmt_pct(expected_net, signed=True))
+    return values
 
 
 def _fmt_threshold_pct(value: float) -> str:
@@ -1047,8 +1491,6 @@ def _fmt_pct(value: float, signed: bool = False) -> str:
 
 
 def _plot_daily_axis(ax: plt.Axes, result: HorizonAnalysis) -> None:
-    threshold_pct = float(result.val.label_threshold) * 100.0
-    label_prefix = _analysis_label(result)
     twin = ax.twinx()
     for split_result, color, label in [
         (result.val, "#1f77b4", "val"),
@@ -1090,15 +1532,10 @@ def _plot_daily_axis(ax: plt.Axes, result: HorizonAnalysis) -> None:
             label=f"{label} trades",
         )
 
-    ax.set_ylabel(f"{label_prefix} hit rate %")
+    ax.set_ylabel("hit rate %")
     twin.set_ylabel("trades/day")
     ax.set_ylim(0.0, 100.0)
     ax.grid(True, alpha=0.25)
-    ax.set_title(
-        f"{label_prefix} daily MFE>{threshold_pct:.2f}% rate vs baseline and trade count",
-        loc="left",
-        fontsize=9,
-    )
     lines, labels = ax.get_legend_handles_labels()
     twin_lines, twin_labels = twin.get_legend_handles_labels()
     ax.legend(lines + twin_lines, labels + twin_labels, loc="upper right", fontsize=8, ncol=3)
@@ -1245,8 +1682,11 @@ def main() -> None:
     parser.add_argument(
         "--label-threshold",
         type=float,
-        default=float(config.LABEL_THRESHOLD),
-        help=f"Label threshold used when recalculating labels. Default: {config.LABEL_THRESHOLD}.",
+        default=None,
+        help=(
+            "Label threshold used when recalculating labels. Default is "
+            "LABEL_THRESHOLD for close_exit/mfe and TRADE_COST for payoff."
+        ),
     )
     args = parser.parse_args()
 
@@ -1260,7 +1700,7 @@ def main() -> None:
             test_start=args.test_start,
             test_end=args.test_end,
             label_mode=args.label_mode,
-            label_threshold=float(args.label_threshold),
+            label_threshold=args.label_threshold,
         )
         logger.info("Done. Saved ensemble chart: %s", chart)
         return
@@ -1278,7 +1718,7 @@ def main() -> None:
         test_start=args.test_start,
         test_end=args.test_end,
         label_mode=args.label_mode,
-        label_threshold=float(args.label_threshold),
+        label_threshold=args.label_threshold,
     )
     logger.info("Done. Saved %d chart(s).", len(charts))
 

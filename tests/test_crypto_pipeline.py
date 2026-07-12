@@ -1,9 +1,12 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import pandas as pd
 
 from crypto import config
+from crypto.main import _validate_resume_metadata
 from crypto.data import CryptoFold, add_binary_labels, split_labeled_by_dates
 from crypto.evolution import CryptoArchive, CryptoIndividual, CryptoMutator
 from crypto.expression import CryptoFeatureSpace
@@ -74,6 +77,83 @@ class CryptoPipelineTests(unittest.TestCase):
         pd.testing.assert_series_equal(labeled["future_return_h3"], expected)
         self.assertEqual(labeled["label_h3"].iloc[0], 1.0)
         self.assertTrue(pd.isna(labeled["label_h3"].iloc[-1]))
+
+    def test_payoff_label_uses_tp_or_future_close_and_preserves_tail_nan(self):
+        idx = pd.date_range("2024-01-01", periods=5, freq="15min")
+        df = pd.DataFrame(
+            {
+                "open": [100.0] * 5,
+                "high": [100.0, 100.5, 100.0, 100.0, 100.0],
+                "low": [99.0] * 5,
+                "close": [100.0, 100.0, 100.0, 100.0, 99.0],
+                "volume": [10.0] * 5,
+                "trade_count": [10] * 5,
+                "taker_buy_base_volume": [5.0] * 5,
+                "taker_buy_quote_volume": [500.0] * 5,
+            },
+            index=idx,
+        )
+
+        old_tp = config.PAYOFF_TP
+        try:
+            config.PAYOFF_TP = 0.003
+            labeled = add_binary_labels(df, horizons=[3], label_mode="payoff")
+        finally:
+            config.PAYOFF_TP = old_tp
+
+        expected = pd.Series(
+            [0.003, -0.01, np.nan, np.nan, np.nan],
+            index=idx,
+            name="future_return_h3",
+        )
+        pd.testing.assert_series_equal(labeled["future_return_h3"], expected)
+        self.assertEqual(labeled["label_h3"].iloc[0], 1.0)
+        self.assertEqual(labeled["label_h3"].iloc[1], 0.0)
+        self.assertTrue(pd.isna(labeled["label_h3"].iloc[-1]))
+
+    def test_payoff_default_label_threshold_uses_trade_cost(self):
+        self.assertEqual(
+            config.default_label_threshold("payoff"),
+            config.TRADE_COST,
+        )
+        self.assertEqual(
+            config.default_label_threshold("mfe"),
+            config.LABEL_THRESHOLD,
+        )
+
+    def test_crypto_archive_preserves_metadata_on_load(self):
+        archive = CryptoArchive(metadata={"label_mode": "mfe", "label_threshold": 0.003})
+        individual = CryptoIndividual(features=["ret_close_3"], score=0.1)
+        self.assertTrue(archive.try_add(individual))
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "archive.json"
+            archive.save(path, metadata=archive.metadata)
+            loaded = CryptoArchive.load(path)
+
+        self.assertEqual(loaded.metadata["label_mode"], "mfe")
+        self.assertEqual(loaded.metadata["label_threshold"], 0.003)
+        self.assertEqual(len(loaded), 1)
+
+    def test_resume_metadata_mismatch_is_rejected(self):
+        archive = CryptoArchive(
+            metadata={
+                "horizons": [3, 5],
+                "label_mode": "mfe",
+                "label_threshold": 0.003,
+                "trade_top_fraction": config.TRADE_TOP_FRACTION,
+                "trade_cost": config.TRADE_COST,
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "label_mode"):
+            _validate_resume_metadata(
+                archive=archive,
+                resume_path=Path("archive.json"),
+                horizons=[3, 5],
+                label_mode="payoff",
+                label_threshold=config.TRADE_COST,
+            )
 
     def test_label_mode_mfe_is_used_by_default_labeling(self):
         idx = pd.date_range("2024-01-01", periods=5, freq="15min")

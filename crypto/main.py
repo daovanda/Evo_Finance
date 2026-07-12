@@ -42,7 +42,7 @@ def run(
     save_archive: str | Path | None = config.DEFAULT_ARCHIVE_PATH,
     resume_archive: str | Path | None = None,
     horizons: list[int] | tuple[int, ...] = tuple(config.HOLDING_HORIZONS),
-    label_threshold: float = config.LABEL_THRESHOLD,
+    label_threshold: float | None = None,
     label_mode: str = config.LABEL_MODE,
     val_start: str = config.VAL_START,
     test_start: str = config.TEST_START,
@@ -56,6 +56,7 @@ def run(
     config.validate_config()
     horizons = [int(h) for h in horizons]
     label_mode = str(label_mode).strip().lower()
+    label_threshold = config.default_label_threshold(label_mode, label_threshold)
     label_return_fn = config.get_label_return_fn(label_mode)
     purge_bars = config.purge_bars_for_horizons(horizons)
     wf_end = wf_end or test_start
@@ -68,6 +69,7 @@ def run(
         horizons=horizons,
         threshold=label_threshold,
         return_fn=label_return_fn,
+        label_mode=label_mode,
     )
     train_df, val_df, test_df = split_labeled_by_dates(
         labeled_df,
@@ -129,6 +131,14 @@ def run(
         if resume_archive is not None
         else CryptoArchive()
     )
+    if resume_archive is not None:
+        _validate_resume_metadata(
+            archive=archive,
+            resume_path=Path(resume_archive),
+            horizons=horizons,
+            label_mode=label_mode,
+            label_threshold=label_threshold,
+        )
 
     if archive.is_empty():
         logger.info("Evaluating seed crypto individual ...")
@@ -243,12 +253,68 @@ def _save_archive(
             "horizons": horizons,
             "label_mode": label_mode,
             "label_threshold": label_threshold,
+            "payoff_tp": config.PAYOFF_TP,
             "fitness": config.FITNESS_WEIGHTS,
             "trade_top_fraction": config.TRADE_TOP_FRACTION,
             "trade_cost": config.TRADE_COST,
             "return_score_scale": config.RETURN_SCORE_SCALE,
         },
     )
+
+
+def _validate_resume_metadata(
+    archive: CryptoArchive,
+    resume_path: Path,
+    horizons: list[int],
+    label_mode: str,
+    label_threshold: float,
+) -> None:
+    metadata = getattr(archive, "metadata", {}) or {}
+    if not metadata:
+        logger.warning(
+            "Resume archive %s has no metadata; cannot verify label/fitness compatibility.",
+            resume_path,
+        )
+        return
+
+    checks: list[tuple[str, object, object]] = [
+        ("horizons", [int(h) for h in metadata.get("horizons", [])], [int(h) for h in horizons]),
+        ("label_mode", str(metadata.get("label_mode", "")).strip().lower(), label_mode),
+        ("label_threshold", metadata.get("label_threshold"), float(label_threshold)),
+        ("trade_top_fraction", metadata.get("trade_top_fraction"), float(config.TRADE_TOP_FRACTION)),
+        ("trade_cost", metadata.get("trade_cost"), float(config.TRADE_COST)),
+    ]
+    archive_label_mode = str(metadata.get("label_mode", "")).strip().lower()
+    if label_mode == "payoff" and archive_label_mode == "payoff":
+        checks.append(("payoff_tp", metadata.get("payoff_tp"), float(config.PAYOFF_TP)))
+
+    mismatches: list[str] = []
+    for name, archive_value, current_value in checks:
+        if archive_value in (None, "", []):
+            logger.warning(
+                "Resume archive %s metadata is missing %s; cannot verify that field.",
+                resume_path,
+                name,
+            )
+            continue
+        if isinstance(current_value, float):
+            try:
+                archive_float = float(archive_value)
+            except (TypeError, ValueError):
+                mismatches.append(f"{name}: archive={archive_value!r}, current={current_value!r}")
+                continue
+            if not np.isclose(archive_float, current_value, rtol=0.0, atol=1e-12):
+                mismatches.append(f"{name}: archive={archive_float!r}, current={current_value!r}")
+        elif archive_value != current_value:
+            mismatches.append(f"{name}: archive={archive_value!r}, current={current_value!r}")
+
+    if mismatches:
+        joined = "; ".join(mismatches)
+        raise ValueError(
+            "Resume archive config does not match current run. "
+            f"Archive={resume_path}. Mismatches: {joined}. "
+            "Use matching --label-mode/--label-threshold/config values, or start a new archive."
+        )
 
 
 def _checkpoint_path(save_path: Path | None) -> Path | None:
@@ -287,7 +353,15 @@ def main() -> None:
         default=list(config.HOLDING_HORIZONS),
         help="Comma-separated horizons, default: 3,7,10.",
     )
-    parser.add_argument("--label-threshold", type=float, default=config.LABEL_THRESHOLD)
+    parser.add_argument(
+        "--label-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Label threshold. Default is LABEL_THRESHOLD for close_exit/mfe and "
+            "TRADE_COST for payoff."
+        ),
+    )
     parser.add_argument(
         "--label-mode",
         choices=sorted(config.LABEL_RETURN_FNS),

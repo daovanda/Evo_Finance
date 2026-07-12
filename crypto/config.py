@@ -19,8 +19,9 @@ DEFAULT_ARCHIVE_PATH: Path = RESULTS_DIR / "crypto_btc_archive.json"
 
 # Multi-horizon binary labels. Edit this list freely, for example [3, 7, 10, 20].
 HOLDING_HORIZONS: list[int] = [3, 5]
-LABEL_THRESHOLD: float = 0.003 # label=1 when future return > 0.1%
-LABEL_MODE: str = "mfe"  # "close_exit" or "mfe"
+LABEL_THRESHOLD: float = 0.003  # label=1 when future_return > threshold
+LABEL_MODE: str = "mfe"  # "close_exit", "mfe", or "payoff"
+PAYOFF_TP: float = 0.003  # only used by LABEL_MODE="payoff"
 
 
 def close_exit_future_return(df: Any, horizon: int) -> Any:
@@ -29,8 +30,7 @@ def close_exit_future_return(df: Any, horizon: int) -> Any:
 
     future_return(t, h) = (close(t+h) - open(t+1)) / open(t+1)
 
-    Edit or replace LABEL_RETURN_FN below when you want a different label,
-    for example a max-high/MFE label instead of close-at-horizon return.
+    Select LABEL_MODE below when you want a different label family.
     """
     h = int(horizon)
     entry_open = df["open"].shift(-1)
@@ -54,9 +54,28 @@ def mfe_future_return(df: Any, horizon: int) -> Any:
     return (max_high - entry_open) / entry_open
 
 
+def payoff_future_return(df: Any, horizon: int) -> Any:
+    """
+    Strategy payoff label return.
+
+    future_return(t, h) =
+        PAYOFF_TP if max(high(t+1)..high(t+h)) reaches PAYOFF_TP,
+        otherwise close_exit_future_return(t, h).
+
+    This is a gross payoff. The payoff label should normally use
+    default_label_threshold("payoff") == TRADE_COST, so label=1 means the
+    rule's gross payoff is above the estimated round-trip cost.
+    """
+    mfe = mfe_future_return(df, horizon)
+    close_return = close_exit_future_return(df, horizon)
+    payoff = close_return.where(mfe < float(PAYOFF_TP), float(PAYOFF_TP))
+    return payoff.where(mfe.notna() & close_return.notna())
+
+
 LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
     "close_exit": close_exit_future_return,
     "mfe": mfe_future_return,
+    "payoff": payoff_future_return,
 }
 
 
@@ -66,6 +85,15 @@ def get_label_return_fn(mode: str | None = None) -> Callable[[Any, int], Any]:
         allowed = ", ".join(sorted(LABEL_RETURN_FNS))
         raise ValueError(f"Unknown LABEL_MODE={selected_mode!r}. Allowed: {allowed}.")
     return LABEL_RETURN_FNS[selected_mode]
+
+
+def default_label_threshold(mode: str | None = None, threshold: float | None = None) -> float:
+    if threshold is not None:
+        return float(threshold)
+    selected_mode = str(mode or LABEL_MODE).strip().lower()
+    if selected_mode == "payoff":
+        return float(TRADE_COST)
+    return float(LABEL_THRESHOLD)
 
 
 LABEL_RETURN_FN: Callable[[Any, int], Any] = get_label_return_fn()
@@ -108,9 +136,9 @@ MAX_RETRY: int = 5
 
 # Fitness. RETURN_SCORE_SCALE normalizes mean trade return so that one metric
 # cannot dominate merely by being on a wider numerical scale.
-TRADE_TOP_FRACTION: float = 0.30
+TRADE_TOP_FRACTION: float = 0.2
 MIN_TRADES_PER_SPLIT: int = 20
-TRADE_COST: float = 0.002  # 0.1% breakeven cost per selected trade
+TRADE_COST: float = 0.002  # 0.2% breakeven round-trip cost per selected trade
 RETURN_SCORE_SCALE: float = 0.01
 BAD_AUC_THRESHOLD: float = 0.50
 
@@ -164,6 +192,8 @@ def validate_config() -> None:
     if LABEL_THRESHOLD < 0:
         raise ValueError("LABEL_THRESHOLD must be non-negative.")
     get_label_return_fn()
+    if PAYOFF_TP <= 0:
+        raise ValueError("PAYOFF_TP must be positive.")
     if FEATURE_MIN < 1 or FEATURE_MAX < FEATURE_MIN:
         raise ValueError("Require 1 <= FEATURE_MIN <= FEATURE_MAX.")
     if EXPR_MAX_DEPTH < 1:

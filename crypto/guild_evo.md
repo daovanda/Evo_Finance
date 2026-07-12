@@ -53,11 +53,13 @@ Sua trong `crypto/config.py`.
 
 ```python
 HOLDING_HORIZONS = [3, 5]
-LABEL_THRESHOLD = 0.001
-LABEL_MODE = "close_exit"  # "close_exit" hoac "mfe"
+LABEL_THRESHOLD = 0.003
+LABEL_MODE = "mfe"  # "close_exit", "mfe", hoac "payoff"
+PAYOFF_TP = 0.003
+TRADE_COST = 0.002
 ```
 
-Nghia la tao label cho `h3` va `h5`; label = 1 khi future return vuot `0.1%`.
+Nghia la tao label cho `h3` va `h5`; label = 1 khi `future_return` vuot threshold cua mode dang chay.
 
 `LABEL_MODE="close_exit"`:
 
@@ -73,6 +75,16 @@ future_return(t, h) = (max(high(t+1)..high(t+h)) - open(t+1)) / open(t+1)
 
 Mode `mfe` phu hop hon voi chien luoc dat TP, vi chi can gia cham muc loi trong horizon la label duong.
 
+`LABEL_MODE="payoff"`:
+
+```text
+MFE(t, h) = (max(high(t+1)..high(t+h)) - open(t+1)) / open(t+1)
+close_return(t, h) = (close(t+h) - open(t+1)) / open(t+1)
+future_return(t, h) = PAYOFF_TP neu MFE(t, h) >= PAYOFF_TP, nguoc lai close_return(t, h)
+```
+
+Mode `payoff` mo phong gross payoff cua rule: cham TP thi tinh loi bang `PAYOFF_TP`, khong cham TP thi tinh return thoat o `close(t+h)`. Neu khong truyen `--label-threshold`, mode nay tu dung `TRADE_COST` lam threshold, tuc label = 1 khi gross payoff lon hon phi vong mua/ban.
+
 Co the override label mode bang CLI, khong can sua file config:
 
 ```powershell
@@ -85,10 +97,17 @@ Co the override threshold bang CLI:
 python -m crypto.main --label-mode mfe --label-threshold 0.003 --help
 ```
 
+Chay tien hoa voi payoff label, dung threshold mac dinh la `TRADE_COST`:
+
+```powershell
+python -m crypto.main --label-mode payoff --help
+```
+
 Luu y:
 
 - `--label-mode` va `--label-threshold` trong `crypto.main` anh huong truc tiep den label khi tien hoa.
 - `--label-mode` va `--label-threshold` trong `crypto.analyze` la label/threshold dung de train lai va ve chart.
+- Neu `--label-mode payoff` va bo qua `--label-threshold`, threshold se la `TRADE_COST`; `PAYOFF_TP` chi quy dinh muc TP gross trong cong thuc payoff.
 - Neu archive duoc tien hoa bang mode/threshold A nhung analyze bang mode/threshold B thi chart la ket qua tai danh gia theo B, khong phai score goc trong archive.
 
 ### Final split

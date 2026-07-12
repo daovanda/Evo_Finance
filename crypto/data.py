@@ -71,22 +71,25 @@ def load_ohlcv(path: str | Path = config.DATA_PATH) -> pd.DataFrame:
 def add_binary_labels(
     df: pd.DataFrame,
     horizons: list[int] | tuple[int, ...] = tuple(config.HOLDING_HORIZONS),
-    threshold: float = config.LABEL_THRESHOLD,
+    threshold: float | None = None,
     return_fn: Callable[[pd.DataFrame, int], pd.Series] | None = None,
+    label_mode: str | None = None,
 ) -> pd.DataFrame:
     """
     Add future_return_h{h} and label_h{h}.
 
-    The future_return formula is controlled by config.LABEL_MODE.
+    The future_return formula is controlled by label_mode/config.LABEL_MODE.
     label = 1 if future_return > threshold, else 0.
     """
     labeled = df.sort_index().copy()
-    label_return_fn = return_fn or config.get_label_return_fn()
+    selected_mode = str(label_mode or config.LABEL_MODE).strip().lower()
+    label_return_fn = return_fn or config.get_label_return_fn(selected_mode)
+    label_threshold = config.default_label_threshold(selected_mode, threshold)
     for h in horizons:
         h = int(h)
         future_return = label_return_fn(labeled, h)
         labeled[f"future_return_h{h}"] = future_return
-        labeled[f"label_h{h}"] = (future_return > float(threshold)).astype("float")
+        labeled[f"label_h{h}"] = (future_return > float(label_threshold)).astype("float")
         labeled.loc[future_return.isna(), f"label_h{h}"] = np.nan
     return labeled
 

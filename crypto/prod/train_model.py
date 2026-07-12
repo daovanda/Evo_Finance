@@ -54,7 +54,7 @@ def train_from_archive(
     test_start: str = config.TEST_START,
     test_end: str | None = config.TEST_END,
     label_mode: str = config.LABEL_MODE,
-    label_threshold: float = config.LABEL_THRESHOLD,
+    label_threshold: float | None = None,
 ) -> Path:
     """Train one LightGBM model per selected individual and horizon."""
     config.validate_config()
@@ -68,11 +68,13 @@ def train_from_archive(
     logger.info("Loading crypto data from %s", data_path)
     raw_df = load_ohlcv(data_path)
     label_mode = str(label_mode).strip().lower()
+    label_threshold = config.default_label_threshold(label_mode, label_threshold)
     labeled_df = add_binary_labels(
         raw_df,
         horizons=config.HOLDING_HORIZONS,
-        threshold=float(label_threshold),
+        threshold=label_threshold,
         return_fn=config.get_label_return_fn(label_mode),
+        label_mode=label_mode,
     )
     purge_bars = config.purge_bars_for_horizons(config.HOLDING_HORIZONS)
     train_df, val_df, test_df = split_labeled_by_dates(
@@ -170,13 +172,18 @@ def train_ensemble_from_specs(
     test_start: str = config.TEST_START,
     test_end: str | None = config.TEST_END,
     default_label_mode: str = config.LABEL_MODE,
-    default_label_threshold: float = config.LABEL_THRESHOLD,
+    default_label_threshold: float | None = None,
 ) -> Path:
     """Train one production model bundle from archive/rank specs."""
     if len(specs) < 1:
         raise ValueError("Need at least one ensemble individual spec.")
     config.validate_config()
     run_name = run_name or "crypto_ensemble"
+    default_label_mode = str(default_label_mode).strip().lower()
+    default_label_threshold = config.default_label_threshold(
+        default_label_mode,
+        default_label_threshold,
+    )
     model_dir = Path(output_dir) / _safe_name(run_name)
     model_dir.mkdir(parents=True, exist_ok=True)
 
@@ -188,8 +195,9 @@ def train_ensemble_from_specs(
     default_labeled_df = add_binary_labels(
         raw_df,
         horizons=config.HOLDING_HORIZONS,
-        threshold=float(default_label_threshold),
+        threshold=default_label_threshold,
         return_fn=config.get_label_return_fn(default_label_mode),
+        label_mode=default_label_mode,
     )
     default_train_df, _, _ = split_labeled_by_dates(
         default_labeled_df,
@@ -214,8 +222,8 @@ def train_ensemble_from_specs(
             test_start=test_start,
             test_end=test_end,
             purge_bars=purge_bars,
-            label_mode=str(default_label_mode).strip().lower(),
-            label_threshold=float(default_label_threshold),
+            label_mode=default_label_mode,
+            label_threshold=default_label_threshold,
         ),
         "entries": [],
         "ensemble": {
@@ -228,11 +236,7 @@ def train_ensemble_from_specs(
     label_cache: dict[tuple[str, float], tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]] = {}
     for spec in specs:
         label_mode = str(spec.label_mode or default_label_mode).strip().lower()
-        label_threshold = (
-            float(spec.label_threshold)
-            if spec.label_threshold is not None
-            else float(default_label_threshold)
-        )
+        label_threshold = _resolve_spec_label_threshold(spec, default_label_threshold)
         if label_mode not in config.LABEL_RETURN_FNS:
             allowed = ", ".join(sorted(config.LABEL_RETURN_FNS))
             raise ValueError(f"Unknown label mode {label_mode!r}. Allowed: {allowed}.")
@@ -243,6 +247,7 @@ def train_ensemble_from_specs(
                 horizons=config.HOLDING_HORIZONS,
                 threshold=label_threshold,
                 return_fn=config.get_label_return_fn(label_mode),
+                label_mode=label_mode,
             )
             label_cache[cache_key] = split_labeled_by_dates(
                 labeled_df,
@@ -480,6 +485,8 @@ def _config_snapshot(
         "horizons": list(config.HOLDING_HORIZONS),
         "label_mode": label_mode,
         "label_threshold": float(label_threshold),
+        "payoff_tp": float(config.PAYOFF_TP),
+        "trade_cost": float(config.TRADE_COST),
         "val_start": val_start,
         "test_start": test_start,
         "test_end": test_end,
@@ -503,9 +510,12 @@ def _entry_id(
     label_mode: str,
     label_threshold: float,
 ) -> str:
+    suffix = ""
+    if str(label_mode).strip().lower() == "payoff":
+        suffix = f"_tp_{_threshold_token(float(config.PAYOFF_TP))}"
     return _safe_name(
         f"{Path(archive_path).stem}_r{int(rank):02d}_{label_mode}_thr_"
-        f"{_threshold_token(float(label_threshold))}"
+        f"{_threshold_token(float(label_threshold))}{suffix}"
     )
 
 
@@ -539,6 +549,17 @@ def _parse_ranks(values: list[str] | None) -> list[int] | None:
     if not values:
         return None
     return [int(value) for value in values]
+
+
+def _resolve_spec_label_threshold(
+    spec: EnsembleIndividualSpec,
+    default_label_threshold: float,
+) -> float:
+    if spec.label_threshold is not None:
+        return float(spec.label_threshold)
+    if spec.label_mode is not None:
+        return config.default_label_threshold(spec.label_mode)
+    return float(default_label_threshold)
 
 
 def _parse_ensemble_specs(values: list[str] | None) -> list[EnsembleIndividualSpec]:
@@ -625,8 +646,11 @@ def main() -> None:
     parser.add_argument(
         "--label-threshold",
         type=float,
-        default=float(config.LABEL_THRESHOLD),
-        help=f"Label threshold used when training production models. Default: {config.LABEL_THRESHOLD}.",
+        default=None,
+        help=(
+            "Label threshold used when training production models. Default is "
+            "LABEL_THRESHOLD for close_exit/mfe and TRADE_COST for payoff."
+        ),
     )
     args = parser.parse_args()
 
@@ -641,7 +665,7 @@ def main() -> None:
             test_start=args.test_start,
             test_end=args.test_end,
             default_label_mode=args.label_mode,
-            default_label_threshold=float(args.label_threshold),
+            default_label_threshold=args.label_threshold,
         )
     else:
         if not args.archive:
@@ -657,7 +681,7 @@ def main() -> None:
             test_start=args.test_start,
             test_end=args.test_end,
             label_mode=args.label_mode,
-            label_threshold=float(args.label_threshold),
+            label_threshold=args.label_threshold,
         )
     logger.info("Done. Manifest: %s", manifest_path)
 

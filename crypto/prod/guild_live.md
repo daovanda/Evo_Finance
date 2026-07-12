@@ -27,8 +27,10 @@ Quan trong nhat:
 
 ```python
 HOLDING_HORIZONS = [3, 5]
-LABEL_THRESHOLD = 0.001
-LABEL_MODE = "close_exit"  # "close_exit" hoac "mfe"
+LABEL_THRESHOLD = 0.003
+LABEL_MODE = "mfe"  # "close_exit", "mfe", hoac "payoff"
+PAYOFF_TP = 0.003
+TRADE_COST = 0.002
 VAL_START = "2024-01-01"
 TEST_START = "2025-01-01"
 TRADE_TOP_FRACTION = 0.20
@@ -44,6 +46,7 @@ rank_01_h5.txt
 
 `LABEL_MODE="close_exit"` dung return tu `open(t+1)` den `close(t+h)`.
 `LABEL_MODE="mfe"` dung return tu `open(t+1)` den high lon nhat trong khoang `t+1..t+h`.
+`LABEL_MODE="payoff"` dung return mo phong rule TP: neu MFE cham `PAYOFF_TP` thi future return = `PAYOFF_TP`, nguoc lai future return = close return tai `close(t+h)`. Neu bo qua `--label-threshold`, mode `payoff` tu dung `TRADE_COST` lam threshold.
 
 ### Trading config
 
@@ -158,6 +161,16 @@ python -m crypto.prod.train_model `
   --run-name crypto_btc_seed1_12h
 ```
 
+Train rank 1 voi payoff label, threshold mac dinh = `TRADE_COST`:
+
+```powershell
+python -m crypto.prod.train_model `
+  --archive crypto/results/crypto_btc_payoff_seed1_12h.json `
+  --label-mode payoff `
+  --rank 1 `
+  --run-name crypto_btc_payoff_seed1_12h
+```
+
 Train top 3:
 
 ```powershell
@@ -197,6 +210,7 @@ ARCHIVE#RANK[#MODE[#THRESHOLD]]
 ```
 
 Neu bo `MODE/THRESHOLD`, member se dung mac dinh tu CLI `--label-mode` va `--label-threshold`.
+Rieng khi mode la `payoff` va khong co threshold, code se dung `TRADE_COST` lam threshold.
 
 Output:
 
