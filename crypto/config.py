@@ -21,7 +21,7 @@ DEFAULT_ARCHIVE_PATH: Path = RESULTS_DIR / "crypto_btc_archive.json"
 HOLDING_HORIZONS: list[int] = [3, 5]
 LABEL_THRESHOLD: float = 0.003  # label=1 when future_return > threshold
 LABEL_MODE: str = "mfe"  # "close_exit", "mfe", or "payoff"
-PAYOFF_TP: float = 0.003  # only used by LABEL_MODE="payoff"
+PAYOFF_TP: float = 0.005  # only used by LABEL_MODE="payoff"
 
 
 def close_exit_future_return(df: Any, horizon: int) -> Any:
@@ -136,7 +136,7 @@ MAX_RETRY: int = 5
 
 # Fitness. RETURN_SCORE_SCALE normalizes mean trade return so that one metric
 # cannot dominate merely by being on a wider numerical scale.
-TRADE_TOP_FRACTION: float = 0.2
+TRADE_TOP_FRACTION: float = 0.1
 MIN_TRADES_PER_SPLIT: int = 20
 TRADE_COST: float = 0.002  # 0.2% breakeven round-trip cost per selected trade
 RETURN_SCORE_SCALE: float = 0.01
