@@ -112,7 +112,7 @@ WF_PURGE_BARS: int | None = None  # None => max(HOLDING_HORIZONS) + 1
 
 # Safe feature construction. All features are time-series/ratio normalized;
 # raw price/volume scale columns are intentionally not selectable.
-WINDOWS: list[int] = [3, 5, 7, 10, 14, 20, 30, 40, 50, 60, 80, 120, 160, 240, 320, 400, 480]
+WINDOWS: list[int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 14, 20, 30, 40, 50, 60, 80, 120, 160, 240, 320, 400, 480]
 FEATURE_MIN_VALID_RATIO: float = 0.70
 FEATURE_MAX_DOMINANT_VALUE_RATIO: float = 0.985
 FEATURE_CORR_THRESHOLD: float = 0.70
@@ -144,10 +144,10 @@ BAD_AUC_THRESHOLD: float = 0.50
 
 FITNESS_WEIGHTS: dict[str, float] = {
     "auc_edge": 0.40,
-    "precision_excess": 0.25,
+    "precision_excess": 0.3,
     "trade_return_score": 0.20,
     "auc_std": -0.20,
-    "overfit_gap": -0.30,
+    "overfit_gap": -0.25,
     "bad_fold_ratio": -0.30,
 }
 
