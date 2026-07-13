@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,10 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("crypto.analyze")
+
+
+_WINDOW_SUFFIX_RE = re.compile(r"_(\d+)(?=\b|[^0-9])")
+_WINDOW_ARG_RE = re.compile(r",\s*(\d+)\s*\)")
 
 
 DEFAULT_CHART_DIR = config.RESULTS_DIR / "chart"
@@ -136,22 +141,23 @@ def analyze(
         purge_bars,
     )
 
-    logger.info("Building crypto feature matrix; quality filter uses final train rows.")
-    feature_df = build_feature_frame(raw_df, quality_index=train_df.index)
+    required_windows = _required_windows_for_entries(entries)
+    logger.info(
+        "Building crypto feature matrix; quality filter uses final train rows | windows=%s.",
+        required_windows,
+    )
+    feature_df = build_feature_frame(
+        raw_df,
+        windows=required_windows,
+        quality_index=train_df.index,
+    )
     feature_pool = selectable_features(feature_df)
     feature_space = CryptoFeatureSpace(feature_df, feature_pool)
-    mfe_by_horizon = {
-        int(horizon): _max_high_return(raw_df, int(horizon))
-        for horizon in config.HOLDING_HORIZONS
-    }
-    path_by_horizon = {
-        int(horizon): _horizon_path_returns(raw_df, int(horizon))
-        for horizon in config.HOLDING_HORIZONS
-    }
-    close_return_by_horizon = {
-        int(horizon): _close_exit_return(raw_df, int(horizon))
-        for horizon in config.HOLDING_HORIZONS
-    }
+    mfe_by_horizon, path_by_horizon, close_return_by_horizon = _return_context_by_horizon(
+        raw_df,
+        config.HOLDING_HORIZONS,
+        label_mode=label_mode,
+    )
 
     charts: list[Path] = []
     for entry in entries:
@@ -241,22 +247,39 @@ def analyze_ensemble_individuals(
         purge_bars,
     )
 
-    logger.info("Building crypto feature matrix; quality filter uses final train rows.")
-    feature_df = build_feature_frame(raw_df, quality_index=train_df.index)
+    spec_entries = [(spec, _load_rank_entry(spec.archive_path, spec.rank)) for spec in specs]
+    required_windows = _required_windows_for_entries([entry for _, entry in spec_entries])
+    logger.info(
+        "Building crypto feature matrix; quality filter uses final train rows | windows=%s.",
+        required_windows,
+    )
+    feature_df = build_feature_frame(
+        raw_df,
+        windows=required_windows,
+        quality_index=train_df.index,
+    )
     feature_pool = selectable_features(feature_df)
     feature_space = CryptoFeatureSpace(feature_df, feature_pool)
-    mfe_by_horizon = {
-        int(horizon): _max_high_return(raw_df, int(horizon))
-        for horizon in config.HOLDING_HORIZONS
-    }
-    path_by_horizon = {
-        int(horizon): _horizon_path_returns(raw_df, int(horizon))
-        for horizon in config.HOLDING_HORIZONS
-    }
-    close_return_by_horizon = {
-        int(horizon): _close_exit_return(raw_df, int(horizon))
-        for horizon in config.HOLDING_HORIZONS
-    }
+    return_context_cache: dict[
+        str,
+        tuple[dict[int, pd.Series], dict[int, pd.DataFrame], dict[int, pd.Series]],
+    ] = {}
+
+    def return_context_for(
+        mode: str,
+    ) -> tuple[dict[int, pd.Series], dict[int, pd.DataFrame], dict[int, pd.Series]]:
+        mode = str(mode).strip().lower()
+        cached = return_context_cache.get(mode)
+        if cached is None:
+            cached = _return_context_by_horizon(
+                raw_df,
+                config.HOLDING_HORIZONS,
+                label_mode=mode,
+            )
+            return_context_cache[mode] = cached
+        return cached
+
+    mfe_by_horizon, path_by_horizon, close_return_by_horizon = return_context_for(label_mode)
     exit_horizon = int(max(config.HOLDING_HORIZONS))
     reference_val = _reference_split_prediction(
         split="val",
@@ -280,8 +303,7 @@ def analyze_ensemble_individuals(
     individual_ensembles: list[HorizonAnalysis] = []
     active_specs: list[EnsembleIndividualSpec] = []
     active_entries: list[dict[str, Any]] = []
-    for spec in specs:
-        entry = _load_rank_entry(spec.archive_path, spec.rank)
+    for spec, entry in spec_entries:
         individual = _entry_to_individual(entry)
         member_label_mode = str(spec.label_mode or label_mode).strip().lower()
         member_label_threshold = _resolve_spec_label_threshold(spec, float(label_threshold))
@@ -310,6 +332,9 @@ def analyze_ensemble_individuals(
             member_label_threshold,
             len(individual.features),
         )
+        member_mfe_by_horizon, member_path_by_horizon, member_close_by_horizon = (
+            return_context_for(member_label_mode)
+        )
         horizon_results: list[HorizonAnalysis] = []
         for horizon in config.HOLDING_HORIZONS:
             result = _analyze_horizon(
@@ -319,14 +344,23 @@ def analyze_ensemble_individuals(
                 val_df=member_val_df,
                 test_df=member_test_df,
                 feature_space=feature_space,
-                mfe=mfe_by_horizon[int(horizon)],
-                path_returns=path_by_horizon[int(horizon)],
-                close_return=close_return_by_horizon[int(horizon)],
+                mfe=member_mfe_by_horizon[int(horizon)],
+                path_returns=member_path_by_horizon[int(horizon)],
+                close_return=member_close_by_horizon[int(horizon)],
                 label_threshold=member_label_threshold,
             )
             if result is not None:
                 horizon_results.append(result)
-        h_ensemble = _build_ensemble_analysis(horizon_results)
+        if len(horizon_results) == 1:
+            h_ensemble = horizon_results[0]
+            logger.info(
+                "Using single horizon h%d as member ensemble for %s rank %d.",
+                h_ensemble.horizon,
+                spec.archive_path,
+                spec.rank,
+            )
+        else:
+            h_ensemble = _build_ensemble_analysis(horizon_results)
         if h_ensemble is None:
             logger.warning(
                 "Skip ensemble member %s rank %d: could not build horizon ensemble.",
@@ -434,6 +468,26 @@ def _entry_to_individual(entry: dict[str, Any]) -> CryptoIndividual:
         score=float(entry.get("score", float("nan"))),
         metrics=dict(entry.get("metrics", {})),
     )
+
+
+def _required_windows_for_entries(entries: list[dict[str, Any]]) -> list[int]:
+    windows: set[int] = set()
+    for entry in entries:
+        features = entry.get("features")
+        if not isinstance(features, list):
+            continue
+        for feature in features:
+            windows.update(_feature_windows(str(feature)))
+    return sorted(window for window in windows if window > 1)
+
+
+def _feature_windows(formula: str) -> set[int]:
+    windows: set[int] = set()
+    for match in _WINDOW_SUFFIX_RE.finditer(formula):
+        windows.add(int(match.group(1)))
+    for match in _WINDOW_ARG_RE.finditer(formula):
+        windows.add(int(match.group(1)))
+    return windows
 
 
 def _analyze_horizon(
@@ -809,34 +863,96 @@ def _valid_frame(df: pd.DataFrame, label_col: str, ret_col: str) -> pd.DataFrame
     return df.dropna(subset=[label_col, ret_col]).copy()
 
 
-def _max_high_return(raw_df: pd.DataFrame, horizon: int) -> pd.Series:
+def _return_context_by_horizon(
+    raw_df: pd.DataFrame,
+    horizons: list[int] | tuple[int, ...],
+    label_mode: str,
+) -> tuple[dict[int, pd.Series], dict[int, pd.DataFrame], dict[int, pd.Series]]:
+    return (
+        {
+            int(horizon): _max_high_return(raw_df, int(horizon), label_mode=label_mode)
+            for horizon in horizons
+        },
+        {
+            int(horizon): _horizon_path_returns(raw_df, int(horizon), label_mode=label_mode)
+            for horizon in horizons
+        },
+        {
+            int(horizon): _close_exit_return(raw_df, int(horizon), label_mode=label_mode)
+            for horizon in horizons
+        },
+    )
+
+
+def _max_high_return(
+    raw_df: pd.DataFrame,
+    horizon: int,
+    label_mode: str = config.LABEL_MODE,
+) -> pd.Series:
     data = raw_df.sort_index()
-    entry = pd.to_numeric(data["open"], errors="coerce").shift(-1)
+    entry = _entry_open_for_mode(data, label_mode)
     high = pd.to_numeric(data["high"], errors="coerce")
+    offsets = _future_offsets_for_mode(horizon, label_mode)
     max_high = pd.concat(
-        [high.shift(-offset) for offset in range(1, int(horizon) + 1)],
+        [high.shift(-offset) for offset in offsets],
         axis=1,
     ).max(axis=1, skipna=False)
     return (max_high / entry - 1.0).replace([np.inf, -np.inf], np.nan)
 
 
-def _horizon_path_returns(raw_df: pd.DataFrame, horizon: int) -> pd.DataFrame:
+def _horizon_path_returns(
+    raw_df: pd.DataFrame,
+    horizon: int,
+    label_mode: str = config.LABEL_MODE,
+) -> pd.DataFrame:
     data = raw_df.sort_index()
-    entry = pd.to_numeric(data["open"], errors="coerce").shift(-1)
+    entry = _entry_open_for_mode(data, label_mode)
     high = pd.to_numeric(data["high"], errors="coerce")
     low = pd.to_numeric(data["low"], errors="coerce")
+    close = pd.to_numeric(data["close"], errors="coerce")
     columns: dict[str, pd.Series] = {}
-    for step in range(1, int(horizon) + 1):
-        columns[f"high_h{step}"] = high.shift(-step) / entry - 1.0
-        columns[f"low_h{step}"] = low.shift(-step) / entry - 1.0
+    for step, offset in enumerate(_future_offsets_for_mode(horizon, label_mode), start=1):
+        columns[f"high_h{step}"] = high.shift(-offset) / entry - 1.0
+        columns[f"low_h{step}"] = low.shift(-offset) / entry - 1.0
+        columns[f"close_h{step}"] = close.shift(-offset) / entry - 1.0
     return pd.DataFrame(columns, index=data.index).replace([np.inf, -np.inf], np.nan)
 
 
-def _close_exit_return(raw_df: pd.DataFrame, horizon: int) -> pd.Series:
+def _close_exit_return(
+    raw_df: pd.DataFrame,
+    horizon: int,
+    label_mode: str = config.LABEL_MODE,
+) -> pd.Series:
     data = raw_df.sort_index()
-    entry = pd.to_numeric(data["open"], errors="coerce").shift(-1)
-    close = pd.to_numeric(data["close"], errors="coerce").shift(-int(horizon))
+    entry = _entry_open_for_mode(data, label_mode)
+    close_offset = _close_offset_for_mode(horizon, label_mode)
+    close = pd.to_numeric(data["close"], errors="coerce").shift(-close_offset)
     return (close / entry - 1.0).replace([np.inf, -np.inf], np.nan)
+
+
+def _entry_open_for_mode(data: pd.DataFrame, label_mode: str) -> pd.Series:
+    open_ = pd.to_numeric(data["open"], errors="coerce")
+    if _is_exit_all_mode(label_mode):
+        return open_
+    return open_.shift(-1)
+
+
+def _future_offsets_for_mode(horizon: int, label_mode: str) -> range:
+    h = int(horizon)
+    if _is_exit_all_mode(label_mode):
+        return range(0, h)
+    return range(1, h + 1)
+
+
+def _close_offset_for_mode(horizon: int, label_mode: str) -> int:
+    h = int(horizon)
+    if _is_exit_all_mode(label_mode):
+        return max(h - 1, 0)
+    return h
+
+
+def _is_exit_all_mode(label_mode: str) -> bool:
+    return str(label_mode).strip().lower() == "exit_all"
 
 
 def _plot_individual(
@@ -908,9 +1024,9 @@ def _plot_sections_vertical(
 ) -> None:
     rows_per_section = 5
     nrows = len(sections) * rows_per_section
-    height_ratios = [0.34, 2.30, 0.92, 1.55, 3.20] * len(sections)
+    height_ratios = [0.34, 2.30, 0.92, 2.25, 3.20] * len(sections)
     fig = plt.figure(
-        figsize=(20, max(8.5, 8.05 * len(sections))),
+        figsize=(20, max(9.2, 8.75 * len(sections))),
         constrained_layout=True,
     )
     gs = fig.add_gridspec(
@@ -1365,12 +1481,38 @@ def _plot_mfe_probability_table(ax: plt.Axes, result: HorizonAnalysis) -> None:
     columns = ["Group"] + [_fmt_threshold_pct(threshold) for threshold in thresholds]
     rows = [
         ["val signal"] + _mfe_probability_row(result.val.selected, thresholds),
+        ["val mean_H"] + _mfe_mean_hit_h_row(result.val.selected, thresholds),
+        ["val hit<H4/all"] + _mfe_hit_before_h_row(
+            result.val.selected,
+            thresholds,
+            denominator="all",
+        ),
+        ["val hit<H4|hit"] + _mfe_hit_before_h_row(
+            result.val.selected,
+            thresholds,
+            denominator="hit",
+        ),
         ["val miss close"] + _mfe_miss_close_row(result.val.selected, thresholds),
+        ["val miss close H3"] + _mfe_miss_close_h_row(result.val.selected, thresholds),
         ["E val"] + _mfe_expected_net_row(result.val.selected, thresholds),
+        ["E val H3"] + _mfe_expected_net_h_row(result.val.selected, thresholds),
         ["val base"] + _mfe_probability_row(result.val.data, thresholds),
         ["test signal"] + _mfe_probability_row(result.test.selected, thresholds),
+        ["test mean_H"] + _mfe_mean_hit_h_row(result.test.selected, thresholds),
+        ["test hit<H4/all"] + _mfe_hit_before_h_row(
+            result.test.selected,
+            thresholds,
+            denominator="all",
+        ),
+        ["test hit<H4|hit"] + _mfe_hit_before_h_row(
+            result.test.selected,
+            thresholds,
+            denominator="hit",
+        ),
         ["test miss close"] + _mfe_miss_close_row(result.test.selected, thresholds),
+        ["test miss close H3"] + _mfe_miss_close_h_row(result.test.selected, thresholds),
         ["E test"] + _mfe_expected_net_row(result.test.selected, thresholds),
+        ["E test H3"] + _mfe_expected_net_h_row(result.test.selected, thresholds),
         ["test base"] + _mfe_probability_row(result.test.data, thresholds),
     ]
     table = ax.table(
@@ -1381,16 +1523,16 @@ def _plot_mfe_probability_table(ax: plt.Axes, result: HorizonAnalysis) -> None:
         colLoc="center",
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(5.4)
+    table.set_fontsize(4.25)
     table.scale(1.0, 1.02)
     for (row, col), cell in table.get_celld().items():
         cell.set_linewidth(0.30)
         if row == 0:
             cell.set_facecolor("#222831")
             cell.set_text_props(color="white", weight="bold")
-        elif row in {1, 2, 3, 4}:
+        elif 1 <= row <= 9:
             cell.set_facecolor("#eef5ff")
-        elif row in {5, 6, 7, 8}:
+        elif 10 <= row <= 18:
             cell.set_facecolor("#fff4e6")
         if col == 0 and row > 0:
             cell.set_text_props(weight="bold")
@@ -1413,6 +1555,100 @@ def _mfe_probability_row(frame: pd.DataFrame, thresholds: list[float]) -> list[s
     if mfe.empty:
         return ["0.00%" for _ in thresholds]
     return [_fmt_pct(float((mfe > threshold).mean())) for threshold in thresholds]
+
+
+def _mfe_mean_hit_h_row(frame: pd.DataFrame, thresholds: list[float]) -> list[str]:
+    high_values, steps = _high_path_values(frame)
+    if high_values is None or steps is None:
+        return ["n/a" for _ in thresholds]
+
+    values: list[str] = []
+    for threshold in thresholds:
+        first_hit_steps = _first_hit_steps(high_values, steps, float(threshold))
+        if len(first_hit_steps) == 0:
+            values.append("n/a")
+            continue
+        values.append(f"{float(first_hit_steps.mean()):.2f}")
+    return values
+
+
+def _mfe_hit_before_h_row(
+    frame: pd.DataFrame,
+    thresholds: list[float],
+    denominator: str = "all",
+    cutoff_h: int = 4,
+) -> list[str]:
+    high_values, steps = _high_path_values(frame)
+    if high_values is None or steps is None:
+        return ["n/a" for _ in thresholds]
+
+    total = len(high_values)
+    denominator = str(denominator).strip().lower()
+    values: list[str] = []
+    for threshold in thresholds:
+        first_hit_steps = _first_hit_steps(high_values, steps, float(threshold))
+        if len(first_hit_steps) == 0 or total == 0:
+            values.append("n/a")
+            continue
+        denom = len(first_hit_steps) if denominator == "hit" else total
+        early_hit_ratio = float((first_hit_steps < cutoff_h).sum() / denom)
+        values.append(_fmt_pct(early_hit_ratio))
+    return values
+
+
+def _high_path_values(frame: pd.DataFrame) -> tuple[np.ndarray | None, np.ndarray | None]:
+    high_columns = _sorted_high_h_columns(frame)
+    if frame.empty or not high_columns:
+        return None, None
+    high_names = [name for name, _ in high_columns]
+    high_frame = (
+        frame[high_names]
+        .apply(pd.to_numeric, errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+    )
+    if high_frame.empty:
+        return None, None
+
+    steps = np.array([step for _, step in high_columns], dtype=float)
+    return high_frame.to_numpy(dtype=float), steps
+
+
+def _first_hit_steps(
+    high_values: np.ndarray,
+    steps: np.ndarray,
+    threshold: float,
+) -> np.ndarray:
+    hit_mask = high_values > float(threshold)
+    has_hit = hit_mask.any(axis=1)
+    if not bool(has_hit.any()):
+        return np.array([], dtype=float)
+    first_hit_position = hit_mask[has_hit].argmax(axis=1)
+    return steps[first_hit_position]
+
+
+def _hit_before_h_mask(
+    high_values: np.ndarray,
+    steps: np.ndarray,
+    threshold: float,
+    cutoff_h: int,
+) -> np.ndarray:
+    step_mask = steps < float(cutoff_h)
+    if not bool(step_mask.any()):
+        return np.zeros(len(high_values), dtype=bool)
+    return (high_values[:, step_mask] > float(threshold)).any(axis=1)
+
+
+def _sorted_high_h_columns(frame: pd.DataFrame) -> list[tuple[str, int]]:
+    columns: list[tuple[str, int]] = []
+    for column in frame.columns:
+        text = str(column)
+        if not text.startswith("high_h"):
+            continue
+        suffix = text[len("high_h") :]
+        if not suffix.isdigit():
+            continue
+        columns.append((text, int(suffix)))
+    return sorted(columns, key=lambda item: item[1])
 
 
 def _mfe_miss_close_row(frame: pd.DataFrame, thresholds: list[float]) -> list[str]:
@@ -1441,6 +1677,36 @@ def _mfe_miss_close_row(frame: pd.DataFrame, thresholds: list[float]) -> list[st
     return values
 
 
+def _mfe_miss_close_h_row(
+    frame: pd.DataFrame,
+    thresholds: list[float],
+    exit_step: int = 3,
+    hit_before_h: int = 4,
+) -> list[str]:
+    close_col = f"close_h{int(exit_step)}"
+    if frame.empty or close_col not in frame.columns:
+        return ["n/a" for _ in thresholds]
+    high_values, steps = _high_path_values(frame)
+    if high_values is None or steps is None:
+        return ["n/a" for _ in thresholds]
+    close_h = (
+        pd.to_numeric(frame[close_col], errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .to_numpy(dtype=float)
+    )
+    valid_close = np.isfinite(close_h)
+
+    values: list[str] = []
+    for threshold in thresholds:
+        hit = _hit_before_h_mask(high_values, steps, float(threshold), int(hit_before_h))
+        miss = (~hit) & valid_close
+        if not bool(miss.any()):
+            values.append("n/a")
+        else:
+            values.append(_fmt_pct(float(np.mean(close_h[miss])), signed=True))
+    return values
+
+
 def _mfe_expected_net_row(frame: pd.DataFrame, thresholds: list[float]) -> list[str]:
     if frame.empty or "mfe" not in frame.columns or "close_return" not in frame.columns:
         return ["n/a" for _ in thresholds]
@@ -1462,6 +1728,41 @@ def _mfe_expected_net_row(frame: pd.DataFrame, thresholds: list[float]) -> list[
     for threshold in thresholds:
         hit = data["mfe"] > threshold
         gross = np.where(hit.to_numpy(), float(threshold), data["close_return"].to_numpy())
+        expected_net = float(np.mean(gross)) - trade_cost
+        values.append(_fmt_pct(expected_net, signed=True))
+    return values
+
+
+def _mfe_expected_net_h_row(
+    frame: pd.DataFrame,
+    thresholds: list[float],
+    exit_step: int = 3,
+    hit_before_h: int = 4,
+) -> list[str]:
+    close_col = f"close_h{int(exit_step)}"
+    if frame.empty or close_col not in frame.columns:
+        return ["n/a" for _ in thresholds]
+    high_values, steps = _high_path_values(frame)
+    if high_values is None or steps is None:
+        return ["n/a" for _ in thresholds]
+    close_h = (
+        pd.to_numeric(frame[close_col], errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .to_numpy(dtype=float)
+    )
+    valid_close = np.isfinite(close_h)
+    if not bool(valid_close.any()):
+        return ["n/a" for _ in thresholds]
+
+    values: list[str] = []
+    trade_cost = float(config.TRADE_COST)
+    for threshold in thresholds:
+        hit = _hit_before_h_mask(high_values, steps, float(threshold), int(hit_before_h))
+        valid = valid_close
+        if not bool(valid.any()):
+            values.append("n/a")
+            continue
+        gross = np.where(hit[valid], float(threshold), close_h[valid])
         expected_net = float(np.mean(gross)) - trade_cost
         values.append(_fmt_pct(expected_net, signed=True))
     return values

@@ -19,8 +19,8 @@ DEFAULT_ARCHIVE_PATH: Path = RESULTS_DIR / "crypto_btc_archive.json"
 
 # Multi-horizon binary labels. Edit this list freely, for example [3, 7, 10, 20].
 HOLDING_HORIZONS: list[int] = [5]
-LABEL_THRESHOLD: float = 0.003  # label=1 when future_return > threshold
-LABEL_MODE: str = "mfe"  # "close_exit", "mfe", or "payoff"
+LABEL_THRESHOLD: float = 0.004  # label=1 when future_return > threshold
+LABEL_MODE: str = "mfe"  # "close_exit", "mfe", "payoff", or "exit_all"
 PAYOFF_TP: float = 0.004  # only used by LABEL_MODE="payoff"
 
 
@@ -54,6 +54,26 @@ def mfe_future_return(df: Any, horizon: int) -> Any:
     return (max_high - entry_open) / entry_open
 
 
+def exit_all_future_return(df: Any, horizon: int) -> Any:
+    """
+    Exit-model MFE label return.
+
+    This mode is aligned to a row that is evaluated after the entry/H1 candle
+    has closed. The feature row may therefore use data <= close(t), while the
+    trade entry anchor remains open(t).
+
+    future_return(t, h) = (max(high(t)..high(t+h-1)) - open(t)) / open(t)
+    """
+    h = int(horizon)
+    entry_open = df["open"]
+    future_highs = pd.concat(
+        [df["high"].shift(-offset) for offset in range(0, h)],
+        axis=1,
+    )
+    max_high = future_highs.max(axis=1, skipna=False)
+    return (max_high - entry_open) / entry_open
+
+
 def payoff_future_return(df: Any, horizon: int) -> Any:
     """
     Strategy payoff label return.
@@ -76,6 +96,7 @@ LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
     "close_exit": close_exit_future_return,
     "mfe": mfe_future_return,
     "payoff": payoff_future_return,
+    "exit_all": exit_all_future_return,
 }
 
 
@@ -137,7 +158,8 @@ MAX_RETRY: int = 5
 # Fitness. RETURN_SCORE_SCALE normalizes mean trade return so that one metric
 # cannot dominate merely by being on a wider numerical scale.
 FITNESS_HORIZON_MODE: str = "mean"  # "mean" keeps old behavior; "ensemble" requires all H signals
-TRADE_TOP_FRACTION: float = 0.1
+TRADE_TOP_FRACTION: float = 0.2
+
 MIN_TRADES_PER_SPLIT: int = 20
 TRADE_COST: float = 0.002  # 0.2% breakeven round-trip cost per selected trade
 RETURN_SCORE_SCALE: float = 0.01
@@ -145,7 +167,7 @@ BAD_AUC_THRESHOLD: float = 0.50
 
 FITNESS_WEIGHTS: dict[str, float] = {
     "auc_edge": 0.40,
-    "precision_excess": 0.3,
+    "precision_excess": 0.50,  #old: 0.30
     "trade_return_score": 0.20,
     "auc_std": -0.20,
     "overfit_gap": -0.25,
