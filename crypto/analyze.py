@@ -49,6 +49,7 @@ DAILY_ROLLING_WINDOW_DAYS = 10
 MFE_PROB_TABLE_START: float = 0.0
 MFE_PROB_TABLE_END: float = 0.007
 MFE_PROB_TABLE_STEP: float = 0.0005
+FIRST_HIT_MIN_H: int = 1
 
 
 @dataclass(frozen=True)
@@ -979,9 +980,10 @@ def _plot_individual(
     ]
     mode_name = _filename_token(label_mode)
     threshold_name = _threshold_filename_token(float(label_threshold))
+    top_fraction_name = _top_fraction_filename_token()
     filename = (
         f"rank_{rank:02d}_score_{score:.4f}_mode_{mode_name}_"
-        f"thr_{threshold_name}.png"
+        f"thr_{threshold_name}_top_{top_fraction_name}.png"
     )
     path = output_dir / filename
     _plot_sections_vertical(sections=sections, section_titles=section_titles, path=path)
@@ -1007,10 +1009,11 @@ def _plot_ensemble_individuals(
     ]
     mode_name = _filename_token(label_mode)
     threshold_name = _threshold_filename_token(float(label_threshold))
+    top_fraction_name = _top_fraction_filename_token()
     member_name = "_".join(_member_filename_token(spec) for spec in specs)
     filename = (
         f"ensemble_individuals_{member_name}_mode_{mode_name}_"
-        f"thr_{threshold_name}.png"
+        f"thr_{threshold_name}_top_{top_fraction_name}.png"
     )
     path = output_dir / filename
     _plot_sections_vertical(sections=all_sections, section_titles=section_titles, path=path)
@@ -1482,15 +1485,14 @@ def _plot_mfe_probability_table(ax: plt.Axes, result: HorizonAnalysis) -> None:
     rows = [
         ["val signal"] + _mfe_probability_row(result.val.selected, thresholds),
         ["val mean_H"] + _mfe_mean_hit_h_row(result.val.selected, thresholds),
-        ["val hit<H4/all"] + _mfe_hit_before_h_row(
+        ["val noH1 hit H2-H5"] + _mfe_no_h1_hit_between_h_row(
             result.val.selected,
             thresholds,
-            denominator="all",
+            denominator="no_h1",
         ),
-        ["val hit<H4|hit"] + _mfe_hit_before_h_row(
+        ["val noH1 hit/all"] + _mfe_no_h1_row(
             result.val.selected,
             thresholds,
-            denominator="hit",
         ),
         ["val miss close"] + _mfe_miss_close_row(result.val.selected, thresholds),
         ["val miss close H3"] + _mfe_miss_close_h_row(result.val.selected, thresholds),
@@ -1499,15 +1501,14 @@ def _plot_mfe_probability_table(ax: plt.Axes, result: HorizonAnalysis) -> None:
         ["val base"] + _mfe_probability_row(result.val.data, thresholds),
         ["test signal"] + _mfe_probability_row(result.test.selected, thresholds),
         ["test mean_H"] + _mfe_mean_hit_h_row(result.test.selected, thresholds),
-        ["test hit<H4/all"] + _mfe_hit_before_h_row(
+        ["test noH1 hit H2-H5"] + _mfe_no_h1_hit_between_h_row(
             result.test.selected,
             thresholds,
-            denominator="all",
+            denominator="no_h1",
         ),
-        ["test hit<H4|hit"] + _mfe_hit_before_h_row(
+        ["test noH1 hit/all"] + _mfe_no_h1_row(
             result.test.selected,
             thresholds,
-            denominator="hit",
         ),
         ["test miss close"] + _mfe_miss_close_row(result.test.selected, thresholds),
         ["test miss close H3"] + _mfe_miss_close_h_row(result.test.selected, thresholds),
@@ -1572,27 +1573,56 @@ def _mfe_mean_hit_h_row(frame: pd.DataFrame, thresholds: list[float]) -> list[st
     return values
 
 
-def _mfe_hit_before_h_row(
+def _mfe_no_h1_hit_between_h_row(
     frame: pd.DataFrame,
     thresholds: list[float],
-    denominator: str = "all",
-    cutoff_h: int = 4,
+    denominator: str = "no_h1",
+    after_h: int = 1,
+    before_h: int = 6,
+) -> list[str]:
+    high_values, steps = _high_path_values(frame)
+    if high_values is None or steps is None:
+        return ["n/a" for _ in thresholds]
+
+    denominator = str(denominator).strip().lower()
+    total = len(high_values)
+    values: list[str] = []
+    for threshold in thresholds:
+        hit_h1 = _hit_at_h_mask(high_values, steps, float(threshold), h=1)
+        no_h1 = ~hit_h1
+        denom = total if denominator == "all" else int(no_h1.sum())
+        if denom == 0:
+            values.append("n/a")
+            continue
+        between_hit_mask = _hit_between_h_mask(
+            high_values,
+            steps,
+            float(threshold),
+            after_h=after_h,
+            before_h=before_h,
+        )
+        between_hit_ratio = float((between_hit_mask & no_h1).sum() / denom)
+        values.append(_fmt_pct(between_hit_ratio))
+    return values
+
+
+def _mfe_no_h1_row(
+    frame: pd.DataFrame,
+    thresholds: list[float],
 ) -> list[str]:
     high_values, steps = _high_path_values(frame)
     if high_values is None or steps is None:
         return ["n/a" for _ in thresholds]
 
     total = len(high_values)
-    denominator = str(denominator).strip().lower()
     values: list[str] = []
     for threshold in thresholds:
-        first_hit_steps = _first_hit_steps(high_values, steps, float(threshold))
-        if len(first_hit_steps) == 0 or total == 0:
+        if total == 0:
             values.append("n/a")
             continue
-        denom = len(first_hit_steps) if denominator == "hit" else total
-        early_hit_ratio = float((first_hit_steps < cutoff_h).sum() / denom)
-        values.append(_fmt_pct(early_hit_ratio))
+        hit_h1 = _hit_at_h_mask(high_values, steps, float(threshold), h=1)
+        ratio = float((~hit_h1).sum() / total)
+        values.append(_fmt_pct(ratio))
     return values
 
 
@@ -1617,13 +1647,19 @@ def _first_hit_steps(
     high_values: np.ndarray,
     steps: np.ndarray,
     threshold: float,
+    min_h: int = FIRST_HIT_MIN_H,
 ) -> np.ndarray:
-    hit_mask = high_values > float(threshold)
+    step_mask = steps >= float(min_h)
+    if not bool(step_mask.any()):
+        return np.array([], dtype=float)
+    hit_values = high_values[:, step_mask]
+    hit_steps = steps[step_mask]
+    hit_mask = hit_values > float(threshold)
     has_hit = hit_mask.any(axis=1)
     if not bool(has_hit.any()):
         return np.array([], dtype=float)
     first_hit_position = hit_mask[has_hit].argmax(axis=1)
-    return steps[first_hit_position]
+    return hit_steps[first_hit_position]
 
 
 def _hit_before_h_mask(
@@ -1633,6 +1669,43 @@ def _hit_before_h_mask(
     cutoff_h: int,
 ) -> np.ndarray:
     step_mask = steps < float(cutoff_h)
+    if not bool(step_mask.any()):
+        return np.zeros(len(high_values), dtype=bool)
+    return (high_values[:, step_mask] > float(threshold)).any(axis=1)
+
+
+def _hit_at_h_mask(
+    high_values: np.ndarray,
+    steps: np.ndarray,
+    threshold: float,
+    h: int,
+) -> np.ndarray:
+    step_mask = steps == float(h)
+    if not bool(step_mask.any()):
+        return np.zeros(len(high_values), dtype=bool)
+    return (high_values[:, step_mask] > float(threshold)).any(axis=1)
+
+
+def _hit_between_h_mask(
+    high_values: np.ndarray,
+    steps: np.ndarray,
+    threshold: float,
+    after_h: int,
+    before_h: int,
+) -> np.ndarray:
+    step_mask = (steps > float(after_h)) & (steps < float(before_h))
+    if not bool(step_mask.any()):
+        return np.zeros(len(high_values), dtype=bool)
+    return (high_values[:, step_mask] > float(threshold)).any(axis=1)
+
+
+def _hit_after_h_mask(
+    high_values: np.ndarray,
+    steps: np.ndarray,
+    threshold: float,
+    h: int,
+) -> np.ndarray:
+    step_mask = steps > float(h)
     if not bool(step_mask.any()):
         return np.zeros(len(high_values), dtype=bool)
     return (high_values[:, step_mask] > float(threshold)).any(axis=1)
@@ -1775,6 +1848,12 @@ def _fmt_threshold_pct(value: float) -> str:
 def _threshold_filename_token(value: float) -> str:
     pct = value * 100.0
     token = f"{pct:.3f}pct"
+    return _filename_token(token)
+
+
+def _top_fraction_filename_token() -> str:
+    pct = float(config.TRADE_TOP_FRACTION) * 100.0
+    token = f"{pct:.2f}pct"
     return _filename_token(token)
 
 

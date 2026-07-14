@@ -88,6 +88,9 @@ def add_binary_labels(
     for h in horizons:
         h = int(h)
         future_return = label_return_fn(labeled, h)
+        if selected_mode == "exit_all":
+            h1_return = (labeled["high"] - labeled["open"]) / labeled["open"]
+            future_return = future_return.mask(h1_return > float(label_threshold))
         labeled[f"future_return_h{h}"] = future_return
         labeled[f"label_h{h}"] = (future_return > float(label_threshold)).astype("float")
         labeled.loc[future_return.isna(), f"label_h{h}"] = np.nan

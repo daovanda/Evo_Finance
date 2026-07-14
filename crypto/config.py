@@ -60,14 +60,19 @@ def exit_all_future_return(df: Any, horizon: int) -> Any:
 
     This mode is aligned to a row that is evaluated after the entry/H1 candle
     has closed. The feature row may therefore use data <= close(t), while the
-    trade entry anchor remains open(t).
+    trade entry anchor remains open(t). H1 hits are filtered out in
+    crypto.data.add_binary_labels() using the active label threshold, because
+    in live trading this exit model is only evaluated when the take profit was
+    not reached during H1.
 
-    future_return(t, h) = (max(high(t)..high(t+h-1)) - open(t)) / open(t)
+    future_return(t, h) = (max(high(t+1)..high(t+h-1)) - open(t)) / open(t)
     """
     h = int(horizon)
+    if h < 2:
+        return pd.Series(pd.NA, index=df.index, dtype="float64")
     entry_open = df["open"]
     future_highs = pd.concat(
-        [df["high"].shift(-offset) for offset in range(0, h)],
+        [df["high"].shift(-offset) for offset in range(1, h)],
         axis=1,
     )
     max_high = future_highs.max(axis=1, skipna=False)
