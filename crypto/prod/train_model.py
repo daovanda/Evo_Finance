@@ -67,7 +67,7 @@ def train_from_archive(
 
     logger.info("Loading crypto data from %s", data_path)
     raw_df = load_ohlcv(data_path)
-    label_mode = str(label_mode).strip().lower()
+    label_mode = config.canonical_label_mode(label_mode)
     label_threshold = config.default_label_threshold(label_mode, label_threshold)
     labeled_df = add_binary_labels(
         raw_df,
@@ -179,7 +179,7 @@ def train_ensemble_from_specs(
         raise ValueError("Need at least one ensemble individual spec.")
     config.validate_config()
     run_name = run_name or "crypto_ensemble"
-    default_label_mode = str(default_label_mode).strip().lower()
+    default_label_mode = config.canonical_label_mode(default_label_mode)
     default_label_threshold = config.default_label_threshold(
         default_label_mode,
         default_label_threshold,
@@ -235,11 +235,8 @@ def train_ensemble_from_specs(
 
     label_cache: dict[tuple[str, float], tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]] = {}
     for spec in specs:
-        label_mode = str(spec.label_mode or default_label_mode).strip().lower()
+        label_mode = config.canonical_label_mode(spec.label_mode or default_label_mode)
         label_threshold = _resolve_spec_label_threshold(spec, default_label_threshold)
-        if label_mode not in config.LABEL_RETURN_FNS:
-            allowed = ", ".join(sorted(config.LABEL_RETURN_FNS))
-            raise ValueError(f"Unknown label mode {label_mode!r}. Allowed: {allowed}.")
         cache_key = (label_mode, label_threshold)
         if cache_key not in label_cache:
             labeled_df = add_binary_labels(
@@ -589,9 +586,8 @@ def _parse_ensemble_specs(values: list[str] | None) -> list[EnsembleIndividualSp
                 "Invalid --ensemble-individual spec. Use ARCHIVE#RANK[#MODE[#THRESHOLD]], "
                 f"got: {raw_value!r}"
             )
-        if mode_text is not None and mode_text not in config.LABEL_RETURN_FNS:
-            allowed = ", ".join(sorted(config.LABEL_RETURN_FNS))
-            raise ValueError(f"Invalid label mode {mode_text!r}. Allowed: {allowed}.")
+        if mode_text is not None:
+            mode_text = config.canonical_label_mode(mode_text)
         specs.append(
             EnsembleIndividualSpec(
                 archive_path=Path(path_text),
@@ -639,9 +635,12 @@ def main() -> None:
     parser.add_argument("--test-end", default=config.TEST_END)
     parser.add_argument(
         "--label-mode",
-        choices=sorted(config.LABEL_RETURN_FNS),
         default=config.LABEL_MODE,
-        help=f"Label mode used when training production models. Default: {config.LABEL_MODE}.",
+        help=(
+            "Label mode used when training production models. "
+            f"Allowed: {', '.join(sorted(config.LABEL_RETURN_FNS))}. "
+            f"Alias accepted: exit_all -> exit_after_h1. Default: {config.LABEL_MODE}."
+        ),
     )
     parser.add_argument(
         "--label-threshold",

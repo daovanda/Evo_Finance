@@ -82,15 +82,23 @@ def add_binary_labels(
     label = 1 if future_return > threshold, else 0.
     """
     labeled = df.sort_index().copy()
-    selected_mode = str(label_mode or config.LABEL_MODE).strip().lower()
+    selected_mode = config.canonical_label_mode(label_mode)
     label_return_fn = return_fn or config.get_label_return_fn(selected_mode)
     label_threshold = config.default_label_threshold(selected_mode, threshold)
     for h in horizons:
         h = int(h)
         future_return = label_return_fn(labeled, h)
-        if selected_mode == "exit_all":
+        if selected_mode == "exit_after_h1":
             h1_return = (labeled["high"] - labeled["open"]) / labeled["open"]
             future_return = future_return.mask(h1_return > float(label_threshold))
+        elif selected_mode == "exit_after_h2":
+            entry_open = labeled["open"].shift(1)
+            h1_return = (labeled["high"].shift(1) - entry_open) / entry_open
+            h2_return = (labeled["high"] - entry_open) / entry_open
+            hit_h1_or_h2 = (h1_return > float(label_threshold)) | (
+                h2_return > float(label_threshold)
+            )
+            future_return = future_return.mask(hit_h1_or_h2)
         labeled[f"future_return_h{h}"] = future_return
         labeled[f"label_h{h}"] = (future_return > float(label_threshold)).astype("float")
         labeled.loc[future_return.isna(), f"label_h{h}"] = np.nan

@@ -117,7 +117,7 @@ def analyze(
 
     logger.info("Loading crypto data from %s", data_path)
     raw_df = load_ohlcv(data_path)
-    label_mode = str(label_mode).strip().lower()
+    label_mode = config.canonical_label_mode(label_mode)
     label_threshold = config.default_label_threshold(label_mode, label_threshold)
     labeled_df = add_binary_labels(
         raw_df,
@@ -223,7 +223,7 @@ def analyze_ensemble_individuals(
 
     logger.info("Loading crypto data from %s", data_path)
     raw_df = load_ohlcv(data_path)
-    label_mode = str(label_mode).strip().lower()
+    label_mode = config.canonical_label_mode(label_mode)
     label_threshold = config.default_label_threshold(label_mode, label_threshold)
     labeled_df = add_binary_labels(
         raw_df,
@@ -269,7 +269,7 @@ def analyze_ensemble_individuals(
     def return_context_for(
         mode: str,
     ) -> tuple[dict[int, pd.Series], dict[int, pd.DataFrame], dict[int, pd.Series]]:
-        mode = str(mode).strip().lower()
+        mode = config.canonical_label_mode(mode)
         cached = return_context_cache.get(mode)
         if cached is None:
             cached = _return_context_by_horizon(
@@ -306,7 +306,7 @@ def analyze_ensemble_individuals(
     active_entries: list[dict[str, Any]] = []
     for spec, entry in spec_entries:
         individual = _entry_to_individual(entry)
-        member_label_mode = str(spec.label_mode or label_mode).strip().lower()
+        member_label_mode = config.canonical_label_mode(spec.label_mode or label_mode)
         member_label_threshold = _resolve_spec_label_threshold(spec, float(label_threshold))
         if member_label_mode == label_mode and member_label_threshold == float(label_threshold):
             member_train_df, member_val_df, member_test_df = train_df, val_df, test_df
@@ -933,27 +933,37 @@ def _close_exit_return(
 
 def _entry_open_for_mode(data: pd.DataFrame, label_mode: str) -> pd.Series:
     open_ = pd.to_numeric(data["open"], errors="coerce")
-    if _is_exit_all_mode(label_mode):
+    if _is_exit_after_h1_mode(label_mode):
         return open_
+    if _is_exit_after_h2_mode(label_mode):
+        return open_.shift(1)
     return open_.shift(-1)
 
 
 def _future_offsets_for_mode(horizon: int, label_mode: str) -> range:
     h = int(horizon)
-    if _is_exit_all_mode(label_mode):
+    if _is_exit_after_h1_mode(label_mode):
         return range(0, h)
+    if _is_exit_after_h2_mode(label_mode):
+        return range(-1, h - 1)
     return range(1, h + 1)
 
 
 def _close_offset_for_mode(horizon: int, label_mode: str) -> int:
     h = int(horizon)
-    if _is_exit_all_mode(label_mode):
+    if _is_exit_after_h1_mode(label_mode):
         return max(h - 1, 0)
+    if _is_exit_after_h2_mode(label_mode):
+        return max(h - 2, 0)
     return h
 
 
-def _is_exit_all_mode(label_mode: str) -> bool:
-    return str(label_mode).strip().lower() == "exit_all"
+def _is_exit_after_h1_mode(label_mode: str) -> bool:
+    return config.canonical_label_mode(label_mode) == "exit_after_h1"
+
+
+def _is_exit_after_h2_mode(label_mode: str) -> bool:
+    return config.canonical_label_mode(label_mode) == "exit_after_h2"
 
 
 def _plot_individual(
@@ -1087,7 +1097,7 @@ def _member_section_title(spec: EnsembleIndividualSpec, entry: dict[str, Any]) -
             score_text = f" | score={float(score):.4f}"
         except (TypeError, ValueError):
             score_text = f" | score={score}"
-    mode_text = spec.label_mode or config.LABEL_MODE
+    mode_text = config.canonical_label_mode(spec.label_mode or config.LABEL_MODE)
     threshold_text = (
         float(spec.label_threshold)
         if spec.label_threshold is not None
@@ -2005,12 +2015,8 @@ def _parse_ensemble_specs(values: list[str] | None) -> list[EnsembleIndividualSp
         rank_text = rank_text.strip()
         if not path_text or not rank_text:
             raise ValueError(f"Invalid --ensemble-individual spec: {raw_value!r}")
-        if mode_text is not None and mode_text not in config.LABEL_RETURN_FNS:
-            allowed = ", ".join(sorted(config.LABEL_RETURN_FNS))
-            raise ValueError(
-                f"Invalid label mode in --ensemble-individual: {mode_text!r}. "
-                f"Allowed: {allowed}."
-            )
+        if mode_text is not None:
+            mode_text = config.canonical_label_mode(mode_text)
         specs.append(
             EnsembleIndividualSpec(
                 archive_path=Path(path_text),
@@ -2055,9 +2061,12 @@ def main() -> None:
     parser.add_argument("--test-end", default=config.TEST_END)
     parser.add_argument(
         "--label-mode",
-        choices=sorted(config.LABEL_RETURN_FNS),
         default=config.LABEL_MODE,
-        help=f"Label mode used when recalculating labels. Default: {config.LABEL_MODE}.",
+        help=(
+            "Label mode used when recalculating labels. "
+            f"Allowed: {', '.join(sorted(config.LABEL_RETURN_FNS))}. "
+            f"Alias accepted: exit_all -> exit_after_h1. Default: {config.LABEL_MODE}."
+        ),
     )
     parser.add_argument(
         "--label-threshold",

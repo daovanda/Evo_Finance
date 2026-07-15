@@ -55,7 +55,7 @@ def run(
 ) -> CryptoArchive:
     config.validate_config()
     horizons = [int(h) for h in horizons]
-    label_mode = str(label_mode).strip().lower()
+    label_mode = config.canonical_label_mode(label_mode)
     label_threshold = config.default_label_threshold(label_mode, label_threshold)
     label_return_fn = config.get_label_return_fn(label_mode)
     purge_bars = config.purge_bars_for_horizons(horizons)
@@ -278,9 +278,15 @@ def _validate_resume_metadata(
         )
         return
 
+    metadata_label_mode = metadata.get("label_mode", "")
+    archive_label_mode = (
+        config.canonical_label_mode(metadata_label_mode)
+        if metadata_label_mode not in (None, "")
+        else ""
+    )
     checks: list[tuple[str, object, object]] = [
         ("horizons", [int(h) for h in metadata.get("horizons", [])], [int(h) for h in horizons]),
-        ("label_mode", str(metadata.get("label_mode", "")).strip().lower(), label_mode),
+        ("label_mode", archive_label_mode, label_mode),
         ("label_threshold", metadata.get("label_threshold"), float(label_threshold)),
         (
             "fitness_horizon_mode",
@@ -290,7 +296,6 @@ def _validate_resume_metadata(
         ("trade_top_fraction", metadata.get("trade_top_fraction"), float(config.TRADE_TOP_FRACTION)),
         ("trade_cost", metadata.get("trade_cost"), float(config.TRADE_COST)),
     ]
-    archive_label_mode = str(metadata.get("label_mode", "")).strip().lower()
     if label_mode == "payoff" and archive_label_mode == "payoff":
         checks.append(("payoff_tp", metadata.get("payoff_tp"), float(config.PAYOFF_TP)))
 
@@ -370,9 +375,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--label-mode",
-        choices=sorted(config.LABEL_RETURN_FNS),
         default=config.LABEL_MODE,
-        help=f"Label mode. Default: {config.LABEL_MODE}.",
+        help=(
+            f"Label mode. Allowed: {', '.join(sorted(config.LABEL_RETURN_FNS))}. "
+            f"Alias accepted: exit_all -> exit_after_h1. Default: {config.LABEL_MODE}."
+        ),
     )
     parser.add_argument("--val-start", default=config.VAL_START)
     parser.add_argument("--test-start", default=config.TEST_START)

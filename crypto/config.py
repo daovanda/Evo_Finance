@@ -20,7 +20,7 @@ DEFAULT_ARCHIVE_PATH: Path = RESULTS_DIR / "crypto_btc_archive.json"
 # Multi-horizon binary labels. Edit this list freely, for example [3, 7, 10, 20].
 HOLDING_HORIZONS: list[int] = [5]
 LABEL_THRESHOLD: float = 0.004  # label=1 when future_return > threshold
-LABEL_MODE: str = "mfe"  # "close_exit", "mfe", "payoff", or "exit_all"
+LABEL_MODE: str = "mfe"  # "close_exit", "mfe", "payoff", "exit_after_h1", or "exit_after_h2"
 PAYOFF_TP: float = 0.004  # only used by LABEL_MODE="payoff"
 
 
@@ -54,9 +54,9 @@ def mfe_future_return(df: Any, horizon: int) -> Any:
     return (max_high - entry_open) / entry_open
 
 
-def exit_all_future_return(df: Any, horizon: int) -> Any:
+def exit_after_h1_future_return(df: Any, horizon: int) -> Any:
     """
-    Exit-model MFE label return.
+    Exit model evaluated after H1 has closed.
 
     This mode is aligned to a row that is evaluated after the entry/H1 candle
     has closed. The feature row may therefore use data <= close(t), while the
@@ -73,6 +73,38 @@ def exit_all_future_return(df: Any, horizon: int) -> Any:
     entry_open = df["open"]
     future_highs = pd.concat(
         [df["high"].shift(-offset) for offset in range(1, h)],
+        axis=1,
+    )
+    max_high = future_highs.max(axis=1, skipna=False)
+    return (max_high - entry_open) / entry_open
+
+
+exit_all_future_return = exit_after_h1_future_return
+
+
+def exit_after_h2_future_return(df: Any, horizon: int) -> Any:
+    """
+    Exit model evaluated after H2 has closed.
+
+    This mode is aligned to a row s that represents H2. The feature row may use
+    data <= close(s), while the original trade entry remains open(s-1), i.e.
+    open H1. H1/H2 hits are filtered out in crypto.data.add_binary_labels()
+    using the active label threshold.
+
+    For h=5:
+        entry = open(s-1)
+        future_return = (max(high(s+1), high(s+2), high(s+3)) - entry) / entry
+
+    In base-signal coordinates, this is:
+        base signal t, entry open(t+1), model row s=t+2,
+        label=1 if no H1/H2 hit and there is a hit in H3-H5.
+    """
+    h = int(horizon)
+    if h < 3:
+        return pd.Series(pd.NA, index=df.index, dtype="float64")
+    entry_open = df["open"].shift(1)
+    future_highs = pd.concat(
+        [df["high"].shift(-offset) for offset in range(1, h - 1)],
         axis=1,
     )
     max_high = future_highs.max(axis=1, skipna=False)
@@ -101,22 +133,33 @@ LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
     "close_exit": close_exit_future_return,
     "mfe": mfe_future_return,
     "payoff": payoff_future_return,
-    "exit_all": exit_all_future_return,
+    "exit_after_h1": exit_after_h1_future_return,
+    "exit_after_h2": exit_after_h2_future_return,
+}
+
+LABEL_MODE_ALIASES: dict[str, str] = {
+    "exit_all": "exit_after_h1",
 }
 
 
-def get_label_return_fn(mode: str | None = None) -> Callable[[Any, int], Any]:
+def canonical_label_mode(mode: str | None = None) -> str:
     selected_mode = str(mode or LABEL_MODE).strip().lower()
+    selected_mode = LABEL_MODE_ALIASES.get(selected_mode, selected_mode)
     if selected_mode not in LABEL_RETURN_FNS:
-        allowed = ", ".join(sorted(LABEL_RETURN_FNS))
+        allowed = ", ".join(sorted([*LABEL_RETURN_FNS, *LABEL_MODE_ALIASES]))
         raise ValueError(f"Unknown LABEL_MODE={selected_mode!r}. Allowed: {allowed}.")
+    return selected_mode
+
+
+def get_label_return_fn(mode: str | None = None) -> Callable[[Any, int], Any]:
+    selected_mode = canonical_label_mode(mode)
     return LABEL_RETURN_FNS[selected_mode]
 
 
 def default_label_threshold(mode: str | None = None, threshold: float | None = None) -> float:
     if threshold is not None:
         return float(threshold)
-    selected_mode = str(mode or LABEL_MODE).strip().lower()
+    selected_mode = canonical_label_mode(mode)
     if selected_mode == "payoff":
         return float(TRADE_COST)
     return float(LABEL_THRESHOLD)
@@ -163,7 +206,7 @@ MAX_RETRY: int = 5
 # Fitness. RETURN_SCORE_SCALE normalizes mean trade return so that one metric
 # cannot dominate merely by being on a wider numerical scale.
 FITNESS_HORIZON_MODE: str = "mean"  # "mean" keeps old behavior; "ensemble" requires all H signals
-TRADE_TOP_FRACTION: float = 0.2
+TRADE_TOP_FRACTION: float = 0.20
 
 MIN_TRADES_PER_SPLIT: int = 20
 TRADE_COST: float = 0.002  # 0.2% breakeven round-trip cost per selected trade

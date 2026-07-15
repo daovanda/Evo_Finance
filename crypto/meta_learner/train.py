@@ -143,8 +143,8 @@ def train_meta_learner(
         raise ValueError("At least one horizon is required.")
     meta_exit_horizon = int(meta_exit_horizon or max(horizons))
 
-    base_label_mode = str(base_label_mode).strip().lower()
-    meta_label_mode = str(meta_label_mode).strip().lower()
+    base_label_mode = config.canonical_label_mode(base_label_mode)
+    meta_label_mode = config.canonical_label_mode(meta_label_mode)
     base_label_threshold = config.default_label_threshold(
         base_label_mode,
         base_label_threshold,
@@ -1209,9 +1209,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--base-label-mode",
-        choices=sorted(config.LABEL_RETURN_FNS),
         default=config.LABEL_MODE,
-        help="Label mode used to retrain the archive individual per fold.",
+        help=(
+            "Label mode used to retrain the archive individual per fold. "
+            f"Allowed: {', '.join(sorted(config.LABEL_RETURN_FNS))}. "
+            "Alias accepted: exit_all -> exit_after_h1."
+        ),
     )
     parser.add_argument(
         "--base-label-threshold",
@@ -1221,9 +1224,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--meta-label-mode",
-        choices=sorted(config.LABEL_RETURN_FNS),
         default="payoff",
-        help="Label mode used for the meta learner target. Default: payoff.",
+        help=(
+            "Label mode used for the meta learner target. "
+            f"Allowed: {', '.join(sorted(config.LABEL_RETURN_FNS))}. "
+            "Alias accepted: exit_all -> exit_after_h1. Default: payoff."
+        ),
     )
     parser.add_argument(
         "--meta-label-threshold",
