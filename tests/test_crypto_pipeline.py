@@ -15,6 +15,14 @@ from crypto.fitness import CryptoFitnessEvaluator, _internal_early_stop_split
 
 
 class CryptoPipelineTests(unittest.TestCase):
+    def test_config_allows_finite_negative_label_threshold(self):
+        old_threshold = config.LABEL_THRESHOLD
+        try:
+            config.LABEL_THRESHOLD = -0.001
+            config.validate_config()
+        finally:
+            config.LABEL_THRESHOLD = old_threshold
+
     def test_binary_label_uses_next_open_and_future_close(self):
         idx = pd.date_range("2024-01-01", periods=5, freq="15min")
         df = pd.DataFrame(

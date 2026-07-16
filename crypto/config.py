@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -216,10 +217,10 @@ BAD_AUC_THRESHOLD: float = 0.50
 FITNESS_WEIGHTS: dict[str, float] = {
     "auc_edge": 0.40,
     "precision_excess": 0.50,  #old: 0.30
-    "trade_return_score": 0.20,
-    "auc_std": -0.20,
-    "overfit_gap": -0.25,
-    "bad_fold_ratio": -0.30,
+    "trade_return_score": 0.0, #old: 0.20 
+    "auc_std": -0.20, #old: -0.20
+    "overfit_gap": -0.25, #old: -0.25
+    "bad_fold_ratio": 0.0, #old: -0.30
 }
 
 # Binary LightGBM. These are deliberately conservative because evolution itself
@@ -260,8 +261,8 @@ def validate_config() -> None:
         raise ValueError("HOLDING_HORIZONS must not be empty.")
     if any(int(h) < 1 for h in HOLDING_HORIZONS):
         raise ValueError("HOLDING_HORIZONS must contain positive integers.")
-    if LABEL_THRESHOLD < 0:
-        raise ValueError("LABEL_THRESHOLD must be non-negative.")
+    if not isfinite(float(LABEL_THRESHOLD)):
+        raise ValueError("LABEL_THRESHOLD must be finite.")
     get_label_return_fn()
     if PAYOFF_TP <= 0:
         raise ValueError("PAYOFF_TP must be positive.")

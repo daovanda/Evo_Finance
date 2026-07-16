@@ -44,6 +44,7 @@ def run(
     horizons: list[int] | tuple[int, ...] = tuple(config.HOLDING_HORIZONS),
     label_threshold: float | None = None,
     label_mode: str = config.LABEL_MODE,
+    trade_top_fraction: float | None = None,
     val_start: str = config.VAL_START,
     test_start: str = config.TEST_START,
     test_end: str | None = config.TEST_END,
@@ -57,11 +58,24 @@ def run(
     horizons = [int(h) for h in horizons]
     label_mode = config.canonical_label_mode(label_mode)
     label_threshold = config.default_label_threshold(label_mode, label_threshold)
+    if not np.isfinite(float(label_threshold)):
+        raise ValueError("label_threshold must be finite.")
+    if trade_top_fraction is not None:
+        trade_top_fraction = float(trade_top_fraction)
+        if not np.isfinite(trade_top_fraction) or not 0.0 < trade_top_fraction <= 1.0:
+            raise ValueError("trade_top_fraction must be finite and in (0, 1].")
+        config.TRADE_TOP_FRACTION = trade_top_fraction
     label_return_fn = config.get_label_return_fn(label_mode)
     purge_bars = config.purge_bars_for_horizons(horizons)
     wf_end = wf_end or test_start
     rng = np.random.default_rng(seed)
 
+    logger.info(
+        "Run labels: mode=%s | threshold=%g | trade_top_fraction=%.2f%%",
+        label_mode,
+        label_threshold,
+        100.0 * float(config.TRADE_TOP_FRACTION),
+    )
     logger.info("Loading crypto data from %s", data_path)
     raw_df = load_ohlcv(data_path)
     labeled_df = add_binary_labels(
@@ -381,6 +395,15 @@ def main() -> None:
             f"Alias accepted: exit_all -> exit_after_h1. Default: {config.LABEL_MODE}."
         ),
     )
+    parser.add_argument(
+        "--trade-top-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Fraction of highest predictions selected for fitness/trading. "
+            f"Default: config.TRADE_TOP_FRACTION={config.TRADE_TOP_FRACTION}."
+        ),
+    )
     parser.add_argument("--val-start", default=config.VAL_START)
     parser.add_argument("--test-start", default=config.TEST_START)
     parser.add_argument("--test-end", default=config.TEST_END)
@@ -400,6 +423,7 @@ def main() -> None:
         horizons=args.horizons,
         label_threshold=args.label_threshold,
         label_mode=args.label_mode,
+        trade_top_fraction=args.trade_top_fraction,
         val_start=args.val_start,
         test_start=args.test_start,
         test_end=args.test_end,
