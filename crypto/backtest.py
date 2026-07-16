@@ -1,25 +1,28 @@
-"""Backtest the live two-stage crypto strategy.
+"""Backtest the live staged crypto strategy.
 
 This module evaluates the practical flow:
 
 1. One or more base archive individuals create the original trade signal at t.
-2. If the trade has not hit take profit before the exit model is due, the exit
-   model is evaluated at the correct delayed bar for its label mode.
-3. Report how often base signals survive to that exit point and how often the
-   exit model selects those cases.
+2. If the trade has not hit take profit during H1, exit_after_h1 is evaluated
+   at t+1.
+3. If exit_after_h1 does not select the trade and H2 also does not hit take
+   profit, exit_after_h2 is evaluated at t+2.
+4. Report each stage with table-only charts.
 
 Examples:
     python -m crypto.backtest ^
       --base crypto/results/crypto_btc_mfe_h5_seed1_12h.json#1#mfe#0.003 ^
       --base crypto/results/crypto_btc_close_exit_h5_seed1_12h.json#1#close_exit#0.001 ^
       --base-ensemble and ^
-      --exit crypto/results/crypto_btc_exit_after_h1_h5_noh1_tp04_seed1_12h.json#1#exit_after_h1#0.004 ^
+      --exit1 crypto/results/crypto_btc_exit_after_h1_h5_noh1_tp04_seed1_12h.json#1#exit_after_h1#0.004 ^
+      --exit2 crypto/results/crypto_btc_exit_after_h2_h5_tp04_seed1_12h.json#1#exit_after_h2#0.004 ^
       --tp-threshold 0.004
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import re
@@ -103,7 +106,8 @@ class BacktestResult:
 
 def run_backtest(
     base_specs: list[ModelSpec],
-    exit_spec: ModelSpec,
+    exit1_spec: ModelSpec,
+    exit2_spec: ModelSpec,
     data_path: str | Path = config.DATA_PATH,
     out_dir: str | Path = DEFAULT_OUT_DIR,
     base_ensemble: str = "and",
@@ -118,26 +122,51 @@ def run_backtest(
     if base_ensemble not in {"and", "or"}:
         raise ValueError("--base-ensemble must be 'and' or 'or'.")
 
-    tp = float(tp_threshold if tp_threshold is not None else exit_spec.label_threshold)
+    tp = float(tp_threshold if tp_threshold is not None else exit1_spec.label_threshold)
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
     logger.info(
-        "Backtest setup: base_specs=%d | base_ensemble=%s | exit=%s rank %d",
+        "Backtest setup: base_specs=%d | base_ensemble=%s | exit1=%s rank %d | exit2=%s rank %d",
         len(base_specs),
         base_ensemble.upper(),
-        exit_spec.archive_path,
-        exit_spec.rank,
+        exit1_spec.archive_path,
+        exit1_spec.rank,
+        exit2_spec.archive_path,
+        exit2_spec.rank,
     )
     logger.info("Loading crypto data from %s", data_path)
     raw_df = load_ohlcv(data_path)
-    horizon = int(max(config.HOLDING_HORIZONS))
-    purge_bars = config.purge_bars_for_horizons(config.HOLDING_HORIZONS)
+    base_horizons = _normalize_horizons(config.HOLDING_HORIZONS, "config.HOLDING_HORIZONS")
+    exit1_horizons = _archive_horizons(
+        exit1_spec.archive_path,
+        fallback=base_horizons,
+        label="exit1",
+    )
+    exit2_horizons = _archive_horizons(
+        exit2_spec.archive_path,
+        fallback=base_horizons,
+        label="exit2",
+    )
+    all_horizons = sorted(set(base_horizons + exit1_horizons + exit2_horizons))
+    horizon = int(max(all_horizons))
+    purge_bars = config.purge_bars_for_horizons(all_horizons)
+    logger.info(
+        "Backtest horizons: base=%s | exit1=%s | exit2=%s | path_horizon=h%d",
+        base_horizons,
+        exit1_horizons,
+        exit2_horizons,
+        horizon,
+    )
 
-    entries = [_load_rank_entry(spec.archive_path, spec.rank) for spec in [*base_specs, exit_spec]]
+    entries = [
+        _load_rank_entry(spec.archive_path, spec.rank)
+        for spec in [*base_specs, exit1_spec, exit2_spec]
+    ]
     quality_train = _quality_train_index(
         raw_df=raw_df,
         spec=base_specs[0],
+        horizons=all_horizons,
         val_start=val_start,
         test_start=test_start,
         test_end=test_end,
@@ -158,6 +187,7 @@ def run_backtest(
             entry=entry,
             raw_df=raw_df,
             feature_space=feature_space,
+            horizons=base_horizons,
             val_start=val_start,
             test_start=test_start,
             test_end=test_end,
@@ -165,18 +195,29 @@ def run_backtest(
         )
         base_bundles.append(bundle)
 
-    exit_bundle = _train_spec_bundle(
-        spec=exit_spec,
+    exit1_bundle = _train_spec_bundle(
+        spec=exit1_spec,
+        entry=entries[-2],
+        raw_df=raw_df,
+        feature_space=feature_space,
+        horizons=exit1_horizons,
+        val_start=val_start,
+        test_start=test_start,
+        test_end=test_end,
+        purge_bars=purge_bars,
+    )
+    exit2_bundle = _train_spec_bundle(
+        spec=exit2_spec,
         entry=entries[-1],
         raw_df=raw_df,
         feature_space=feature_space,
+        horizons=exit2_horizons,
         val_start=val_start,
         test_start=test_start,
         test_end=test_end,
         purge_bars=purge_bars,
     )
     base_bundle = _combine_base_bundles(base_bundles, selection=base_ensemble)
-    exit_delay_bars = _exit_delay_bars(exit_spec.label_mode)
 
     _, path_by_horizon, _ = _return_context_by_horizon(
         raw_df,
@@ -188,26 +229,26 @@ def run_backtest(
     summary_rows: list[dict[str, Any]] = []
     tp_sweep_rows: list[dict[str, Any]] = []
     tp_sweep_thresholds = _tp_sweep_thresholds()
-    for split_name, base_split, exit_split in [
-        ("val", base_bundle.val, exit_bundle.val),
-        ("test", base_bundle.test, exit_bundle.test),
+    for split_name, base_split, exit1_split, exit2_split in [
+        ("val", base_bundle.val, exit1_bundle.val, exit2_bundle.val),
+        ("test", base_bundle.test, exit1_bundle.test, exit2_bundle.test),
     ]:
         summary_row, split_tp_rows = _summarize_split(
             split=split_name,
             base_split=base_split,
-            exit_split=exit_split,
+            exit1_split=exit1_split,
+            exit2_split=exit2_split,
             path_returns=path_returns,
             raw_index=pd.DatetimeIndex(raw_df.index),
             tp_threshold=tp,
             tp_sweep_thresholds=tp_sweep_thresholds,
-            exit_delay_bars=exit_delay_bars,
         )
         summary_rows.append(summary_row)
         tp_sweep_rows.extend(split_tp_rows)
 
     summary = pd.DataFrame(summary_rows)
     tp_sweep = pd.DataFrame(tp_sweep_rows)
-    run_name = _backtest_name(base_specs, exit_spec, base_ensemble, tp)
+    run_name = _backtest_name(base_specs, exit1_spec, exit2_spec, base_ensemble, tp)
     csv_path = out_path / f"{run_name}.csv"
     tp_sweep_csv_path = out_path / f"{run_name}_tp_sweep.csv"
     chart_path = out_path / f"{run_name}.png"
@@ -218,10 +259,10 @@ def run_backtest(
         tp_sweep=tp_sweep,
         chart_path=chart_path,
         base_label=base_bundle.label,
-        exit_label=exit_bundle.label,
+        exit1_label=exit1_bundle.label,
+        exit2_label=exit2_bundle.label,
         base_ensemble=base_ensemble,
         tp_threshold=tp,
-        exit_delay_bars=exit_delay_bars,
     )
     logger.info("Saved summary: %s", csv_path)
     logger.info("Saved TP sweep: %s", tp_sweep_csv_path)
@@ -238,6 +279,7 @@ def run_backtest(
 def _quality_train_index(
     raw_df: pd.DataFrame,
     spec: ModelSpec,
+    horizons: list[int],
     val_start: str,
     test_start: str,
     test_end: str | None,
@@ -245,7 +287,7 @@ def _quality_train_index(
 ) -> pd.Index:
     labeled = add_binary_labels(
         raw_df,
-        horizons=config.HOLDING_HORIZONS,
+        horizons=horizons,
         threshold=spec.label_threshold,
         return_fn=config.get_label_return_fn(spec.label_mode),
         label_mode=spec.label_mode,
@@ -258,6 +300,47 @@ def _quality_train_index(
         purge_bars=purge_bars,
     )
     return train_df.index
+
+
+def _archive_horizons(path: Path, fallback: list[int], label: str) -> list[int]:
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Could not read metadata.horizons for %s archive %s; using fallback %s. Error: %s",
+            label,
+            path,
+            fallback,
+            exc,
+        )
+        return list(fallback)
+
+    metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+    raw_horizons = metadata.get("horizons") if isinstance(metadata, dict) else None
+    if raw_horizons is None:
+        logger.warning(
+            "%s archive %s has no metadata.horizons; using fallback %s.",
+            label,
+            path,
+            fallback,
+        )
+        return list(fallback)
+    horizons = _normalize_horizons(raw_horizons, f"{label} metadata.horizons")
+    logger.info("%s archive horizons from metadata: %s", label, horizons)
+    return horizons
+
+
+def _normalize_horizons(values: Any, label: str) -> list[int]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, (list, tuple, set)):
+        raise ValueError(f"{label} must be a list of positive integers, got: {values!r}")
+    horizons = sorted({int(value) for value in values})
+    if not horizons:
+        raise ValueError(f"{label} must not be empty.")
+    if any(value < 1 for value in horizons):
+        raise ValueError(f"{label} must contain positive integers, got: {values!r}")
+    return horizons
 
 
 def _cached_feature_space(
@@ -300,23 +383,25 @@ def _train_spec_bundle(
     entry: dict[str, Any],
     raw_df: pd.DataFrame,
     feature_space: CryptoFeatureSpace,
+    horizons: list[int],
     val_start: str,
     test_start: str,
     test_end: str | None,
     purge_bars: int,
 ) -> BundleSignals:
     logger.info(
-        "Training %s rank %d | mode=%s threshold=%.6f top=%.2f%%",
+        "Training %s rank %d | mode=%s threshold=%.6f top=%.2f%% | horizons=%s",
         spec.archive_path,
         spec.rank,
         spec.label_mode,
         spec.label_threshold,
         spec.top_fraction * 100.0,
+        horizons,
     )
     individual = _entry_to_individual(entry)
     labeled = add_binary_labels(
         raw_df,
-        horizons=config.HOLDING_HORIZONS,
+        horizons=horizons,
         threshold=spec.label_threshold,
         return_fn=config.get_label_return_fn(spec.label_mode),
         label_mode=spec.label_mode,
@@ -330,7 +415,7 @@ def _train_spec_bundle(
     )
 
     horizon_results: list[tuple[int, SplitSignals, SplitSignals]] = []
-    for horizon in config.HOLDING_HORIZONS:
+    for horizon in horizons:
         result = _train_one_horizon_signal(
             individual=individual,
             horizon=int(horizon),
@@ -560,15 +645,15 @@ def _combine_indices(indices: list[pd.Index], selection: str) -> pd.Index:
 def _summarize_split(
     split: str,
     base_split: SplitSignals,
-    exit_split: SplitSignals,
+    exit1_split: SplitSignals,
+    exit2_split: SplitSignals,
     path_returns: pd.DataFrame,
     raw_index: pd.DatetimeIndex,
     tp_threshold: float,
     tp_sweep_thresholds: list[float],
-    exit_delay_bars: int,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     base_selected = pd.Index(base_split.selected_index)
-    base_path = path_returns.reindex(base_selected).dropna(subset=["high_h1"])
+    base_path = path_returns.reindex(base_selected).dropna(subset=["high_h1", "high_h2"])
     base_signals = int(len(base_path))
     if base_signals == 0:
         summary = {
@@ -576,66 +661,104 @@ def _summarize_split(
             "base_signals": 0,
             "base_no_h1": 0,
             "base_no_h1_rate": 0.0,
-            "exit_selected_after_no_h1": 0,
-            "exit_selected_after_no_h1_rate": 0.0,
-            "exit_delay_bars": int(exit_delay_bars),
-            "base_no_pre_exit_hit": 0,
-            "base_no_pre_exit_hit_rate": 0.0,
-            "exit_selected_after_pre_exit": 0,
-            "exit_selected_after_pre_exit_rate": 0.0,
-            "base_threshold_source": "val-top",
-            "exit_top_fraction": float(exit_split.top_fraction),
+            "exit1_selected": 0,
+            "exit1_selected_rate": 0.0,
+            "exit1_no_selected": 0,
+            "exit1_no_selected_rate": 0.0,
+            "exit1_top_fraction": float(exit1_split.top_fraction),
+            "exit1_pred_threshold": _json_safe_float(exit1_split.pred_threshold),
+            "exit1_no_selected_no_h2": 0,
+            "exit1_no_selected_no_h2_rate": 0.0,
+            "exit2_selected": 0,
+            "exit2_selected_rate": 0.0,
+            "exit2_no_selected": 0,
+            "exit2_no_selected_rate": 0.0,
+            "exit2_top_fraction": float(exit2_split.top_fraction),
+            "exit2_pred_threshold": _json_safe_float(exit2_split.pred_threshold),
+            "base_pred_threshold": _json_safe_float(base_split.pred_threshold),
             "tp_threshold": float(tp_threshold),
         }
         return summary, (
-            _empty_tp_sweep_rows(split, tp_sweep_thresholds, group="all_signal")
-            + _empty_tp_sweep_rows(split, tp_sweep_thresholds, group="base_no_h1")
-            + _empty_tp_sweep_rows(split, tp_sweep_thresholds, group="base_no_pre_exit_hit")
-            + _empty_tp_sweep_rows(split, tp_sweep_thresholds, group="exit_selected")
-            + _empty_tp_sweep_rows(split, tp_sweep_thresholds, group="no_exit_selected")
+            _empty_stage_tp_rows(split, tp_sweep_thresholds)
         )
 
     no_h1_index = pd.Index(base_path.index[base_path["high_h1"] <= float(tp_threshold)])
     no_h1_count = int(len(no_h1_index))
-    no_pre_exit_index = _no_pre_exit_hit_index(
-        base_path,
-        exit_delay_bars=int(exit_delay_bars),
-        tp_threshold=float(tp_threshold),
+
+    exit1_mapping = _future_bar_mapping(no_h1_index, raw_index, offset=1)
+    exit1_selected_index = pd.Index(exit1_split.selected_index)
+    exit1_selected_mapping = exit1_mapping[
+        exit1_mapping["exit_index"].isin(exit1_selected_index)
+    ]
+    exit1_no_selected_mapping = exit1_mapping[
+        ~exit1_mapping["exit_index"].isin(exit1_selected_index)
+    ]
+    exit1_selected_base_index = pd.Index(exit1_selected_mapping["base_index"])
+    exit1_no_selected_base_index = pd.Index(exit1_no_selected_mapping["base_index"])
+    exit1_selected_count = int(len(exit1_selected_base_index))
+    exit1_no_selected_count = int(len(exit1_no_selected_base_index))
+
+    exit1_no_selected_path = path_returns.reindex(exit1_no_selected_base_index)
+    exit1_no_selected_no_h2_index = pd.Index(
+        exit1_no_selected_path.index[
+            pd.to_numeric(exit1_no_selected_path["high_h2"], errors="coerce")
+            <= float(tp_threshold)
+        ]
     )
-    no_pre_exit_count = int(len(no_pre_exit_index))
-    exit_mapping = _future_bar_mapping(no_pre_exit_index, raw_index, offset=int(exit_delay_bars))
-    exit_selected = pd.Index(exit_split.selected_index)
-    exit_selected_mapping = exit_mapping[exit_mapping["exit_index"].isin(exit_selected)]
-    no_exit_selected_mapping = exit_mapping[~exit_mapping["exit_index"].isin(exit_selected)]
-    exit_after_pre_exit = int(len(exit_selected_mapping))
-    exit_selected_base_index = pd.Index(exit_selected_mapping["base_index"])
-    no_exit_selected_base_index = pd.Index(no_exit_selected_mapping["base_index"])
+    exit1_no_selected_no_h2_count = int(len(exit1_no_selected_no_h2_index))
+
+    exit2_mapping = _future_bar_mapping(exit1_no_selected_no_h2_index, raw_index, offset=2)
+    exit2_selected_index = pd.Index(exit2_split.selected_index)
+    exit2_selected_mapping = exit2_mapping[
+        exit2_mapping["exit_index"].isin(exit2_selected_index)
+    ]
+    exit2_no_selected_mapping = exit2_mapping[
+        ~exit2_mapping["exit_index"].isin(exit2_selected_index)
+    ]
+    exit2_selected_base_index = pd.Index(exit2_selected_mapping["base_index"])
+    exit2_no_selected_base_index = pd.Index(exit2_no_selected_mapping["base_index"])
+    exit2_selected_count = int(len(exit2_selected_base_index))
+    exit2_no_selected_count = int(len(exit2_no_selected_base_index))
+
     summary = {
         "split": split,
         "base_signals": base_signals,
         "base_no_h1": no_h1_count,
         "base_no_h1_rate": no_h1_count / base_signals if base_signals else 0.0,
-        "exit_selected_after_no_h1": exit_after_pre_exit,
-        "exit_selected_after_no_h1_rate": (
-            exit_after_pre_exit / no_h1_count if no_h1_count else 0.0
+        "exit1_selected": exit1_selected_count,
+        "exit1_selected_rate": exit1_selected_count / no_h1_count if no_h1_count else 0.0,
+        "exit1_no_selected": exit1_no_selected_count,
+        "exit1_no_selected_rate": (
+            exit1_no_selected_count / no_h1_count if no_h1_count else 0.0
         ),
-        "exit_delay_bars": int(exit_delay_bars),
-        "base_no_pre_exit_hit": no_pre_exit_count,
-        "base_no_pre_exit_hit_rate": (
-            no_pre_exit_count / base_signals if base_signals else 0.0
+        "exit1_top_fraction": float(exit1_split.top_fraction),
+        "exit1_no_selected_no_h2": exit1_no_selected_no_h2_count,
+        "exit1_no_selected_no_h2_rate": (
+            exit1_no_selected_no_h2_count / exit1_no_selected_count
+            if exit1_no_selected_count
+            else 0.0
         ),
-        "exit_selected_after_pre_exit": exit_after_pre_exit,
-        "exit_selected_after_pre_exit_rate": (
-            exit_after_pre_exit / no_pre_exit_count if no_pre_exit_count else 0.0
+        "exit2_selected": exit2_selected_count,
+        "exit2_selected_rate": (
+            exit2_selected_count / exit1_no_selected_no_h2_count
+            if exit1_no_selected_no_h2_count
+            else 0.0
         ),
+        "exit2_no_selected": exit2_no_selected_count,
+        "exit2_no_selected_rate": (
+            exit2_no_selected_count / exit1_no_selected_no_h2_count
+            if exit1_no_selected_no_h2_count
+            else 0.0
+        ),
+        "exit2_top_fraction": float(exit2_split.top_fraction),
         "base_pred_threshold": _json_safe_float(base_split.pred_threshold),
-        "exit_pred_threshold": _json_safe_float(exit_split.pred_threshold),
-        "exit_top_fraction": float(exit_split.top_fraction),
+        "exit1_pred_threshold": _json_safe_float(exit1_split.pred_threshold),
+        "exit2_pred_threshold": _json_safe_float(exit2_split.pred_threshold),
         "tp_threshold": float(tp_threshold),
     }
     all_signal_tp_rows = _tp_sweep_rows(
         split=split,
-        group="all_signal",
+        group="p1_base_signal",
         selected_base_index=pd.Index(base_path.index),
         path_returns=path_returns,
         thresholds=tp_sweep_thresholds,
@@ -643,43 +766,72 @@ def _summarize_split(
     )
     base_no_h1_tp_rows = _tp_sweep_rows(
         split=split,
-        group="base_no_h1",
+        group="p1_base_no_h1",
         selected_base_index=no_h1_index,
         path_returns=path_returns,
         thresholds=tp_sweep_thresholds,
         min_h=2,
     )
-    base_no_pre_exit_tp_rows = _tp_sweep_rows(
+    exit1_selected_tp_rows = _tp_sweep_rows(
         split=split,
-        group="base_no_pre_exit_hit",
-        selected_base_index=no_pre_exit_index,
+        group="p1_exit_after_h1_selected",
+        selected_base_index=exit1_selected_base_index,
         path_returns=path_returns,
         thresholds=tp_sweep_thresholds,
-        min_h=int(exit_delay_bars) + 1,
+        min_h=2,
     )
-    exit_selected_tp_rows = _tp_sweep_rows(
+    exit1_no_selected_tp_rows = _tp_sweep_rows(
         split=split,
-        group="exit_selected",
-        selected_base_index=exit_selected_base_index,
+        group="p1_exit_after_h1_no_selected",
+        selected_base_index=exit1_no_selected_base_index,
         path_returns=path_returns,
         thresholds=tp_sweep_thresholds,
-        min_h=int(exit_delay_bars) + 1,
+        min_h=2,
     )
-    no_exit_selected_tp_rows = _tp_sweep_rows(
+    exit1_no_selected_h2_tp_rows = _tp_sweep_rows(
         split=split,
-        group="no_exit_selected",
-        selected_base_index=no_exit_selected_base_index,
+        group="p1_exit_after_h1_no_selected_h2",
+        selected_base_index=exit1_no_selected_base_index,
         path_returns=path_returns,
         thresholds=tp_sweep_thresholds,
-        min_h=int(exit_delay_bars) + 1,
+        min_h=2,
+        max_h=2,
+    )
+
+    exit1_no_selected_no_h2_tp_rows = _tp_sweep_rows(
+        split=split,
+        group="p2_exit_after_h1_no_selected_no_h2",
+        selected_base_index=exit1_no_selected_no_h2_index,
+        path_returns=path_returns,
+        thresholds=tp_sweep_thresholds,
+        min_h=3,
+    )
+    exit2_selected_tp_rows = _tp_sweep_rows(
+        split=split,
+        group="p2_exit_after_h2_selected",
+        selected_base_index=exit2_selected_base_index,
+        path_returns=path_returns,
+        thresholds=tp_sweep_thresholds,
+        min_h=3,
+    )
+    exit2_no_selected_tp_rows = _tp_sweep_rows(
+        split=split,
+        group="p2_exit_after_h2_no_selected",
+        selected_base_index=exit2_no_selected_base_index,
+        path_returns=path_returns,
+        thresholds=tp_sweep_thresholds,
+        min_h=3,
     )
     return (
         summary,
         all_signal_tp_rows
         + base_no_h1_tp_rows
-        + base_no_pre_exit_tp_rows
-        + exit_selected_tp_rows
-        + no_exit_selected_tp_rows,
+        + exit1_selected_tp_rows
+        + exit1_no_selected_tp_rows
+        + exit1_no_selected_h2_tp_rows
+        + exit1_no_selected_no_h2_tp_rows
+        + exit2_selected_tp_rows
+        + exit2_no_selected_tp_rows,
     )
 
 
@@ -703,37 +855,6 @@ def _future_bar_mapping(
     )
 
 
-def _no_pre_exit_hit_index(
-    base_path: pd.DataFrame,
-    exit_delay_bars: int,
-    tp_threshold: float,
-) -> pd.Index:
-    hit_columns = [
-        f"high_h{step}"
-        for step in range(1, max(int(exit_delay_bars), 1) + 1)
-        if f"high_h{step}" in base_path.columns
-    ]
-    if not hit_columns:
-        return pd.Index([])
-    high_values = base_path[hit_columns].apply(pd.to_numeric, errors="coerce")
-    no_hit = ~(high_values > float(tp_threshold)).any(axis=1)
-    return pd.Index(base_path.index[no_hit.fillna(False)])
-
-
-def _exit_delay_bars(label_mode: str) -> int:
-    mode = config.canonical_label_mode(label_mode)
-    if mode == "exit_after_h2":
-        return 2
-    return 1
-
-
-def _pre_exit_label(exit_delay_bars: int) -> str:
-    delay = max(int(exit_delay_bars), 1)
-    if delay == 1:
-        return "no H1 hit"
-    return f"no H1-H{delay} hit"
-
-
 def _tp_sweep_thresholds() -> list[float]:
     count = int(np.floor((TP_SWEEP_END - TP_SWEEP_START) / TP_SWEEP_STEP + 1e-12)) + 1
     return [float(TP_SWEEP_START + idx * TP_SWEEP_STEP) for idx in range(max(count, 0))]
@@ -752,9 +873,28 @@ def _empty_tp_sweep_rows(
             "sample_count": 0,
             "hit_count": 0,
             "hit_rate": 0.0,
+            "miss_count": 0,
+            "miss_return_mean": float("nan"),
         }
         for threshold in thresholds
     ]
+
+
+def _empty_stage_tp_rows(split: str, thresholds: list[float]) -> list[dict[str, Any]]:
+    groups = [
+        "p1_base_signal",
+        "p1_base_no_h1",
+        "p1_exit_after_h1_selected",
+        "p1_exit_after_h1_no_selected",
+        "p1_exit_after_h1_no_selected_h2",
+        "p2_exit_after_h1_no_selected_no_h2",
+        "p2_exit_after_h2_selected",
+        "p2_exit_after_h2_no_selected",
+    ]
+    rows: list[dict[str, Any]] = []
+    for group in groups:
+        rows.extend(_empty_tp_sweep_rows(split, thresholds, group=group))
+    return rows
 
 
 def _tp_sweep_rows(
@@ -764,19 +904,30 @@ def _tp_sweep_rows(
     path_returns: pd.DataFrame,
     thresholds: list[float],
     min_h: int = 2,
+    max_h: int | None = None,
 ) -> list[dict[str, Any]]:
     selected_path = path_returns.reindex(selected_base_index)
-    high_cols = _future_high_columns(selected_path, min_h=min_h)
+    high_cols = _future_high_columns(selected_path, min_h=min_h, max_h=max_h)
     selected_path = selected_path.dropna(subset=high_cols) if high_cols else selected_path.iloc[0:0]
     total = int(len(selected_path))
     if total == 0 or not high_cols:
         return _empty_tp_sweep_rows(split, thresholds, group=group)
 
     high_values = selected_path[high_cols].apply(pd.to_numeric, errors="coerce")
+    close_col = f"close_h{_max_h_from_high_columns(high_cols)}"
+    close_values = (
+        pd.to_numeric(selected_path[close_col], errors="coerce")
+        if close_col in selected_path.columns
+        else pd.Series(np.nan, index=selected_path.index, dtype=float)
+    )
     rows: list[dict[str, Any]] = []
     for threshold in thresholds:
         hit = (high_values > float(threshold)).any(axis=1)
         hit_count = int(hit.sum())
+        miss = ~hit
+        miss_count = int(miss.sum())
+        miss_close = close_values[miss & close_values.notna()]
+        miss_return_mean = float(miss_close.mean()) if not miss_close.empty else float("nan")
         rows.append(
             {
                 "split": split,
@@ -785,14 +936,21 @@ def _tp_sweep_rows(
                 "sample_count": total,
                 "hit_count": hit_count,
                 "hit_rate": hit_count / total if total else 0.0,
+                "miss_count": miss_count,
+                "miss_return_mean": miss_return_mean,
             }
         )
     return rows
 
 
-def _future_high_columns(frame: pd.DataFrame, min_h: int) -> list[str]:
+def _future_high_columns(
+    frame: pd.DataFrame,
+    min_h: int,
+    max_h: int | None = None,
+) -> list[str]:
     columns: list[tuple[int, str]] = []
     min_h = max(int(min_h), 1)
+    max_h_value = int(max_h) if max_h is not None else None
     for column in frame.columns:
         text = str(column)
         if not text.startswith("high_h"):
@@ -801,13 +959,23 @@ def _future_high_columns(frame: pd.DataFrame, min_h: int) -> list[str]:
         if not suffix.isdigit():
             continue
         step = int(suffix)
+        if max_h_value is not None and step > max_h_value:
+            continue
         if step >= min_h:
             columns.append((step, text))
     return [name for _, name in sorted(columns)]
 
 
-def _post_h1_high_columns(frame: pd.DataFrame) -> list[str]:
-    return _future_high_columns(frame, min_h=2)
+def _max_h_from_high_columns(columns: list[str]) -> int:
+    steps: list[int] = []
+    for column in columns:
+        text = str(column)
+        if not text.startswith("high_h"):
+            continue
+        suffix = text[len("high_h") :]
+        if suffix.isdigit():
+            steps.append(int(suffix))
+    return max(steps) if steps else 1
 
 
 def _plot_summary(
@@ -815,152 +983,181 @@ def _plot_summary(
     tp_sweep: pd.DataFrame,
     chart_path: Path,
     base_label: str,
-    exit_label: str,
+    exit1_label: str,
+    exit2_label: str,
     base_ensemble: str,
     tp_threshold: float,
-    exit_delay_bars: int,
 ) -> None:
-    pre_exit_label = _pre_exit_label(exit_delay_bars)
-    post_exit_start_h = max(int(exit_delay_bars), 1) + 1
     fig, (
-        ax_bar,
-        ax_sweep,
-        ax_all_table,
-        ax_base_table,
-        ax_pre_exit_table,
-        ax_exit_table,
-        ax_no_exit_table,
-        ax_table,
+        ax_p1_summary,
+        ax_p1_base,
+        ax_p1_no_h1,
+        ax_p1_selected,
+        ax_p1_no_selected,
+        ax_p1_no_selected_h2,
+        ax_p2_summary,
+        ax_p2_base,
+        ax_p2_selected,
+        ax_p2_no_selected,
     ) = plt.subplots(
-        8,
+        10,
         1,
-        figsize=(15.5, 18.0),
+        figsize=(17.5, 25.0),
         gridspec_kw={
-            "height_ratios": [2.0, 2.0, 1.10, 1.10, 1.10, 1.10, 1.10, 1.55]
+            "height_ratios": [
+                1.25,
+                1.35,
+                1.35,
+                1.35,
+                1.35,
+                1.35,
+                1.25,
+                1.35,
+                1.35,
+                1.35,
+            ]
         },
         constrained_layout=True,
     )
-    x = np.arange(len(summary))
-    width = 0.34
-    ax_bar.bar(
-        x - width / 2,
-        summary["base_no_pre_exit_hit_rate"].astype(float) * 100.0,
-        width,
-        label=f"base signal {pre_exit_label} / base signal",
-        color="#4c78a8",
-    )
-    ax_bar.bar(
-        x + width / 2,
-        summary["exit_selected_after_pre_exit_rate"].astype(float) * 100.0,
-        width,
-        label=f"exit selected / base {pre_exit_label}",
-        color="#f58518",
-    )
-    ax_bar.set_xticks(x, summary["split"].astype(str).tolist())
-    ax_bar.set_ylim(0.0, 100.0)
-    ax_bar.set_ylabel("Rate %")
-    ax_bar.grid(True, axis="y", alpha=0.25)
-    ax_bar.legend(loc="upper left")
-    ax_bar.set_title(
-        f"Two-stage backtest | base={base_ensemble.upper()} | TP={tp_threshold:.4g}\n"
-        f"{base_label}\nexit: {exit_label}",
-        fontsize=10,
-    )
-
-    if not tp_sweep.empty:
-        styles = {
-            ("all_signal", "val"): ("#9c755f", "-"),
-            ("all_signal", "test"): ("#9c755f", "--"),
-            ("base_no_h1", "val"): ("#4c78a8", "-"),
-            ("base_no_h1", "test"): ("#4c78a8", "--"),
-            ("base_no_pre_exit_hit", "val"): ("#b279a2", "-"),
-            ("base_no_pre_exit_hit", "test"): ("#b279a2", "--"),
-            ("exit_selected", "val"): ("#f58518", "-"),
-            ("exit_selected", "test"): ("#f58518", "--"),
-            ("no_exit_selected", "val"): ("#54a24b", "-"),
-            ("no_exit_selected", "test"): ("#54a24b", "--"),
-        }
-        for (group_name, split), group in tp_sweep.groupby(["group", "split"], sort=False):
-            color, linestyle = styles.get((str(group_name), str(split)), ("#777777", "-"))
-            ax_sweep.plot(
-                group["tp_threshold"].astype(float) * 100.0,
-                group["hit_rate"].astype(float) * 100.0,
-                marker="o",
-                linestyle=linestyle,
-                linewidth=1.4,
-                label=f"{group_name} {split}",
-                color=color,
-            )
-        ax_sweep.set_ylabel("Hit rate %")
-        ax_sweep.set_xlabel("TP threshold %")
-        ax_sweep.set_ylim(0.0, 100.0)
-        ax_sweep.grid(True, alpha=0.25)
-        ax_sweep.legend(loc="upper right")
-        ax_sweep.set_title("TP hit rate by remaining horizon window")
-    else:
-        ax_sweep.axis("off")
 
     _draw_table(
-        ax_all_table,
-        _sweep_table(tp_sweep, group_name="all_signal"),
-        title="all_signal: TP hit rate in H1+ / total base signals",
-        font_size=6.3,
-    )
-    _draw_table(
-        ax_base_table,
-        _sweep_table(tp_sweep, group_name="base_no_h1"),
-        title="base_no_h1: TP hit rate in H2-H5 / total base_no_h1",
-        font_size=6.3,
-    )
-    _draw_table(
-        ax_pre_exit_table,
-        _sweep_table(tp_sweep, group_name="base_no_pre_exit_hit"),
+        ax_p1_summary,
+        _part1_summary_table(summary),
         title=(
-            f"base_no_pre_exit_hit: TP hit rate in H{post_exit_start_h}+ / "
-            f"total base {pre_exit_label}"
+            f"Part 1: exit_after_h1 | base={base_ensemble.upper()} | TP={tp_threshold:.4g}\n"
+            f"base: {base_label}\nexit_after_h1: {exit1_label}"
         ),
-        font_size=6.3,
-    )
-    _draw_table(
-        ax_exit_table,
-        _sweep_table(tp_sweep, group_name="exit_selected"),
-        title=f"exit_selected: TP hit rate in H{post_exit_start_h}+ / total exit_selected",
-        font_size=6.3,
-    )
-    _draw_table(
-        ax_no_exit_table,
-        _sweep_table(tp_sweep, group_name="no_exit_selected"),
-        title=(
-            f"no_exit_selected: TP hit rate in H{post_exit_start_h}+ / "
-            "total no_exit_selected"
-        ),
-        font_size=6.3,
-    )
-
-    table_df = summary.copy()
-    for column in [
-        "base_no_h1_rate",
-        "exit_selected_after_no_h1_rate",
-        "base_no_pre_exit_hit_rate",
-        "exit_selected_after_pre_exit_rate",
-        "tp_threshold",
-        "exit_top_fraction",
-    ]:
-        if column in table_df.columns:
-            table_df[column] = table_df[column].astype(float).map(lambda value: f"{value:.2%}")
-    for column in ["base_pred_threshold", "exit_pred_threshold"]:
-        if column in table_df.columns:
-            table_df[column] = table_df[column].map(
-                lambda value: "n/a" if pd.isna(value) else f"{float(value):.6f}"
-            )
-    _draw_table(
-        ax_table,
-        table_df,
-        title="summary",
         font_size=7.0,
+    )
+    _draw_table(
+        ax_p1_base,
+        _sweep_table(tp_sweep, group_name="p1_base_signal"),
+        title="base signal: TP hitrate in H1-H5 / total base signal",
+        font_size=6.3,
+    )
+    _draw_table(
+        ax_p1_no_h1,
+        _sweep_table(tp_sweep, group_name="p1_base_no_h1"),
+        title="base no H1: TP hitrate in H2-H5 / total base no H1",
+        font_size=6.3,
+    )
+    _draw_table(
+        ax_p1_selected,
+        _sweep_table(tp_sweep, group_name="p1_exit_after_h1_selected"),
+        title="exit_after_h1 selected: TP hitrate in H2-H5 / total exit_after_h1 selected",
+        font_size=6.3,
+    )
+    _draw_table(
+        ax_p1_no_selected,
+        _sweep_table(tp_sweep, group_name="p1_exit_after_h1_no_selected"),
+        title=(
+            "exit_after_h1 no selected: "
+            "TP hitrate in H2-H5 / total exit_after_h1 no selected"
+        ),
+        font_size=6.3,
+    )
+    _draw_table(
+        ax_p1_no_selected_h2,
+        _sweep_table(tp_sweep, group_name="p1_exit_after_h1_no_selected_h2"),
+        title="exit_after_h1 no selected: TP hitrate in H2 / total exit_after_h1 no selected",
+        font_size=6.3,
+    )
+
+    _draw_table(
+        ax_p2_summary,
+        _part2_summary_table(summary),
+        title=f"Part 2: exit_after_h2\nexit_after_h2: {exit2_label}",
+        font_size=7.0,
+    )
+    _draw_table(
+        ax_p2_base,
+        _sweep_table(tp_sweep, group_name="p2_exit_after_h1_no_selected_no_h2"),
+        title=(
+            "base_e_after_h1_no_selected_no_H2: "
+            "TP hitrate in H3-H5 / total base_e_after_h1_no_selected_no_H2"
+        ),
+        font_size=6.3,
+    )
+    _draw_table(
+        ax_p2_selected,
+        _sweep_table(tp_sweep, group_name="p2_exit_after_h2_selected"),
+        title="exit_after_h2 selected: TP hitrate in H3-H5 / total exit_after_h2 selected",
+        font_size=6.3,
+    )
+    _draw_table(
+        ax_p2_no_selected,
+        _sweep_table(tp_sweep, group_name="p2_exit_after_h2_no_selected"),
+        title="exit_after_h2 no selected: TP hitrate in H3-H5 / total exit_after_h2 no selected",
+        font_size=6.3,
     )
     fig.savefig(chart_path, dpi=170)
     plt.close(fig)
+
+
+def _part1_summary_table(summary: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, str]] = []
+    for _, row in summary.iterrows():
+        base_no_h1 = _count_rate_cell(row, "base_no_h1", "base_no_h1_rate")
+        exit1_selected = _count_rate_cell(row, "exit1_selected", "exit1_selected_rate")
+        exit1_no_selected = _count_rate_cell(
+            row,
+            "exit1_no_selected",
+            "exit1_no_selected_rate",
+        )
+        rows.append(
+            {
+                "split": str(row.get("split", "")),
+                "base signal": _count_cell(row.get("base_signals")),
+                "base no H1": base_no_h1,
+                "e_after_h1 selected": exit1_selected,
+                "e_after_h1 no selected": exit1_no_selected,
+                "exit_h1_top_fraction": _format_pct(float(row.get("exit1_top_fraction", 0.0))),
+                "TP_threshold": _format_pct(float(row.get("tp_threshold", 0.0))),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _part2_summary_table(summary: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, str]] = []
+    for _, row in summary.iterrows():
+        h1_no_selected = _count_cell(row.get("exit1_no_selected"))
+        no_h2 = _count_rate_cell(
+            row,
+            "exit1_no_selected_no_h2",
+            "exit1_no_selected_no_h2_rate",
+        )
+        exit2_selected = _count_rate_cell(row, "exit2_selected", "exit2_selected_rate")
+        exit2_no_selected = _count_rate_cell(
+            row,
+            "exit2_no_selected",
+            "exit2_no_selected_rate",
+        )
+        rows.append(
+            {
+                "split": str(row.get("split", "")),
+                "e_after_h1 no selected": h1_no_selected,
+                "base_e_after_h1_no_selected_no_H2": no_h2,
+                "e_after_h2 selected": exit2_selected,
+                "e_after_h2 no selected": exit2_no_selected,
+                "exit_h2_top_fraction": _format_pct(float(row.get("exit2_top_fraction", 0.0))),
+                "TP_threshold": _format_pct(float(row.get("tp_threshold", 0.0))),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _count_rate_cell(row: pd.Series, count_col: str, rate_col: str) -> str:
+    return f"{_count_cell(row.get(count_col))} ({_format_pct(float(row.get(rate_col, 0.0)))})"
+
+
+def _count_cell(value: Any) -> str:
+    try:
+        if pd.isna(value):
+            return "0"
+        return str(int(value))
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def _sweep_table(tp_sweep: pd.DataFrame, group_name: str) -> pd.DataFrame:
@@ -976,12 +1173,17 @@ def _sweep_table(tp_sweep: pd.DataFrame, group_name: str) -> pd.DataFrame:
         sorted_group = group.sort_values("tp_threshold")
         n_value = pd.to_numeric(sorted_group["sample_count"], errors="coerce").max()
         n = int(n_value) if pd.notna(n_value) else 0
-        row: dict[str, str] = {"split": f"{split} n={n}"}
+        hit_row: dict[str, str] = {"split": f"{split} hit n={n}"}
+        miss_return_row: dict[str, str] = {"split": f"{split} miss ret"}
         for _, item in sorted_group.iterrows():
-            row[_format_threshold_pct(float(item["tp_threshold"]))] = _format_pct(
+            threshold_label = _format_threshold_pct(float(item["tp_threshold"]))
+            hit_row[threshold_label] = _format_pct(
                 float(item["hit_rate"])
             )
-        rows.append(row)
+            miss_return = item.get("miss_return_mean", float("nan"))
+            miss_return_row[threshold_label] = _format_signed_pct(miss_return)
+        rows.append(hit_row)
+        rows.append(miss_return_row)
     return pd.DataFrame(rows, columns=columns).fillna("")
 
 
@@ -1020,23 +1222,58 @@ def _format_pct(value: float) -> str:
     return f"{float(value):.2%}"
 
 
+def _format_signed_pct(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if not np.isfinite(number):
+        return ""
+    return f"{number:+.2%}"
+
+
 def _backtest_name(
     base_specs: list[ModelSpec],
-    exit_spec: ModelSpec,
+    exit1_spec: ModelSpec,
+    exit2_spec: ModelSpec,
     base_ensemble: str,
     tp_threshold: float,
 ) -> str:
     base_name = "_".join(
-        f"{_safe_name(spec.archive_path.stem)}_r{spec.rank:02d}"
-        for spec in base_specs
+        f"b{i}_{_short_safe_name(spec.archive_path.stem)}_r{spec.rank:02d}"
+        for i, spec in enumerate(base_specs, start=1)
     )
-    exit_name = f"{_safe_name(exit_spec.archive_path.stem)}_r{exit_spec.rank:02d}"
+    exit1_name = (
+        f"x1_{_short_safe_name(exit1_spec.archive_path.stem)}_r{exit1_spec.rank:02d}"
+    )
+    exit2_name = (
+        f"x2_{_short_safe_name(exit2_spec.archive_path.stem)}_r{exit2_spec.rank:02d}"
+    )
     tp_name = _threshold_filename_token(float(tp_threshold))
-    exit_top_name = _threshold_filename_token(float(exit_spec.top_fraction))
-    return (
-        f"strategy_exit_top_{exit_top_name}_{base_ensemble}_{base_name}_"
-        f"exit_{exit_name}_tp_{tp_name}"
+    exit1_top_name = _threshold_filename_token(float(exit1_spec.top_fraction))
+    exit2_top_name = _threshold_filename_token(float(exit2_spec.top_fraction))
+    return _safe_name(
+        "_".join(
+            [
+                f"strategy_e1top_{exit1_top_name}",
+                f"e2top_{exit2_top_name}",
+                base_ensemble,
+                base_name,
+                exit1_name,
+                exit2_name,
+                f"tp_{tp_name}",
+            ]
+        )
     )
+
+
+def _short_safe_name(value: str, max_len: int = 22) -> str:
+    text = _safe_name(value)
+    if len(text) <= max_len:
+        return text
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:6]
+    head_len = max(8, max_len - len(digest) - 1)
+    return f"{text[:head_len]}_{digest}"
 
 
 def _safe_name(value: str) -> str:
@@ -1058,7 +1295,7 @@ def _parse_spec(
     archive_text, rank_text, mode_text, threshold_text = parts[:4]
     mode_text = config.canonical_label_mode(mode_text)
     if require_top_fraction and len(parts) < 5:
-        raise ValueError("--exit spec must include TOP_FRACTION or use --exit-top-fraction.")
+        raise ValueError("Exit spec must include TOP_FRACTION or use a top-fraction CLI option.")
     top_fraction = float(parts[4]) if len(parts) == 5 and parts[4] else float(default_top_fraction)
     if not 0 < top_fraction <= 1:
         raise ValueError(f"top fraction must be in (0, 1], got {top_fraction}.")
@@ -1092,6 +1329,31 @@ def _validate_top_fractions(values: list[float] | tuple[float, ...]) -> list[flo
     return unique_values
 
 
+def _resolve_top_fraction_values(
+    override: list[float] | None,
+    spec_has_top_fraction: bool,
+    spec: ModelSpec,
+) -> list[float]:
+    if override is not None:
+        return _validate_top_fractions(override)
+    if spec_has_top_fraction:
+        return _validate_top_fractions([spec.top_fraction])
+    return _validate_top_fractions(EXIT_TOP_FRACTIONS)
+
+
+def _pair_top_fractions(
+    exit1_values: list[float],
+    exit2_values: list[float],
+) -> list[tuple[float, float]]:
+    if len(exit1_values) == len(exit2_values):
+        return list(zip(exit1_values, exit2_values, strict=True))
+    if len(exit1_values) == 1:
+        return [(exit1_values[0], value) for value in exit2_values]
+    if len(exit2_values) == 1:
+        return [(value, exit2_values[0]) for value in exit1_values]
+    return [(value1, value2) for value1 in exit1_values for value2 in exit2_values]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1111,22 +1373,39 @@ def main() -> None:
         help="How to combine multiple base specs. Default: and.",
     )
     parser.add_argument(
-        "--exit",
+        "--exit1",
         required=True,
         help=(
-            "Exit model spec: ARCHIVE#RANK#MODE#THRESHOLD[#TOP_FRACTION]. "
-            "If TOP_FRACTION and --exit-top-fraction are omitted, "
-            "EXIT_TOP_FRACTIONS from this file is used."
+            "Exit-after-H1 model spec: ARCHIVE#RANK#MODE#THRESHOLD[#TOP_FRACTION]. "
+            "Use mode exit_after_h1."
         ),
     )
     parser.add_argument(
-        "--exit-top-fraction",
+        "--exit2",
+        required=True,
+        help=(
+            "Exit-after-H2 model spec: ARCHIVE#RANK#MODE#THRESHOLD[#TOP_FRACTION]. "
+            "Use mode exit_after_h2."
+        ),
+    )
+    parser.add_argument(
+        "--exit1-top-fraction",
         type=float,
         nargs="+",
         default=None,
         help=(
-            "Override exit model top fraction(s). Example: "
-            "--exit-top-fraction 0.10 0.20 0.30."
+            "Override exit_after_h1 top fraction(s). Example: "
+            "--exit1-top-fraction 0.10 0.20 0.30."
+        ),
+    )
+    parser.add_argument(
+        "--exit2-top-fraction",
+        type=float,
+        nargs="+",
+        default=None,
+        help=(
+            "Override exit_after_h2 top fraction(s). Example: "
+            "--exit2-top-fraction 0.10 0.20 0.30."
         ),
     )
     parser.add_argument(
@@ -1134,8 +1413,8 @@ def main() -> None:
         type=float,
         default=None,
         help=(
-            "TP threshold used to decide whether H1 was hit. "
-            "Default: exit spec label threshold."
+            "TP threshold used to decide whether H1/H2 was hit. "
+            "Default: exit1 spec label threshold."
         ),
     )
     parser.add_argument("--data", default=str(config.DATA_PATH), help="Crypto OHLCV CSV path.")
@@ -1158,33 +1437,53 @@ def main() -> None:
         )
         for raw in raw_base_specs
     ]
-    exit_spec_has_top_fraction = len(str(args.exit).split("#")) >= 5
-    exit_default_top = float(EXIT_TOP_FRACTIONS[0])
-    exit_spec = _parse_spec(
-        args.exit,
-        default_top_fraction=exit_default_top,
+    exit1_spec_has_top_fraction = len(str(args.exit1).split("#")) >= 5
+    exit2_spec_has_top_fraction = len(str(args.exit2).split("#")) >= 5
+    exit1_spec = _parse_spec(
+        args.exit1,
+        default_top_fraction=float(EXIT_TOP_FRACTIONS[0]),
         require_top_fraction=False,
     )
-    if args.exit_top_fraction is not None:
-        exit_top_fractions = _validate_top_fractions(args.exit_top_fraction)
-    elif exit_spec_has_top_fraction:
-        exit_top_fractions = _validate_top_fractions([exit_spec.top_fraction])
-    else:
-        exit_top_fractions = _validate_top_fractions(EXIT_TOP_FRACTIONS)
+    exit2_spec = _parse_spec(
+        args.exit2,
+        default_top_fraction=float(EXIT_TOP_FRACTIONS[0]),
+        require_top_fraction=False,
+    )
+    exit1_top_fractions = _resolve_top_fraction_values(
+        override=args.exit1_top_fraction,
+        spec_has_top_fraction=exit1_spec_has_top_fraction,
+        spec=exit1_spec,
+    )
+    exit2_top_fractions = _resolve_top_fraction_values(
+        override=args.exit2_top_fraction,
+        spec_has_top_fraction=exit2_spec_has_top_fraction,
+        spec=exit2_spec,
+    )
 
     results: list[BacktestResult] = []
-    for exit_top_fraction in exit_top_fractions:
-        active_exit_spec = ModelSpec(
-            archive_path=exit_spec.archive_path,
-            rank=exit_spec.rank,
-            label_mode=exit_spec.label_mode,
-            label_threshold=exit_spec.label_threshold,
-            top_fraction=float(exit_top_fraction),
+    for exit1_top_fraction, exit2_top_fraction in _pair_top_fractions(
+        exit1_top_fractions,
+        exit2_top_fractions,
+    ):
+        active_exit1_spec = ModelSpec(
+            archive_path=exit1_spec.archive_path,
+            rank=exit1_spec.rank,
+            label_mode=exit1_spec.label_mode,
+            label_threshold=exit1_spec.label_threshold,
+            top_fraction=float(exit1_top_fraction),
+        )
+        active_exit2_spec = ModelSpec(
+            archive_path=exit2_spec.archive_path,
+            rank=exit2_spec.rank,
+            label_mode=exit2_spec.label_mode,
+            label_threshold=exit2_spec.label_threshold,
+            top_fraction=float(exit2_top_fraction),
         )
         results.append(
             run_backtest(
                 base_specs=base_specs,
-                exit_spec=active_exit_spec,
+                exit1_spec=active_exit1_spec,
+                exit2_spec=active_exit2_spec,
                 data_path=args.data,
                 out_dir=args.out_dir,
                 base_ensemble=args.base_ensemble,
