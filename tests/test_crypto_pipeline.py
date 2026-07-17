@@ -6,6 +6,16 @@ import numpy as np
 import pandas as pd
 
 from crypto import config
+from crypto.backtest import (
+    ModelSpec,
+    SplitSignals,
+    _backtest_name,
+    _dynamic_tp_arrays,
+    _parse_spec,
+    _simulate_dynamic_tp_arrays,
+    _summarize_split,
+    _sweep_table,
+)
 from crypto.main import _validate_resume_metadata
 from crypto.data import CryptoFold, add_binary_labels, split_labeled_by_dates
 from crypto.evolution import CryptoArchive, CryptoIndividual, CryptoMutator
@@ -15,6 +25,132 @@ from crypto.fitness import CryptoFitnessEvaluator, _internal_early_stop_split
 
 
 class CryptoPipelineTests(unittest.TestCase):
+    def test_backtest_name_stays_within_windows_safe_length(self):
+        base_specs = [
+            ModelSpec(
+                archive_path=Path(f"crypto_btc_archive_with_a_long_name_{i}.json"),
+                rank=1,
+                label_mode="mfe",
+                label_threshold=0.003,
+                top_fraction=0.15,
+            )
+            for i in range(5)
+        ]
+        exit1 = ModelSpec(
+            Path("crypto_btc_exit_after_h1_h5_tp04_seed1_12h.json"),
+            1,
+            "exit_after_h1",
+            0.004,
+            0.20,
+        )
+        exit2 = ModelSpec(
+            Path("crypto_btc_exit_after_h2_h5_tp04_seed1_12h.json"),
+            1,
+            "exit_after_h2",
+            0.004,
+            0.10,
+        )
+
+        name = _backtest_name(base_specs, exit1, exit2, "and", 0.005)
+
+        self.assertLessEqual(len(name), 150)
+        self.assertTrue(name.startswith("strategy_e1top_20p000pct_e2top_10p000pct"))
+        self.assertIn("_bases5_", name)
+
+    def test_dynamic_tp_simulator_routes_all_five_terminal_branches(self):
+        frame = pd.DataFrame(
+            {
+                "high_h1": [0.006, 0.0, 0.0, 0.0, 0.0],
+                "high_h2": [0.0, 0.0, 0.005, 0.0, 0.0],
+                "max_high_h2_plus": [0.0, 0.005, 0.005, 0.005, 0.004],
+                "max_high_h3_plus": [0.0, 0.0, 0.0, 0.005, 0.004],
+                "close_final": [-0.01] * 5,
+                "exit1_selected": [False, True, False, False, False],
+                "exit2_selected": [False, False, False, True, False],
+            }
+        )
+        thresholds = (0.005, 0.0045, 0.004, 0.004, 0.003)
+
+        metrics = _simulate_dynamic_tp_arrays(
+            _dynamic_tp_arrays(frame),
+            thresholds,
+        )
+
+        expected_gross = sum(thresholds) / len(thresholds)
+        self.assertAlmostEqual(
+            metrics["e_net"],
+            expected_gross - config.TRADE_COST,
+        )
+        self.assertEqual(metrics["hit_rate"], 1.0)
+        self.assertEqual(metrics["n_trades"], 5.0)
+
+    def test_backtest_part1_counts_h1_low_drawdown_rates(self):
+        idx = pd.date_range("2024-01-01", periods=8, freq="15min")
+        selected = pd.Index(idx[:3])
+        base_split = SplitSignals(
+            split="val",
+            data=pd.DataFrame(index=idx),
+            selected_index=selected,
+            pred_threshold=0.5,
+            top_fraction=0.25,
+        )
+        empty_exit = SplitSignals(
+            split="val",
+            data=pd.DataFrame(index=idx),
+            selected_index=pd.Index([]),
+            pred_threshold=0.5,
+            top_fraction=0.20,
+        )
+        path_returns = pd.DataFrame(index=idx)
+        for horizon in range(1, 6):
+            path_returns[f"high_h{horizon}"] = 0.0
+            path_returns[f"close_h{horizon}"] = 0.0
+        path_returns["low_h1"] = [-0.0005, -0.001, -0.003] + [0.0] * 5
+        path_returns["close_h2"] = [-0.001, -0.002, -0.003] + [0.0] * 5
+
+        summary, tp_rows = _summarize_split(
+            split="val",
+            base_split=base_split,
+            exit1_split=empty_exit,
+            exit2_split=empty_exit,
+            path_returns=path_returns,
+            raw_index=pd.DatetimeIndex(idx),
+            tp_threshold=0.004,
+            tp_sweep_thresholds=[0.004],
+        )
+
+        self.assertEqual(summary["base_low_h1_le_neg01"], 2)
+        self.assertAlmostEqual(summary["base_low_h1_le_neg01_rate"], 2 / 3)
+        self.assertEqual(summary["base_low_h1_le_neg005"], 3)
+        self.assertAlmostEqual(summary["base_low_h1_le_neg005_rate"], 1.0)
+        tp_sweep = pd.DataFrame(tp_rows)
+        exit2_no_selected = tp_sweep[
+            tp_sweep["group"] == "p2_exit_after_h2_no_selected"
+        ]
+        self.assertAlmostEqual(
+            float(exit2_no_selected["close_h2_return_mean"].iloc[0]),
+            -0.002,
+        )
+        rendered = _sweep_table(
+            tp_sweep,
+            group_name="p2_exit_after_h2_no_selected",
+            include_close_h2=True,
+        )
+        self.assertIn("val mean close H2", rendered["split"].tolist())
+
+    def test_backtest_base_specs_accept_independent_top_fractions(self):
+        mfe_spec = _parse_spec(
+            "mfe.json#1#mfe#0.003#0.15",
+            default_top_fraction=0.25,
+        )
+        close_spec = _parse_spec(
+            "close.json#1#close_exit#-0.001#0.25",
+            default_top_fraction=0.15,
+        )
+
+        self.assertEqual(mfe_spec.top_fraction, 0.15)
+        self.assertEqual(close_spec.top_fraction, 0.25)
+
     def test_config_allows_finite_negative_label_threshold(self):
         old_threshold = config.LABEL_THRESHOLD
         try:
@@ -85,6 +221,48 @@ class CryptoPipelineTests(unittest.TestCase):
         pd.testing.assert_series_equal(labeled["future_return_h3"], expected)
         self.assertEqual(labeled["label_h3"].iloc[0], 1.0)
         self.assertTrue(pd.isna(labeled["label_h3"].iloc[-1]))
+
+    def test_close_path_mean_label_uses_mean_future_closes_from_next_open(self):
+        idx = pd.date_range("2024-01-01", periods=6, freq="15min")
+        df = pd.DataFrame(
+            {
+                "open": [100.0] * 6,
+                "high": [111.0] * 6,
+                "low": [89.0] * 6,
+                "close": [100.0, 99.0, 101.0, 103.0, 90.0, 110.0],
+                "volume": [10.0] * 6,
+                "trade_count": [10] * 6,
+                "taker_buy_base_volume": [5.0] * 6,
+                "taker_buy_quote_volume": [500.0] * 6,
+            },
+            index=idx,
+        )
+
+        labeled = add_binary_labels(
+            df,
+            horizons=[3],
+            label_mode="close_path_mean",
+            threshold=0.0,
+        )
+
+        expected = pd.Series(
+            [0.01, -0.02, 0.01, np.nan, np.nan, np.nan],
+            index=idx,
+            name="future_return_h3",
+        )
+        pd.testing.assert_series_equal(labeled["future_return_h3"], expected)
+        self.assertEqual(labeled["label_h3"].iloc[0], 1.0)
+        self.assertEqual(labeled["label_h3"].iloc[1], 0.0)
+        self.assertTrue(labeled["label_h3"].iloc[2] == 1.0)
+        self.assertTrue(labeled["label_h3"].iloc[3:].isna().all())
+
+    def test_close_path_mean_is_registered_as_default_mode(self):
+        self.assertEqual(config.LABEL_MODE, "close_path_mean")
+        self.assertEqual(config.default_label_threshold("close_path_mean"), 0.0)
+        self.assertIs(
+            config.get_label_return_fn("close_path_mean"),
+            config.close_path_mean_future_return,
+        )
 
     def test_payoff_label_uses_tp_or_future_close_and_preserves_tail_nan(self):
         idx = pd.date_range("2024-01-01", periods=5, freq="15min")

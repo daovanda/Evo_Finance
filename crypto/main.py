@@ -376,14 +376,17 @@ def main() -> None:
         "--horizons",
         type=_parse_horizons,
         default=list(config.HOLDING_HORIZONS),
-        help="Comma-separated horizons, default: 3,7,10.",
+        help=(
+            "Comma-separated horizons. Default: "
+            f"{','.join(str(h) for h in config.HOLDING_HORIZONS)}."
+        ),
     )
     parser.add_argument(
         "--label-threshold",
         type=float,
         default=None,
         help=(
-            "Label threshold. Default is LABEL_THRESHOLD for close_exit/mfe and "
+            "Label threshold. Default is LABEL_THRESHOLD for non-payoff modes and "
             "TRADE_COST for payoff."
         ),
     )

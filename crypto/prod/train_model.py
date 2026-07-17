@@ -648,7 +648,7 @@ def main() -> None:
         default=None,
         help=(
             "Label threshold used when training production models. Default is "
-            "LABEL_THRESHOLD for close_exit/mfe and TRADE_COST for payoff."
+            "LABEL_THRESHOLD for non-payoff modes and TRADE_COST for payoff."
         ),
     )
     args = parser.parse_args()

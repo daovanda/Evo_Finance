@@ -52,10 +52,10 @@ Sua trong `crypto/config.py`.
 ### Horizon va label
 
 ```python
-HOLDING_HORIZONS = [3, 5]
-LABEL_THRESHOLD = 0.003
-LABEL_MODE = "mfe"  # "close_exit", "mfe", hoac "payoff"
-PAYOFF_TP = 0.003
+HOLDING_HORIZONS = [5]
+LABEL_THRESHOLD = 0.0
+LABEL_MODE = "close_path_mean"
+PAYOFF_TP = 0.004
 TRADE_COST = 0.002
 ```
 
@@ -74,6 +74,17 @@ future_return(t, h) = (max(high(t+1)..high(t+h)) - open(t+1)) / open(t+1)
 ```
 
 Mode `mfe` phu hop hon voi chien luoc dat TP, vi chi can gia cham muc loi trong horizon la label duong.
+
+`LABEL_MODE="close_path_mean"`:
+
+```text
+entry = open(t+1)
+future_return(t, h) = mean(close(t+1)..close(t+h)) / entry - 1
+label = future_return > 0 khi LABEL_THRESHOLD = 0
+```
+
+Mode nay tim cac duong close tuong lai co gia trung binh nam tren entry. Moi
+mau phai co du h nen cac dong cuoi tap du lieu van la NaN.
 
 `LABEL_MODE="payoff"`:
 

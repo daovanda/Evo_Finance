@@ -20,8 +20,8 @@ DEFAULT_ARCHIVE_PATH: Path = RESULTS_DIR / "crypto_btc_archive.json"
 
 # Multi-horizon binary labels. Edit this list freely, for example [3, 7, 10, 20].
 HOLDING_HORIZONS: list[int] = [5]
-LABEL_THRESHOLD: float = 0.004  # label=1 when future_return > threshold
-LABEL_MODE: str = "mfe"  # "close_exit", "mfe", "payoff", "exit_after_h1", or "exit_after_h2"
+LABEL_THRESHOLD: float = 0.0  # label=1 when future_return > threshold
+LABEL_MODE: str = "close_path_mean"
 PAYOFF_TP: float = 0.004  # only used by LABEL_MODE="payoff"
 
 
@@ -53,6 +53,28 @@ def mfe_future_return(df: Any, horizon: int) -> Any:
     )
     max_high = future_highs.max(axis=1, skipna=False)
     return (max_high - entry_open) / entry_open
+
+
+def close_path_mean_future_return(df: Any, horizon: int) -> Any:
+    """Mean future close-path return relative to the next-candle entry open.
+
+    For a signal at t:
+
+        entry = open(t+1)
+        future_return(t, h) = mean(close(t+1)..close(t+h)) / entry - 1
+
+    With LABEL_THRESHOLD=0, label=1 means the mean future close path lies
+    above the trade entry. A complete h-candle path is required; incomplete
+    rows at the end of the dataset remain NaN.
+    """
+    h = int(horizon)
+    entry_open = df["open"].shift(-1)
+    future_closes = pd.concat(
+        [df["close"].shift(-offset) for offset in range(1, h + 1)],
+        axis=1,
+    )
+    mean_future_close = future_closes.mean(axis=1, skipna=False)
+    return (mean_future_close - entry_open) / entry_open
 
 
 def exit_after_h1_future_return(df: Any, horizon: int) -> Any:
@@ -132,6 +154,7 @@ def payoff_future_return(df: Any, horizon: int) -> Any:
 
 LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
     "close_exit": close_exit_future_return,
+    "close_path_mean": close_path_mean_future_return,
     "mfe": mfe_future_return,
     "payoff": payoff_future_return,
     "exit_after_h1": exit_after_h1_future_return,
@@ -207,7 +230,7 @@ MAX_RETRY: int = 5
 # Fitness. RETURN_SCORE_SCALE normalizes mean trade return so that one metric
 # cannot dominate merely by being on a wider numerical scale.
 FITNESS_HORIZON_MODE: str = "mean"  # "mean" keeps old behavior; "ensemble" requires all H signals
-TRADE_TOP_FRACTION: float = 0.25
+TRADE_TOP_FRACTION: float = 0.3
 
 MIN_TRADES_PER_SPLIT: int = 20
 TRADE_COST: float = 0.002  # 0.2% breakeven round-trip cost per selected trade

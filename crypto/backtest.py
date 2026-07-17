@@ -11,8 +11,8 @@ This module evaluates the practical flow:
 
 Examples:
     python -m crypto.backtest ^
-      --base crypto/results/crypto_btc_mfe_h5_seed1_12h.json#1#mfe#0.003 ^
-      --base crypto/results/crypto_btc_close_exit_h5_seed1_12h.json#1#close_exit#0.001 ^
+      --base "crypto/results/crypto_btc_mfe_h5_seed1_12h.json#1#mfe#0.003#0.15" ^
+      --base "crypto/results/crypto_btc_close_exit_h5_seed1_12h.json#1#close_exit#0.001#0.25" ^
       --base-ensemble and ^
       --exit1 crypto/results/crypto_btc_exit_after_h1_h5_noh1_tp04_seed1_12h.json#1#exit_after_h1#0.004 ^
       --exit2 crypto/results/crypto_btc_exit_after_h2_h5_tp04_seed1_12h.json#1#exit_after_h2#0.004 ^
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import json
 import logging
 import re
@@ -66,6 +67,10 @@ TP_SWEEP_START: float = -0.002
 TP_SWEEP_END: float = 0.005
 TP_SWEEP_STEP: float = 0.0005
 EXIT_TOP_FRACTIONS: list[float] = [0.10 ,0.20, 0.30, 0.40, 0.50, 0.6, 0.7]
+TP_OPT_START: float = 0.0025
+TP_OPT_END: float = 0.0060
+TP_OPT_STEP: float = 0.0005
+TP_OPT_TOP_K: int = 5
 
 _FEATURE_SPACE_CACHE: dict[tuple[Any, ...], CryptoFeatureSpace] = {}
 
@@ -99,8 +104,10 @@ class BundleSignals:
 class BacktestResult:
     summary: pd.DataFrame
     tp_sweep: pd.DataFrame
+    tp_optimization: pd.DataFrame
     csv_path: Path
     tp_sweep_csv_path: Path
+    tp_optimization_csv_path: Path
     chart_path: Path
 
 
@@ -248,15 +255,38 @@ def run_backtest(
 
     summary = pd.DataFrame(summary_rows)
     tp_sweep = pd.DataFrame(tp_sweep_rows)
+    val_strategy = _dynamic_tp_strategy_frame(
+        base_split=base_bundle.val,
+        exit1_split=exit1_bundle.val,
+        exit2_split=exit2_bundle.val,
+        path_returns=path_returns,
+        raw_index=pd.DatetimeIndex(raw_df.index),
+    )
+    test_strategy = _dynamic_tp_strategy_frame(
+        base_split=base_bundle.test,
+        exit1_split=exit1_bundle.test,
+        exit2_split=exit2_bundle.test,
+        path_returns=path_returns,
+        raw_index=pd.DatetimeIndex(raw_df.index),
+    )
+    tp_optimization = _optimize_dynamic_tp(
+        val_frame=val_strategy,
+        test_frame=test_strategy,
+        levels=_tp_optimization_levels(),
+        top_k=TP_OPT_TOP_K,
+    )
     run_name = _backtest_name(base_specs, exit1_spec, exit2_spec, base_ensemble, tp)
     csv_path = out_path / f"{run_name}.csv"
     tp_sweep_csv_path = out_path / f"{run_name}_tp_sweep.csv"
+    tp_optimization_csv_path = out_path / f"{run_name}_dynamic_tp_top5.csv"
     chart_path = out_path / f"{run_name}.png"
     summary.to_csv(csv_path, index=False)
     tp_sweep.to_csv(tp_sweep_csv_path, index=False)
+    tp_optimization.to_csv(tp_optimization_csv_path, index=False)
     _plot_summary(
         summary=summary,
         tp_sweep=tp_sweep,
+        tp_optimization=tp_optimization,
         chart_path=chart_path,
         base_label=base_bundle.label,
         exit1_label=exit1_bundle.label,
@@ -266,12 +296,15 @@ def run_backtest(
     )
     logger.info("Saved summary: %s", csv_path)
     logger.info("Saved TP sweep: %s", tp_sweep_csv_path)
+    logger.info("Saved dynamic TP top %d: %s", TP_OPT_TOP_K, tp_optimization_csv_path)
     logger.info("Saved chart: %s", chart_path)
     return BacktestResult(
         summary=summary,
         tp_sweep=tp_sweep,
+        tp_optimization=tp_optimization,
         csv_path=csv_path,
         tp_sweep_csv_path=tp_sweep_csv_path,
+        tp_optimization_csv_path=tp_optimization_csv_path,
         chart_path=chart_path,
     )
 
@@ -653,7 +686,9 @@ def _summarize_split(
     tp_sweep_thresholds: list[float],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     base_selected = pd.Index(base_split.selected_index)
-    base_path = path_returns.reindex(base_selected).dropna(subset=["high_h1", "high_h2"])
+    base_path = path_returns.reindex(base_selected).dropna(
+        subset=["high_h1", "high_h2", "low_h1"]
+    )
     base_signals = int(len(base_path))
     if base_signals == 0:
         summary = {
@@ -661,6 +696,10 @@ def _summarize_split(
             "base_signals": 0,
             "base_no_h1": 0,
             "base_no_h1_rate": 0.0,
+            "base_low_h1_le_neg01": 0,
+            "base_low_h1_le_neg01_rate": 0.0,
+            "base_low_h1_le_neg005": 0,
+            "base_low_h1_le_neg005_rate": 0.0,
             "exit1_selected": 0,
             "exit1_selected_rate": 0.0,
             "exit1_no_selected": 0,
@@ -684,6 +723,9 @@ def _summarize_split(
 
     no_h1_index = pd.Index(base_path.index[base_path["high_h1"] <= float(tp_threshold)])
     no_h1_count = int(len(no_h1_index))
+    low_h1 = pd.to_numeric(base_path["low_h1"], errors="coerce")
+    low_h1_le_neg01_count = int((low_h1 <= -0.001).sum())
+    low_h1_le_neg005_count = int((low_h1 <= -0.0005).sum())
 
     exit1_mapping = _future_bar_mapping(no_h1_index, raw_index, offset=1)
     exit1_selected_index = pd.Index(exit1_split.selected_index)
@@ -725,6 +767,14 @@ def _summarize_split(
         "base_signals": base_signals,
         "base_no_h1": no_h1_count,
         "base_no_h1_rate": no_h1_count / base_signals if base_signals else 0.0,
+        "base_low_h1_le_neg01": low_h1_le_neg01_count,
+        "base_low_h1_le_neg01_rate": (
+            low_h1_le_neg01_count / base_signals if base_signals else 0.0
+        ),
+        "base_low_h1_le_neg005": low_h1_le_neg005_count,
+        "base_low_h1_le_neg005_rate": (
+            low_h1_le_neg005_count / base_signals if base_signals else 0.0
+        ),
         "exit1_selected": exit1_selected_count,
         "exit1_selected_rate": exit1_selected_count / no_h1_count if no_h1_count else 0.0,
         "exit1_no_selected": exit1_no_selected_count,
@@ -835,6 +885,190 @@ def _summarize_split(
     )
 
 
+def _tp_optimization_levels() -> list[float]:
+    count = int(
+        np.floor((TP_OPT_END - TP_OPT_START) / TP_OPT_STEP + 1e-12)
+    ) + 1
+    levels = [float(TP_OPT_START + idx * TP_OPT_STEP) for idx in range(max(count, 0))]
+    if not levels:
+        raise ValueError("Dynamic TP optimization requires at least one TP level.")
+    if any(level <= float(config.TRADE_COST) for level in levels):
+        logger.warning(
+            "Dynamic TP grid contains levels at/below TRADE_COST=%.4g.",
+            config.TRADE_COST,
+        )
+    return levels
+
+
+def _dynamic_tp_strategy_frame(
+    base_split: SplitSignals,
+    exit1_split: SplitSignals,
+    exit2_split: SplitSignals,
+    path_returns: pd.DataFrame,
+    raw_index: pd.DatetimeIndex,
+) -> pd.DataFrame:
+    high_cols = _future_high_columns(path_returns, min_h=1)
+    if len(high_cols) < 3:
+        return pd.DataFrame()
+    final_h = _max_h_from_high_columns(high_cols)
+    close_col = f"close_h{final_h}"
+    required = [*high_cols, close_col]
+    base_path = path_returns.reindex(pd.Index(base_split.selected_index)).dropna(
+        subset=required
+    )
+    if base_path.empty:
+        return pd.DataFrame()
+
+    frame = pd.DataFrame(index=base_path.index)
+    frame["high_h1"] = pd.to_numeric(base_path["high_h1"], errors="coerce")
+    frame["high_h2"] = pd.to_numeric(base_path["high_h2"], errors="coerce")
+    h2_plus = _future_high_columns(base_path, min_h=2)
+    h3_plus = _future_high_columns(base_path, min_h=3)
+    frame["max_high_h2_plus"] = base_path[h2_plus].max(axis=1, skipna=False)
+    frame["max_high_h3_plus"] = base_path[h3_plus].max(axis=1, skipna=False)
+    frame["close_final"] = pd.to_numeric(base_path[close_col], errors="coerce")
+
+    exit1_mapping = _future_bar_mapping(frame.index, raw_index, offset=1)
+    exit2_mapping = _future_bar_mapping(frame.index, raw_index, offset=2)
+    exit1_selected = pd.Series(
+        exit1_mapping["exit_index"].isin(pd.Index(exit1_split.selected_index)).to_numpy(),
+        index=pd.Index(exit1_mapping["base_index"]),
+        dtype=bool,
+    )
+    exit2_selected = pd.Series(
+        exit2_mapping["exit_index"].isin(pd.Index(exit2_split.selected_index)).to_numpy(),
+        index=pd.Index(exit2_mapping["base_index"]),
+        dtype=bool,
+    )
+    frame["exit1_selected"] = exit1_selected.reindex(frame.index).fillna(False).astype(bool)
+    frame["exit2_selected"] = exit2_selected.reindex(frame.index).fillna(False).astype(bool)
+    return frame.replace([np.inf, -np.inf], np.nan).dropna()
+
+
+def _optimize_dynamic_tp(
+    val_frame: pd.DataFrame,
+    test_frame: pd.DataFrame,
+    levels: list[float],
+    top_k: int = 5,
+) -> pd.DataFrame:
+    columns = [
+        "rank",
+        "tp_h1",
+        "tp_exit1_selected",
+        "tp_h2",
+        "tp_exit2_selected",
+        "tp_exit2_no_selected",
+        "val_e_net",
+        "test_e_net",
+        "val_hit_rate",
+        "test_hit_rate",
+        "val_trades",
+        "test_trades",
+    ]
+    if val_frame.empty or test_frame.empty:
+        return pd.DataFrame(columns=columns)
+
+    val_arrays = _dynamic_tp_arrays(val_frame)
+    test_arrays = _dynamic_tp_arrays(test_frame)
+    candidates: list[tuple[float, float, tuple[float, ...], dict[str, float]]] = []
+    for combo in itertools.product(levels, repeat=5):
+        val_metrics = _simulate_dynamic_tp_arrays(val_arrays, combo)
+        candidates.append(
+            (
+                float(val_metrics["e_net"]),
+                float(val_metrics["hit_rate"]),
+                tuple(float(value) for value in combo),
+                val_metrics,
+            )
+        )
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+
+    rows: list[dict[str, Any]] = []
+    for rank, (_, _, combo, val_metrics) in enumerate(
+        candidates[: max(int(top_k), 0)],
+        start=1,
+    ):
+        test_metrics = _simulate_dynamic_tp_arrays(test_arrays, combo)
+        rows.append(
+            {
+                "rank": rank,
+                "tp_h1": combo[0],
+                "tp_exit1_selected": combo[1],
+                "tp_h2": combo[2],
+                "tp_exit2_selected": combo[3],
+                "tp_exit2_no_selected": combo[4],
+                "val_e_net": val_metrics["e_net"],
+                "test_e_net": test_metrics["e_net"],
+                "val_hit_rate": val_metrics["hit_rate"],
+                "test_hit_rate": test_metrics["hit_rate"],
+                "val_trades": int(val_metrics["n_trades"]),
+                "test_trades": int(test_metrics["n_trades"]),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _dynamic_tp_arrays(frame: pd.DataFrame) -> dict[str, np.ndarray]:
+    return {
+        "high_h1": frame["high_h1"].to_numpy(dtype=float),
+        "high_h2": frame["high_h2"].to_numpy(dtype=float),
+        "max_high_h2_plus": frame["max_high_h2_plus"].to_numpy(dtype=float),
+        "max_high_h3_plus": frame["max_high_h3_plus"].to_numpy(dtype=float),
+        "close_final": frame["close_final"].to_numpy(dtype=float),
+        "exit1_selected": frame["exit1_selected"].to_numpy(dtype=bool),
+        "exit2_selected": frame["exit2_selected"].to_numpy(dtype=bool),
+    }
+
+
+def _simulate_dynamic_tp_arrays(
+    arrays: dict[str, np.ndarray],
+    thresholds: tuple[float, ...],
+) -> dict[str, float]:
+    if len(thresholds) != 5:
+        raise ValueError("Dynamic TP simulation requires exactly five thresholds.")
+    n = len(arrays["close_final"])
+    if n == 0:
+        return {"e_net": float("nan"), "hit_rate": 0.0, "n_trades": 0.0}
+
+    tp_h1, tp_exit1, tp_h2, tp_exit2, tp_exit2_no = map(float, thresholds)
+    realized = arrays["close_final"].copy()
+    hit = np.zeros(n, dtype=bool)
+
+    hit_h1 = arrays["high_h1"] > tp_h1
+    realized[hit_h1] = tp_h1
+    hit |= hit_h1
+
+    after_h1 = ~hit_h1
+    exit1_selected = after_h1 & arrays["exit1_selected"]
+    hit_exit1 = exit1_selected & (arrays["max_high_h2_plus"] > tp_exit1)
+    realized[hit_exit1] = tp_exit1
+    hit |= hit_exit1
+
+    exit1_no_selected = after_h1 & ~arrays["exit1_selected"]
+    hit_h2 = exit1_no_selected & (arrays["high_h2"] > tp_h2)
+    realized[hit_h2] = tp_h2
+    hit |= hit_h2
+
+    after_h2 = exit1_no_selected & ~hit_h2
+    exit2_selected = after_h2 & arrays["exit2_selected"]
+    hit_exit2 = exit2_selected & (arrays["max_high_h3_plus"] > tp_exit2)
+    realized[hit_exit2] = tp_exit2
+    hit |= hit_exit2
+
+    exit2_no_selected = after_h2 & ~arrays["exit2_selected"]
+    hit_exit2_no = exit2_no_selected & (
+        arrays["max_high_h3_plus"] > tp_exit2_no
+    )
+    realized[hit_exit2_no] = tp_exit2_no
+    hit |= hit_exit2_no
+
+    return {
+        "e_net": float(realized.mean() - float(config.TRADE_COST)),
+        "hit_rate": float(hit.mean()),
+        "n_trades": float(n),
+    }
+
+
 def _future_bar_mapping(
     index: pd.Index,
     raw_index: pd.DatetimeIndex,
@@ -875,6 +1109,7 @@ def _empty_tp_sweep_rows(
             "hit_rate": 0.0,
             "miss_count": 0,
             "miss_return_mean": float("nan"),
+            "close_h2_return_mean": float("nan"),
         }
         for threshold in thresholds
     ]
@@ -920,6 +1155,14 @@ def _tp_sweep_rows(
         if close_col in selected_path.columns
         else pd.Series(np.nan, index=selected_path.index, dtype=float)
     )
+    close_h2_values = (
+        pd.to_numeric(selected_path["close_h2"], errors="coerce").dropna()
+        if "close_h2" in selected_path.columns
+        else pd.Series(dtype=float)
+    )
+    close_h2_return_mean = (
+        float(close_h2_values.mean()) if not close_h2_values.empty else float("nan")
+    )
     rows: list[dict[str, Any]] = []
     for threshold in thresholds:
         hit = (high_values > float(threshold)).any(axis=1)
@@ -938,6 +1181,7 @@ def _tp_sweep_rows(
                 "hit_rate": hit_count / total if total else 0.0,
                 "miss_count": miss_count,
                 "miss_return_mean": miss_return_mean,
+                "close_h2_return_mean": close_h2_return_mean,
             }
         )
     return rows
@@ -981,6 +1225,7 @@ def _max_h_from_high_columns(columns: list[str]) -> int:
 def _plot_summary(
     summary: pd.DataFrame,
     tp_sweep: pd.DataFrame,
+    tp_optimization: pd.DataFrame,
     chart_path: Path,
     base_label: str,
     exit1_label: str,
@@ -999,10 +1244,11 @@ def _plot_summary(
         ax_p2_base,
         ax_p2_selected,
         ax_p2_no_selected,
+        ax_tp_optimization,
     ) = plt.subplots(
-        10,
+        11,
         1,
-        figsize=(17.5, 25.0),
+        figsize=(17.5, 27.5),
         gridspec_kw={
             "height_ratios": [
                 1.25,
@@ -1015,6 +1261,7 @@ def _plot_summary(
                 1.35,
                 1.35,
                 1.35,
+                1.50,
             ]
         },
         constrained_layout=True,
@@ -1086,9 +1333,23 @@ def _plot_summary(
     )
     _draw_table(
         ax_p2_no_selected,
-        _sweep_table(tp_sweep, group_name="p2_exit_after_h2_no_selected"),
+        _sweep_table(
+            tp_sweep,
+            group_name="p2_exit_after_h2_no_selected",
+            include_close_h2=True,
+        ),
         title="exit_after_h2 no selected: TP hitrate in H3-H5 / total exit_after_h2 no selected",
         font_size=6.3,
+    )
+    _draw_table(
+        ax_tp_optimization,
+        _dynamic_tp_table(tp_optimization),
+        title=(
+            f"Dynamic TP optimizer: top {TP_OPT_TOP_K} by val E[net] | "
+            f"grid={TP_OPT_START:.2%}..{TP_OPT_END:.2%} step={TP_OPT_STEP:.2%} | "
+            "test is evaluation-only"
+        ),
+        font_size=6.8,
     )
     fig.savefig(chart_path, dpi=170)
     plt.close(fig)
@@ -1109,6 +1370,12 @@ def _part1_summary_table(summary: pd.DataFrame) -> pd.DataFrame:
                 "split": str(row.get("split", "")),
                 "base signal": _count_cell(row.get("base_signals")),
                 "base no H1": base_no_h1,
+                "low H1 <= -0.1%": _format_pct(
+                    float(row.get("base_low_h1_le_neg01_rate", 0.0))
+                ),
+                "low H1 <= -0.05%": _format_pct(
+                    float(row.get("base_low_h1_le_neg005_rate", 0.0))
+                ),
                 "e_after_h1 selected": exit1_selected,
                 "e_after_h1 no selected": exit1_no_selected,
                 "exit_h1_top_fraction": _format_pct(float(row.get("exit1_top_fraction", 0.0))),
@@ -1160,7 +1427,11 @@ def _count_cell(value: Any) -> str:
         return str(value)
 
 
-def _sweep_table(tp_sweep: pd.DataFrame, group_name: str) -> pd.DataFrame:
+def _sweep_table(
+    tp_sweep: pd.DataFrame,
+    group_name: str,
+    include_close_h2: bool = False,
+) -> pd.DataFrame:
     columns = ["split"] + [_format_threshold_pct(threshold) for threshold in _tp_sweep_thresholds()]
     if tp_sweep.empty or "group" not in tp_sweep.columns:
         return pd.DataFrame(columns=columns)
@@ -1184,7 +1455,60 @@ def _sweep_table(tp_sweep: pd.DataFrame, group_name: str) -> pd.DataFrame:
             miss_return_row[threshold_label] = _format_signed_pct(miss_return)
         rows.append(hit_row)
         rows.append(miss_return_row)
+        if include_close_h2:
+            close_h2 = pd.to_numeric(
+                sorted_group.get("close_h2_return_mean"),
+                errors="coerce",
+            ).dropna()
+            close_h2_row: dict[str, str] = {"split": f"{split} mean close H2"}
+            if len(columns) > 1 and not close_h2.empty:
+                close_h2_row[columns[1]] = _format_signed_pct(float(close_h2.iloc[0]))
+            rows.append(close_h2_row)
     return pd.DataFrame(rows, columns=columns).fillna("")
+
+
+def _dynamic_tp_table(results: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "rank",
+        "TP H1",
+        "TP E1 selected",
+        "TP H2",
+        "TP E2 selected",
+        "TP E2 no-selected",
+        "val E[net]",
+        "test E[net]",
+        "val hit",
+        "test hit",
+        "val n",
+        "test n",
+    ]
+    if results.empty:
+        return pd.DataFrame(columns=columns)
+    rows: list[dict[str, str]] = []
+    for _, row in results.iterrows():
+        rows.append(
+            {
+                "rank": _count_cell(row.get("rank")),
+                "TP H1": _format_pct(float(row.get("tp_h1", 0.0))),
+                "TP E1 selected": _format_pct(
+                    float(row.get("tp_exit1_selected", 0.0))
+                ),
+                "TP H2": _format_pct(float(row.get("tp_h2", 0.0))),
+                "TP E2 selected": _format_pct(
+                    float(row.get("tp_exit2_selected", 0.0))
+                ),
+                "TP E2 no-selected": _format_pct(
+                    float(row.get("tp_exit2_no_selected", 0.0))
+                ),
+                "val E[net]": _format_signed_pct(row.get("val_e_net")),
+                "test E[net]": _format_signed_pct(row.get("test_e_net")),
+                "val hit": _format_pct(float(row.get("val_hit_rate", 0.0))),
+                "test hit": _format_pct(float(row.get("test_hit_rate", 0.0))),
+                "val n": _count_cell(row.get("val_trades")),
+                "test n": _count_cell(row.get("test_trades")),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
 
 
 def _draw_table(
@@ -1240,7 +1564,10 @@ def _backtest_name(
     tp_threshold: float,
 ) -> str:
     base_name = "_".join(
-        f"b{i}_{_short_safe_name(spec.archive_path.stem)}_r{spec.rank:02d}"
+        (
+            f"b{i}_{_short_safe_name(spec.archive_path.stem)}_r{spec.rank:02d}"
+            f"_top{_threshold_filename_token(float(spec.top_fraction))}"
+        )
         for i, spec in enumerate(base_specs, start=1)
     )
     exit1_name = (
@@ -1252,7 +1579,7 @@ def _backtest_name(
     tp_name = _threshold_filename_token(float(tp_threshold))
     exit1_top_name = _threshold_filename_token(float(exit1_spec.top_fraction))
     exit2_top_name = _threshold_filename_token(float(exit2_spec.top_fraction))
-    return _safe_name(
+    full_name = _safe_name(
         "_".join(
             [
                 f"strategy_e1top_{exit1_top_name}",
@@ -1262,6 +1589,25 @@ def _backtest_name(
                 exit1_name,
                 exit2_name,
                 f"tp_{tp_name}",
+            ]
+        )
+    )
+    if len(full_name) <= 150:
+        return full_name
+
+    # Keep Windows output paths comfortably below MAX_PATH while retaining the
+    # parameters most useful when scanning a directory. The digest covers every
+    # archive, rank, threshold and top fraction contained in the full name.
+    digest = hashlib.sha1(full_name.encode("utf-8")).hexdigest()[:12]
+    return _safe_name(
+        "_".join(
+            [
+                f"strategy_e1top_{exit1_top_name}",
+                f"e2top_{exit2_top_name}",
+                base_ensemble,
+                f"bases{len(base_specs)}",
+                f"tp_{tp_name}",
+                digest,
             ]
         )
     )
@@ -1362,8 +1708,9 @@ def main() -> None:
         nargs="+",
         required=True,
         help=(
-            "Base signal spec(s): ARCHIVE#RANK#MODE#THRESHOLD. "
-            "Base top fraction is config.TRADE_TOP_FRACTION unless a fifth field is supplied."
+            "Base signal spec(s): ARCHIVE#RANK#MODE#THRESHOLD[#TOP_FRACTION]. "
+            "Each base may use its own fifth-field top fraction; otherwise that base "
+            "falls back to config.TRADE_TOP_FRACTION. Quote each spec in the shell."
         ),
     )
     parser.add_argument(

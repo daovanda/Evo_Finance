@@ -26,10 +26,10 @@ crypto/config.py
 Quan trong nhat:
 
 ```python
-HOLDING_HORIZONS = [3, 5]
-LABEL_THRESHOLD = 0.003
-LABEL_MODE = "mfe"  # "close_exit", "mfe", hoac "payoff"
-PAYOFF_TP = 0.003
+HOLDING_HORIZONS = [5]
+LABEL_THRESHOLD = 0.0
+LABEL_MODE = "close_path_mean"
+PAYOFF_TP = 0.004
 TRADE_COST = 0.002
 VAL_START = "2024-01-01"
 TEST_START = "2025-01-01"
@@ -46,6 +46,7 @@ rank_01_h5.txt
 
 `LABEL_MODE="close_exit"` dung return tu `open(t+1)` den `close(t+h)`.
 `LABEL_MODE="mfe"` dung return tu `open(t+1)` den high lon nhat trong khoang `t+1..t+h`.
+`LABEL_MODE="close_path_mean"` dung mean return cua `close(t+1)..close(t+h)` so voi `open(t+1)`; threshold `0.0` nghia la mean future close nam tren entry.
 `LABEL_MODE="payoff"` dung return mo phong rule TP: neu MFE cham `PAYOFF_TP` thi future return = `PAYOFF_TP`, nguoc lai future return = close return tai `close(t+h)`. Neu bo qua `--label-threshold`, mode `payoff` tu dung `TRADE_COST` lam threshold.
 
 ### Trading config
