@@ -11,11 +11,13 @@ from crypto.backtest import (
     SplitSignals,
     _backtest_name,
     _dynamic_tp_arrays,
+    _draw_table,
     _parse_spec,
     _simulate_dynamic_tp_arrays,
     _summarize_split,
     _sweep_table,
 )
+import matplotlib.pyplot as plt
 from crypto.main import _validate_resume_metadata
 from crypto.data import CryptoFold, add_binary_labels, split_labeled_by_dates
 from crypto.evolution import CryptoArchive, CryptoIndividual, CryptoMutator
@@ -25,6 +27,22 @@ from crypto.fitness import CryptoFitnessEvaluator, _internal_early_stop_split
 
 
 class CryptoPipelineTests(unittest.TestCase):
+    def test_backtest_draw_table_handles_empty_results(self):
+        fig, ax = plt.subplots()
+        try:
+            _draw_table(
+                ax,
+                pd.DataFrame(columns=["rank", "val E[net]"]),
+                title="empty optimizer",
+                font_size=7.0,
+            )
+            self.assertEqual(len(ax.tables), 0)
+            self.assertTrue(
+                any("No samples" in text.get_text() for text in ax.texts)
+            )
+        finally:
+            plt.close(fig)
+
     def test_backtest_name_stays_within_windows_safe_length(self):
         base_specs = [
             ModelSpec(
@@ -222,6 +240,106 @@ class CryptoPipelineTests(unittest.TestCase):
         self.assertEqual(labeled["label_h3"].iloc[0], 1.0)
         self.assertTrue(pd.isna(labeled["label_h3"].iloc[-1]))
 
+    def test_safe_path_mfe_uses_first_hit_and_all_prior_safe_closes(self):
+        idx = pd.date_range("2024-01-01", periods=6, freq="15min")
+
+        def labeled_for(highs, closes, threshold=None):
+            frame = pd.DataFrame(
+                {
+                    "open": [100.0] * 6,
+                    "high": [100.0, *highs],
+                    "low": [99.0] * 6,
+                    "close": [100.0, *closes],
+                    "volume": [10.0] * 6,
+                    "trade_count": [10] * 6,
+                    "taker_buy_base_volume": [5.0] * 6,
+                    "taker_buy_quote_volume": [500.0] * 6,
+                },
+                index=idx,
+            )
+            return add_binary_labels(
+                frame,
+                horizons=[5],
+                label_mode="safe_path_mfe",
+                threshold=threshold,
+            )
+
+        old_tp = config.TP_SAFE_CLOSE
+        try:
+            config.TP_SAFE_CLOSE = 0.004
+
+            hit_h1 = labeled_for(
+                highs=[100.4, 100.0, 100.0, 100.0, 100.0],
+                closes=[99.0, 100.0, 100.0, 100.0, 100.0],
+            )
+            self.assertEqual(hit_h1["label_h5"].iloc[0], 1.0)
+            self.assertAlmostEqual(hit_h1["future_return_h5"].iloc[0], 0.004)
+
+            clean_h3 = labeled_for(
+                highs=[100.1, 100.2, 100.4, 100.0, 100.0],
+                closes=[99.9, 99.85, 100.0, 100.0, 100.0],
+            )
+            self.assertEqual(clean_h3["label_h5"].iloc[0], 1.0)
+            self.assertAlmostEqual(clean_h3["future_return_h5"].iloc[0], 0.004)
+
+            unsafe_before_h3 = labeled_for(
+                highs=[100.1, 100.2, 100.4, 100.0, 100.0],
+                closes=[99.9, 99.7, 100.0, 100.0, 100.0],
+            )
+            self.assertEqual(unsafe_before_h3["label_h5"].iloc[0], 0.0)
+            self.assertAlmostEqual(
+                unsafe_before_h3["future_return_h5"].iloc[0],
+                -0.003,
+            )
+            self.assertTrue(unsafe_before_h3["label_h5"].iloc[1:].isna().all())
+        finally:
+            config.TP_SAFE_CLOSE = old_tp
+
+    def test_safe_path_mfe_threshold_overrides_default_close_floor(self):
+        idx = pd.date_range("2024-01-01", periods=4, freq="15min")
+        frame = pd.DataFrame(
+            {
+                "open": [100.0] * 4,
+                "high": [100.0, 100.1, 100.4, 100.0],
+                "low": [99.0] * 4,
+                "close": [100.0, 99.85, 100.0, 100.0],
+                "volume": [10.0] * 4,
+                "trade_count": [10] * 4,
+                "taker_buy_base_volume": [5.0] * 4,
+                "taker_buy_quote_volume": [500.0] * 4,
+            },
+            index=idx,
+        )
+        old_tp = config.TP_SAFE_CLOSE
+        try:
+            config.TP_SAFE_CLOSE = 0.004
+            default_floor = add_binary_labels(
+                frame,
+                horizons=[2],
+                label_mode="safe_path_mfe",
+            )
+            tighter_floor = add_binary_labels(
+                frame,
+                horizons=[2],
+                label_mode="safe_path_mfe",
+                threshold=-0.001,
+            )
+        finally:
+            config.TP_SAFE_CLOSE = old_tp
+
+        self.assertEqual(default_floor["label_h2"].iloc[0], 1.0)
+        self.assertEqual(tighter_floor["label_h2"].iloc[0], 0.0)
+
+    def test_safe_path_mfe_is_registered_with_its_close_floor_default(self):
+        self.assertEqual(
+            config.default_label_threshold("safe_path_mfe"),
+            config.SAFE_CLOSE_FLOOR,
+        )
+        self.assertIs(
+            config.get_label_return_fn("safe_path_mfe"),
+            config.safe_path_mfe_future_return,
+        )
+
     def test_close_path_mean_label_uses_mean_future_closes_from_next_open(self):
         idx = pd.date_range("2024-01-01", periods=6, freq="15min")
         df = pd.DataFrame(
@@ -340,6 +458,33 @@ class CryptoPipelineTests(unittest.TestCase):
                 label_mode="payoff",
                 label_threshold=config.TRADE_COST,
             )
+
+    def test_resume_metadata_mismatch_checks_safe_path_tp(self):
+        old_tp = config.TP_SAFE_CLOSE
+        try:
+            config.TP_SAFE_CLOSE = 0.004
+            archive = CryptoArchive(
+                metadata={
+                    "horizons": [5],
+                    "label_mode": "safe_path_mfe",
+                    "label_threshold": -0.002,
+                    "tp_safe_close": 0.003,
+                    "fitness_horizon_mode": config.FITNESS_HORIZON_MODE,
+                    "trade_top_fraction": config.TRADE_TOP_FRACTION,
+                    "trade_cost": config.TRADE_COST,
+                }
+            )
+
+            with self.assertRaisesRegex(ValueError, "tp_safe_close"):
+                _validate_resume_metadata(
+                    archive=archive,
+                    resume_path=Path("archive.json"),
+                    horizons=[5],
+                    label_mode="safe_path_mfe",
+                    label_threshold=-0.002,
+                )
+        finally:
+            config.TP_SAFE_CLOSE = old_tp
 
     def test_label_mode_mfe_is_used_by_default_labeling(self):
         idx = pd.date_range("2024-01-01", periods=5, freq="15min")

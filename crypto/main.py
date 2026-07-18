@@ -268,6 +268,12 @@ def _save_archive(
             "label_mode": label_mode,
             "label_threshold": label_threshold,
             "payoff_tp": config.PAYOFF_TP,
+            "tp_safe_close": config.TP_SAFE_CLOSE,
+            "safe_close_floor": (
+                float(label_threshold)
+                if label_mode == "safe_path_mfe"
+                else float(config.SAFE_CLOSE_FLOOR)
+            ),
             "fitness_horizon_mode": config.FITNESS_HORIZON_MODE,
             "fitness": config.FITNESS_WEIGHTS,
             "trade_top_fraction": config.TRADE_TOP_FRACTION,
@@ -312,6 +318,10 @@ def _validate_resume_metadata(
     ]
     if label_mode == "payoff" and archive_label_mode == "payoff":
         checks.append(("payoff_tp", metadata.get("payoff_tp"), float(config.PAYOFF_TP)))
+    if label_mode == "safe_path_mfe" and archive_label_mode == "safe_path_mfe":
+        checks.append(
+            ("tp_safe_close", metadata.get("tp_safe_close"), float(config.TP_SAFE_CLOSE))
+        )
 
     mismatches: list[str] = []
     for name, archive_value, current_value in checks:
@@ -386,8 +396,9 @@ def main() -> None:
         type=float,
         default=None,
         help=(
-            "Label threshold. Default is LABEL_THRESHOLD for non-payoff modes and "
-            "TRADE_COST for payoff."
+            "Label threshold. Default is LABEL_THRESHOLD for ordinary modes, "
+            "TRADE_COST for payoff, and SAFE_CLOSE_FLOOR for safe_path_mfe. "
+            "For safe_path_mfe, TP is config.TP_SAFE_CLOSE."
         ),
     )
     parser.add_argument(
@@ -395,7 +406,9 @@ def main() -> None:
         default=config.LABEL_MODE,
         help=(
             f"Label mode. Allowed: {', '.join(sorted(config.LABEL_RETURN_FNS))}. "
-            f"Alias accepted: exit_all -> exit_after_h1. Default: {config.LABEL_MODE}."
+            "Aliases accepted: exit_all -> exit_after_h1, "
+            "first_hit_safe_close/safe_close -> safe_path_mfe. "
+            f"Default: {config.LABEL_MODE}."
         ),
     )
     parser.add_argument(

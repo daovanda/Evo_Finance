@@ -56,6 +56,8 @@ HOLDING_HORIZONS = [5]
 LABEL_THRESHOLD = 0.0
 LABEL_MODE = "close_path_mean"
 PAYOFF_TP = 0.004
+TP_SAFE_CLOSE = 0.004
+SAFE_CLOSE_FLOOR = -0.002
 TRADE_COST = 0.002
 ```
 
@@ -96,6 +98,16 @@ future_return(t, h) = PAYOFF_TP neu MFE(t, h) >= PAYOFF_TP, nguoc lai close_retu
 
 Mode `payoff` mo phong gross payoff cua rule: cham TP thi tinh loi bang `PAYOFF_TP`, khong cham TP thi tinh return thoat o `close(t+h)`. Neu khong truyen `--label-threshold`, mode nay tu dung `TRADE_COST` lam threshold, tuc label = 1 khi gross payoff lon hon phi vong mua/ban.
 
+`LABEL_MODE="safe_path_mfe"`:
+
+```text
+entry = open(t+1)
+first_hit_h = horizon dau tien co high(t+h) / entry - 1 >= TP_SAFE_CLOSE
+label = first_hit_h ton tai va moi close_return tu H1 den truoc first_hit_h > label_threshold
+```
+
+Mode nay dung de tim mau cham TP nhung duong close truoc khi cham TP khong bi xau qua. Neu khong truyen `--label-threshold`, mode nay tu dung `SAFE_CLOSE_FLOOR`; `TP_SAFE_CLOSE` la muc TP rieng, vi du `0.004` la `0.4%`.
+
 Co the override label mode bang CLI, khong can sua file config:
 
 ```powershell
@@ -119,6 +131,7 @@ Luu y:
 - `--label-mode` va `--label-threshold` trong `crypto.main` anh huong truc tiep den label khi tien hoa.
 - `--label-mode` va `--label-threshold` trong `crypto.analyze` la label/threshold dung de train lai va ve chart.
 - Neu `--label-mode payoff` va bo qua `--label-threshold`, threshold se la `TRADE_COST`; `PAYOFF_TP` chi quy dinh muc TP gross trong cong thuc payoff.
+- Neu `--label-mode safe_path_mfe`, `--label-threshold` la close floor, con TP lay tu `TP_SAFE_CLOSE`.
 - Neu archive duoc tien hoa bang mode/threshold A nhung analyze bang mode/threshold B thi chart la ket qua tai danh gia theo B, khong phai score goc trong archive.
 
 ### Final split

@@ -19,10 +19,12 @@ RESULTS_DIR: Path = Path("crypto/results")
 DEFAULT_ARCHIVE_PATH: Path = RESULTS_DIR / "crypto_btc_archive.json"
 
 # Multi-horizon binary labels. Edit this list freely, for example [3, 7, 10, 20].
-HOLDING_HORIZONS: list[int] = [5]
+HOLDING_HORIZONS: list[int] = [3]
 LABEL_THRESHOLD: float = 0.0  # label=1 when future_return > threshold
 LABEL_MODE: str = "close_path_mean"
 PAYOFF_TP: float = 0.004  # only used by LABEL_MODE="payoff"
+TP_SAFE_CLOSE: float = 0.004  # TP used by LABEL_MODE="safe_path_mfe"
+SAFE_CLOSE_FLOOR: float = -0.002  # close floor used by LABEL_MODE="safe_path_mfe"
 
 
 def close_exit_future_return(df: Any, horizon: int) -> Any:
@@ -53,6 +55,74 @@ def mfe_future_return(df: Any, horizon: int) -> Any:
     )
     max_high = future_highs.max(axis=1, skipna=False)
     return (max_high - entry_open) / entry_open
+
+
+def safe_path_mfe_outcome(
+    df: Any,
+    horizon: int,
+    close_floor: float | None = None,
+) -> tuple[pd.Series, pd.Series]:
+    """Return checkpoint-strategy returns and the first-hit safe-path label.
+
+    For a signal at t, entry is open(t+1). The first horizon whose high
+    reaches ``TP_SAFE_CLOSE`` is a positive label only when every close from
+    H1 up to the candle before that first hit remained above ``close_floor``
+    relative to entry:
+
+        first_hit_h = first h where high_h / open_H1 - 1 >= TP_SAFE_CLOSE
+        label = first_hit_h exists and all close_h_before_first_hit > close_floor
+
+    A TP hit is evaluated before that horizon's close because the live limit
+    order would already have exited the position.
+
+    The returned strategy outcome is TP on a valid first hit, the close return
+    at the first failed safety checkpoint, or the final close return when
+    neither event occurs. A complete h-candle path is required.
+    """
+    h = int(horizon)
+    if h < 1:
+        raise ValueError("horizon must be positive for safe_path_mfe.")
+
+    floor = float(SAFE_CLOSE_FLOOR if close_floor is None else close_floor)
+    entry_open = df["open"].shift(-1)
+    future_highs = pd.concat(
+        [df["high"].shift(-offset) for offset in range(1, h + 1)],
+        axis=1,
+    )
+    future_closes = pd.concat(
+        [df["close"].shift(-offset) for offset in range(1, h + 1)],
+        axis=1,
+    )
+    high_returns = future_highs.div(entry_open, axis=0) - 1.0
+    close_returns = future_closes.div(entry_open, axis=0) - 1.0
+    complete_path = (
+        entry_open.notna()
+        & future_highs.notna().all(axis=1)
+        & future_closes.notna().all(axis=1)
+    )
+
+    active = complete_path.copy()
+    label = pd.Series(False, index=df.index, dtype="bool")
+    outcome = pd.Series(float("nan"), index=df.index, dtype="float64")
+    for position in range(h):
+        hit_now = active & high_returns.iloc[:, position].ge(float(TP_SAFE_CLOSE))
+        label.loc[hit_now] = True
+        outcome.loc[hit_now] = float(TP_SAFE_CLOSE)
+        active.loc[hit_now] = False
+
+        unsafe_close = active & close_returns.iloc[:, position].le(floor)
+        outcome.loc[unsafe_close] = close_returns.iloc[:, position].loc[unsafe_close]
+        active.loc[unsafe_close] = False
+
+    outcome.loc[active] = close_returns.iloc[:, -1].loc[active]
+    label_float = label.astype("float64").where(complete_path)
+    return outcome.where(complete_path), label_float
+
+
+def safe_path_mfe_future_return(df: Any, horizon: int) -> Any:
+    """Default-threshold strategy return for ``safe_path_mfe``."""
+    outcome, _ = safe_path_mfe_outcome(df, horizon)
+    return outcome
 
 
 def close_path_mean_future_return(df: Any, horizon: int) -> Any:
@@ -156,6 +226,7 @@ LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
     "close_exit": close_exit_future_return,
     "close_path_mean": close_path_mean_future_return,
     "mfe": mfe_future_return,
+    "safe_path_mfe": safe_path_mfe_future_return,
     "payoff": payoff_future_return,
     "exit_after_h1": exit_after_h1_future_return,
     "exit_after_h2": exit_after_h2_future_return,
@@ -163,6 +234,8 @@ LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
 
 LABEL_MODE_ALIASES: dict[str, str] = {
     "exit_all": "exit_after_h1",
+    "first_hit_safe_close": "safe_path_mfe",
+    "safe_close": "safe_path_mfe",
 }
 
 
@@ -186,6 +259,8 @@ def default_label_threshold(mode: str | None = None, threshold: float | None = N
     selected_mode = canonical_label_mode(mode)
     if selected_mode == "payoff":
         return float(TRADE_COST)
+    if selected_mode == "safe_path_mfe":
+        return float(SAFE_CLOSE_FLOOR)
     return float(LABEL_THRESHOLD)
 
 
@@ -289,6 +364,10 @@ def validate_config() -> None:
     get_label_return_fn()
     if PAYOFF_TP <= 0:
         raise ValueError("PAYOFF_TP must be positive.")
+    if not isfinite(float(TP_SAFE_CLOSE)) or TP_SAFE_CLOSE <= 0:
+        raise ValueError("TP_SAFE_CLOSE must be finite and positive.")
+    if not isfinite(float(SAFE_CLOSE_FLOOR)):
+        raise ValueError("SAFE_CLOSE_FLOOR must be finite.")
     if FEATURE_MIN < 1 or FEATURE_MAX < FEATURE_MIN:
         raise ValueError("Require 1 <= FEATURE_MIN <= FEATURE_MAX.")
     if EXPR_MAX_DEPTH < 1:

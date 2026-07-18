@@ -79,7 +79,10 @@ def add_binary_labels(
     Add future_return_h{h} and label_h{h}.
 
     The future_return formula is controlled by label_mode/config.LABEL_MODE.
-    label = 1 if future_return > threshold, else 0.
+    label = 1 if future_return > threshold, else 0. The safe_path_mfe mode
+    uses its explicit first-hit/path-safety label instead: first TP hit at
+    config.TP_SAFE_CLOSE exists, and all earlier close returns stay above
+    the selected close floor.
     """
     labeled = df.sort_index().copy()
     selected_mode = config.canonical_label_mode(label_mode)
@@ -87,6 +90,16 @@ def add_binary_labels(
     label_threshold = config.default_label_threshold(selected_mode, threshold)
     for h in horizons:
         h = int(h)
+        if selected_mode == "safe_path_mfe":
+            future_return, explicit_label = config.safe_path_mfe_outcome(
+                labeled,
+                h,
+                close_floor=float(label_threshold),
+            )
+            labeled[f"future_return_h{h}"] = future_return
+            labeled[f"label_h{h}"] = explicit_label
+            continue
+
         future_return = label_return_fn(labeled, h)
         if selected_mode == "exit_after_h1":
             h1_return = (labeled["high"] - labeled["open"]) / labeled["open"]

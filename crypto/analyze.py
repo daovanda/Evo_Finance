@@ -159,6 +159,7 @@ def analyze(
         config.HOLDING_HORIZONS,
         label_mode=label_mode,
     )
+    mfe_threshold = _mfe_threshold_for_mode(label_mode, float(label_threshold))
 
     charts: list[Path] = []
     for entry in entries:
@@ -181,7 +182,7 @@ def analyze(
                 mfe=mfe_by_horizon[int(horizon)],
                 path_returns=path_by_horizon[int(horizon)],
                 close_return=close_return_by_horizon[int(horizon)],
-                label_threshold=float(label_threshold),
+                label_threshold=mfe_threshold,
             )
             if result is not None:
                 horizon_results.append(result)
@@ -289,7 +290,7 @@ def analyze_ensemble_individuals(
         mfe=mfe_by_horizon[exit_horizon],
         path_returns=path_by_horizon[exit_horizon],
         close_return=close_return_by_horizon[exit_horizon],
-        label_threshold=float(label_threshold),
+        label_threshold=_mfe_threshold_for_mode(label_mode, float(label_threshold)),
     )
     reference_test = _reference_split_prediction(
         split="test",
@@ -298,7 +299,7 @@ def analyze_ensemble_individuals(
         mfe=mfe_by_horizon[exit_horizon],
         path_returns=path_by_horizon[exit_horizon],
         close_return=close_return_by_horizon[exit_horizon],
-        label_threshold=float(label_threshold),
+        label_threshold=_mfe_threshold_for_mode(label_mode, float(label_threshold)),
     )
 
     individual_ensembles: list[HorizonAnalysis] = []
@@ -308,6 +309,10 @@ def analyze_ensemble_individuals(
         individual = _entry_to_individual(entry)
         member_label_mode = config.canonical_label_mode(spec.label_mode or label_mode)
         member_label_threshold = _resolve_spec_label_threshold(spec, float(label_threshold))
+        member_mfe_threshold = _mfe_threshold_for_mode(
+            member_label_mode,
+            member_label_threshold,
+        )
         if member_label_mode == label_mode and member_label_threshold == float(label_threshold):
             member_train_df, member_val_df, member_test_df = train_df, val_df, test_df
         else:
@@ -348,7 +353,7 @@ def analyze_ensemble_individuals(
                 mfe=member_mfe_by_horizon[int(horizon)],
                 path_returns=member_path_by_horizon[int(horizon)],
                 close_return=member_close_by_horizon[int(horizon)],
-                label_threshold=member_label_threshold,
+                label_threshold=member_mfe_threshold,
             )
             if result is not None:
                 horizon_results.append(result)
@@ -392,7 +397,7 @@ def analyze_ensemble_individuals(
         reference_val=reference_val,
         reference_test=reference_test,
         label_mode=label_mode,
-        label_threshold=float(label_threshold),
+        label_threshold=_mfe_threshold_for_mode(label_mode, float(label_threshold)),
         selection="and",
     )
     final_ensemble_or = _build_ensemble_of_ensembles(
@@ -400,7 +405,7 @@ def analyze_ensemble_individuals(
         reference_val=reference_val,
         reference_test=reference_test,
         label_mode=label_mode,
-        label_threshold=float(label_threshold),
+        label_threshold=_mfe_threshold_for_mode(label_mode, float(label_threshold)),
         selection="or",
     )
     path = _plot_ensemble_individuals(
@@ -966,6 +971,32 @@ def _is_exit_after_h2_mode(label_mode: str) -> bool:
     return config.canonical_label_mode(label_mode) == "exit_after_h2"
 
 
+def _mfe_threshold_for_mode(label_mode: str, label_threshold: float) -> float:
+    if config.canonical_label_mode(label_mode) == "safe_path_mfe":
+        return float(config.TP_SAFE_CLOSE)
+    return float(label_threshold)
+
+
+def _label_settings_text(label_mode: str, label_threshold: float) -> str:
+    mode = config.canonical_label_mode(label_mode)
+    if mode == "safe_path_mfe":
+        return (
+            f"mode={mode} | floor={float(label_threshold):.4g} | "
+            f"tp={float(config.TP_SAFE_CLOSE):.4g}"
+        )
+    return f"mode={mode} | thr={float(label_threshold):.4g}"
+
+
+def _label_filename_suffix(label_mode: str, label_threshold: float) -> str:
+    mode_name = _filename_token(config.canonical_label_mode(label_mode))
+    threshold_name = _threshold_filename_token(float(label_threshold))
+    suffix = f"mode_{mode_name}_thr_{threshold_name}"
+    if config.canonical_label_mode(label_mode) == "safe_path_mfe":
+        tp_name = _threshold_filename_token(float(config.TP_SAFE_CLOSE))
+        suffix += f"_tp_{tp_name}"
+    return suffix
+
+
 def _plot_individual(
     entry: dict[str, Any],
     horizons: list[HorizonAnalysis],
@@ -983,17 +1014,16 @@ def _plot_individual(
     section_titles = [
         (
             f"rank {rank:02d} | {_analysis_label(result)} | "
-            f"mode={label_mode} | thr={float(label_threshold):.4g} | "
+            f"{_label_settings_text(label_mode, label_threshold)} | "
             f"score={score:.4f} | features={feature_count}"
         )
         for result in sections
     ]
-    mode_name = _filename_token(label_mode)
-    threshold_name = _threshold_filename_token(float(label_threshold))
+    label_suffix = _label_filename_suffix(label_mode, label_threshold)
     top_fraction_name = _top_fraction_filename_token()
     filename = (
-        f"rank_{rank:02d}_score_{score:.4f}_mode_{mode_name}_"
-        f"thr_{threshold_name}_top_{top_fraction_name}.png"
+        f"rank_{rank:02d}_score_{score:.4f}_{label_suffix}_"
+        f"top_{top_fraction_name}.png"
     )
     path = output_dir / filename
     _plot_sections_vertical(sections=sections, section_titles=section_titles, path=path)
@@ -1017,13 +1047,12 @@ def _plot_ensemble_individuals(
         _final_ensemble_section_title(label_mode, label_threshold, selection)
         for selection in ["AND", "OR"][: len(final_ensembles)]
     ]
-    mode_name = _filename_token(label_mode)
-    threshold_name = _threshold_filename_token(float(label_threshold))
+    label_suffix = _label_filename_suffix(label_mode, label_threshold)
     top_fraction_name = _top_fraction_filename_token()
     member_name = "_".join(_member_filename_token(spec) for spec in specs)
     filename = (
-        f"ensemble_individuals_{member_name}_mode_{mode_name}_"
-        f"thr_{threshold_name}_top_{top_fraction_name}.png"
+        f"ensemble_individuals_{member_name}_{label_suffix}_"
+        f"top_{top_fraction_name}.png"
     )
     path = output_dir / filename
     _plot_sections_vertical(sections=all_sections, section_titles=section_titles, path=path)
@@ -1085,7 +1114,7 @@ def _member_ensemble_label(
 ) -> str:
     return (
         f"{spec.archive_path.stem} | rank {spec.rank:02d} | "
-        f"mode={label_mode} | thr={float(label_threshold):.4g}"
+        f"{_label_settings_text(label_mode, label_threshold)}"
     )
 
 
@@ -1105,7 +1134,7 @@ def _member_section_title(spec: EnsembleIndividualSpec, entry: dict[str, Any]) -
     )
     return (
         f"{spec.archive_path.stem} | rank {spec.rank:02d} | "
-        f"mode={mode_text} | thr={threshold_text:.4g}{score_text}"
+        f"{_label_settings_text(mode_text, threshold_text)}{score_text}"
     )
 
 
@@ -1115,8 +1144,8 @@ def _final_ensemble_section_title(
     selection: str = "AND",
 ) -> str:
     return (
-        f"final ensemble {selection} | mode={label_mode} | "
-        f"thr={float(label_threshold):.4g} | "
+        f"final ensemble {selection} | "
+        f"{_label_settings_text(label_mode, label_threshold)} | "
         f"val-threshold top={config.TRADE_TOP_FRACTION:.0%}"
     )
 
@@ -2065,7 +2094,9 @@ def main() -> None:
         help=(
             "Label mode used when recalculating labels. "
             f"Allowed: {', '.join(sorted(config.LABEL_RETURN_FNS))}. "
-            f"Alias accepted: exit_all -> exit_after_h1. Default: {config.LABEL_MODE}."
+            "Aliases accepted: exit_all -> exit_after_h1, "
+            "first_hit_safe_close/safe_close -> safe_path_mfe. "
+            f"Default: {config.LABEL_MODE}."
         ),
     )
     parser.add_argument(
@@ -2074,7 +2105,9 @@ def main() -> None:
         default=None,
         help=(
             "Label threshold used when recalculating labels. Default is "
-            "LABEL_THRESHOLD for non-payoff modes and TRADE_COST for payoff."
+            "LABEL_THRESHOLD for ordinary modes, TRADE_COST for payoff, and "
+            "SAFE_CLOSE_FLOOR for safe_path_mfe. For safe_path_mfe, TP is "
+            "config.TP_SAFE_CLOSE."
         ),
     )
     args = parser.parse_args()

@@ -1519,6 +1519,18 @@ def _draw_table(
 ) -> None:
     ax.axis("off")
     ax.set_title(title, fontsize=9, loc="left", pad=3)
+    if table_df.empty:
+        ax.text(
+            0.5,
+            0.44,
+            "No samples for this strategy/filter configuration.",
+            ha="center",
+            va="center",
+            fontsize=max(8.0, float(font_size) + 1.0),
+            color="#6b7280",
+            transform=ax.transAxes,
+        )
+        return
     table = ax.table(
         cellText=table_df.values,
         colLabels=table_df.columns,
