@@ -392,6 +392,7 @@ class CryptoFitnessEvaluator:
                 index=test.index,
                 name=f"pred_h{horizon}",
             )
+            booster.free_dataset()
             train_preds.append(train_pred)
             val_preds.append(val_pred)
             test_preds.append(test_pred)
@@ -536,6 +537,7 @@ class CryptoFitnessEvaluator:
             booster = self._train_booster(X_train, y_train, X_val, y_val)
             train_pred = pd.Series(booster.predict(X_train), index=train.index)
             val_pred = pd.Series(booster.predict(X_val), index=val.index)
+            booster.free_dataset()
             train_metrics = _classification_trade_metrics(
                 y_true=y_train,
                 pred=train_pred,
@@ -607,6 +609,7 @@ class CryptoFitnessEvaluator:
                 index=val.index,
                 name=f"pred_h{horizon}",
             )
+            booster.free_dataset()
             train_preds.append(train_pred)
             val_preds.append(val_pred)
             common_train_index = (
@@ -709,6 +712,7 @@ class CryptoFitnessEvaluator:
             train_pred = pd.Series(booster.predict(X_train), index=train.index)
             val_pred = pd.Series(booster.predict(X_val), index=val.index)
             test_pred = pd.Series(booster.predict(X_test), index=test.index)
+            booster.free_dataset()
             train_metrics = _classification_trade_metrics(
                 y_true=y_train,
                 pred=train_pred,
@@ -772,15 +776,15 @@ class CryptoFitnessEvaluator:
         callbacks = [lgb.log_evaluation(period=-1)]
         valid_sets = None
         if split is None or self.early_stopping_rounds <= 0:
-            train_set = lgb.Dataset(X_train, label=y_train, free_raw_data=False)
+            train_set = lgb.Dataset(X_train, label=y_train, free_raw_data=True)
         else:
             X_fit, y_fit, X_stop, y_stop = split
-            train_set = lgb.Dataset(X_fit, label=y_fit, free_raw_data=False)
+            train_set = lgb.Dataset(X_fit, label=y_fit, free_raw_data=True)
             stop_set = lgb.Dataset(
                 X_stop,
                 label=y_stop,
                 reference=train_set,
-                free_raw_data=False,
+                free_raw_data=True,
             )
             valid_sets = [stop_set]
             callbacks.insert(
@@ -804,7 +808,7 @@ class CryptoFitnessEvaluator:
     ) -> lgb.Booster:
         callbacks = [lgb.log_evaluation(period=-1)]
         valid_sets = None
-        train_set = lgb.Dataset(X_train, label=y_train, free_raw_data=False)
+        train_set = lgb.Dataset(X_train, label=y_train, free_raw_data=True)
         if (
             self.early_stopping_rounds > 0
             and len(X_val) > 0
@@ -814,7 +818,7 @@ class CryptoFitnessEvaluator:
                 X_val,
                 label=y_val,
                 reference=train_set,
-                free_raw_data=False,
+                free_raw_data=True,
             )
             valid_sets = [val_set]
             callbacks.insert(

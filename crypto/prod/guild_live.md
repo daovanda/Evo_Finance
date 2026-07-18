@@ -29,6 +29,7 @@ Quan trong nhat:
 HOLDING_HORIZONS = [5]
 LABEL_THRESHOLD = 0.0
 LABEL_MODE = "close_path_mean"
+LABEL_DIRECTION = "Long"
 PAYOFF_TP = 0.004
 TP_SAFE_CLOSE = 0.004
 SAFE_CLOSE_FLOOR = -0.002
@@ -51,6 +52,7 @@ rank_01_h5.txt
 `LABEL_MODE="close_path_mean"` dung mean return cua `close(t+1)..close(t+h)` so voi `open(t+1)`; threshold `0.0` nghia la mean future close nam tren entry.
 `LABEL_MODE="payoff"` dung return mo phong rule TP: neu MFE cham `PAYOFF_TP` thi future return = `PAYOFF_TP`, nguoc lai future return = close return tai `close(t+h)`. Neu bo qua `--label-threshold`, mode `payoff` tu dung `TRADE_COST` lam threshold.
 `LABEL_MODE="safe_path_mfe"` dung first-hit TP: label=1 khi high dau tien cham `TP_SAFE_CLOSE` va moi close truoc first hit van lon hon close floor. Neu bo qua `--label-threshold`, close floor la `SAFE_CLOSE_FLOOR`; TP luon lay tu `TP_SAFE_CLOSE`.
+`LABEL_DIRECTION="Long"` nghia la gia tang la co loi; `"Short"` nghia la gia giam la co loi. Direction nay chi ap dung cho label/model production. Bot Binance Spot hien tai chi thuc thi Long va se chan tin hieu Short voi trang thai `ERROR` de tranh dat nham lenh BUY. Can mot trader Binance Futures rieng truoc khi co the thuc thi Short.
 
 ### Trading config
 

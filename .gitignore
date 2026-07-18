@@ -14,3 +14,4 @@ results/
 crypto/prod/live/*.json
 crypto/prod/live/*.tmp
 data/crypto/BTCUSDT_1m_2024_now.csv
+data/crypto/BTCUSDT_1m.csv

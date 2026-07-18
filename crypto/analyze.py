@@ -86,6 +86,7 @@ class EnsembleIndividualSpec:
     rank: int
     label_mode: str | None = None
     label_threshold: float | None = None
+    label_direction: str | None = None
 
 
 def _resolve_spec_label_threshold(
@@ -109,6 +110,7 @@ def analyze(
     test_start: str = config.TEST_START,
     test_end: str | None = config.TEST_END,
     label_mode: str = config.LABEL_MODE,
+    label_direction: str | None = None,
     label_threshold: float | None = None,
 ) -> list[Path]:
     entries = _filter_entries(_load_archive_entries(Path(archive_path)), top=top, ranks=ranks)
@@ -118,6 +120,10 @@ def analyze(
     logger.info("Loading crypto data from %s", data_path)
     raw_df = load_ohlcv(data_path)
     label_mode = config.canonical_label_mode(label_mode)
+    label_direction = _resolve_archive_label_direction(
+        Path(archive_path),
+        explicit_direction=label_direction,
+    )
     label_threshold = config.default_label_threshold(label_mode, label_threshold)
     labeled_df = add_binary_labels(
         raw_df,
@@ -125,6 +131,7 @@ def analyze(
         threshold=label_threshold,
         return_fn=config.get_label_return_fn(label_mode),
         label_mode=label_mode,
+        label_direction=label_direction,
     )
     purge_bars = config.purge_bars_for_horizons(config.HOLDING_HORIZONS)
     train_df, val_df, test_df = split_labeled_by_dates(
@@ -158,6 +165,7 @@ def analyze(
         raw_df,
         config.HOLDING_HORIZONS,
         label_mode=label_mode,
+        label_direction=label_direction,
     )
     mfe_threshold = _mfe_threshold_for_mode(label_mode, float(label_threshold))
 
@@ -198,6 +206,7 @@ def analyze(
             output_path,
             ensemble_result,
             label_mode=label_mode,
+            label_direction=label_direction,
             label_threshold=float(label_threshold),
         )
         charts.append(chart_path)
@@ -214,6 +223,7 @@ def analyze_ensemble_individuals(
     test_start: str = config.TEST_START,
     test_end: str | None = config.TEST_END,
     label_mode: str = config.LABEL_MODE,
+    label_direction: str | None = None,
     label_threshold: float | None = None,
 ) -> Path:
     if len(specs) < 2:
@@ -221,6 +231,20 @@ def analyze_ensemble_individuals(
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+
+    member_directions = [
+        _resolve_archive_label_direction(
+            spec.archive_path,
+            explicit_direction=spec.label_direction or label_direction,
+        )
+        for spec in specs
+    ]
+    if len(set(member_directions)) != 1:
+        raise ValueError(
+            "Current binary ensemble requires all members to use the same "
+            f"label direction, got: {member_directions}. Analyze Long and Short separately."
+        )
+    label_direction = member_directions[0]
 
     logger.info("Loading crypto data from %s", data_path)
     raw_df = load_ohlcv(data_path)
@@ -232,6 +256,7 @@ def analyze_ensemble_individuals(
         threshold=label_threshold,
         return_fn=config.get_label_return_fn(label_mode),
         label_mode=label_mode,
+        label_direction=label_direction,
     )
     purge_bars = config.purge_bars_for_horizons(config.HOLDING_HORIZONS)
     train_df, val_df, test_df = split_labeled_by_dates(
@@ -263,25 +288,32 @@ def analyze_ensemble_individuals(
     feature_pool = selectable_features(feature_df)
     feature_space = CryptoFeatureSpace(feature_df, feature_pool)
     return_context_cache: dict[
-        str,
+        tuple[str, str],
         tuple[dict[int, pd.Series], dict[int, pd.DataFrame], dict[int, pd.Series]],
     ] = {}
 
     def return_context_for(
         mode: str,
+        direction: str,
     ) -> tuple[dict[int, pd.Series], dict[int, pd.DataFrame], dict[int, pd.Series]]:
         mode = config.canonical_label_mode(mode)
-        cached = return_context_cache.get(mode)
+        direction = config.canonical_label_direction(direction)
+        cache_key = (mode, direction)
+        cached = return_context_cache.get(cache_key)
         if cached is None:
             cached = _return_context_by_horizon(
                 raw_df,
                 config.HOLDING_HORIZONS,
                 label_mode=mode,
+                label_direction=direction,
             )
-            return_context_cache[mode] = cached
+            return_context_cache[cache_key] = cached
         return cached
 
-    mfe_by_horizon, path_by_horizon, close_return_by_horizon = return_context_for(label_mode)
+    mfe_by_horizon, path_by_horizon, close_return_by_horizon = return_context_for(
+        label_mode,
+        label_direction,
+    )
     exit_horizon = int(max(config.HOLDING_HORIZONS))
     reference_val = _reference_split_prediction(
         split="val",
@@ -305,7 +337,11 @@ def analyze_ensemble_individuals(
     individual_ensembles: list[HorizonAnalysis] = []
     active_specs: list[EnsembleIndividualSpec] = []
     active_entries: list[dict[str, Any]] = []
-    for spec, entry in spec_entries:
+    for (spec, entry), member_label_direction in zip(
+        spec_entries,
+        member_directions,
+        strict=True,
+    ):
         individual = _entry_to_individual(entry)
         member_label_mode = config.canonical_label_mode(spec.label_mode or label_mode)
         member_label_threshold = _resolve_spec_label_threshold(spec, float(label_threshold))
@@ -313,7 +349,11 @@ def analyze_ensemble_individuals(
             member_label_mode,
             member_label_threshold,
         )
-        if member_label_mode == label_mode and member_label_threshold == float(label_threshold):
+        if (
+            member_label_mode == label_mode
+            and member_label_direction == label_direction
+            and member_label_threshold == float(label_threshold)
+        ):
             member_train_df, member_val_df, member_test_df = train_df, val_df, test_df
         else:
             member_labeled_df = add_binary_labels(
@@ -322,6 +362,7 @@ def analyze_ensemble_individuals(
                 threshold=member_label_threshold,
                 return_fn=config.get_label_return_fn(member_label_mode),
                 label_mode=member_label_mode,
+                label_direction=member_label_direction,
             )
             member_train_df, member_val_df, member_test_df = split_labeled_by_dates(
                 member_labeled_df,
@@ -331,15 +372,17 @@ def analyze_ensemble_individuals(
                 purge_bars=purge_bars,
             )
         logger.info(
-            "Analyzing ensemble member %s rank %d | label=%s threshold=%.6f | features=%d",
+            "Analyzing ensemble member %s rank %d | label=%s direction=%s "
+            "threshold=%.6f | features=%d",
             spec.archive_path,
             spec.rank,
             member_label_mode,
+            member_label_direction,
             member_label_threshold,
             len(individual.features),
         )
         member_mfe_by_horizon, member_path_by_horizon, member_close_by_horizon = (
-            return_context_for(member_label_mode)
+            return_context_for(member_label_mode, member_label_direction)
         )
         horizon_results: list[HorizonAnalysis] = []
         for horizon in config.HOLDING_HORIZONS:
@@ -384,6 +427,7 @@ def analyze_ensemble_individuals(
                 label=_member_ensemble_label(
                     spec,
                     label_mode=member_label_mode,
+                    label_direction=member_label_direction,
                     label_threshold=member_label_threshold,
                 ),
             )
@@ -397,6 +441,7 @@ def analyze_ensemble_individuals(
         reference_val=reference_val,
         reference_test=reference_test,
         label_mode=label_mode,
+        label_direction=label_direction,
         label_threshold=_mfe_threshold_for_mode(label_mode, float(label_threshold)),
         selection="and",
     )
@@ -405,6 +450,7 @@ def analyze_ensemble_individuals(
         reference_val=reference_val,
         reference_test=reference_test,
         label_mode=label_mode,
+        label_direction=label_direction,
         label_threshold=_mfe_threshold_for_mode(label_mode, float(label_threshold)),
         selection="or",
     )
@@ -415,6 +461,7 @@ def analyze_ensemble_individuals(
         specs=active_specs,
         entries=active_entries,
         label_mode=label_mode,
+        label_direction=label_direction,
         label_threshold=float(label_threshold),
     )
     logger.info("Saved ensemble chart: %s", path)
@@ -428,6 +475,25 @@ def _load_archive_entries(path: Path) -> list[dict[str, Any]]:
         raise ValueError(f"Archive has no entries list: {path}")
     logger.info("Loaded %d archive entries from %s", len(entries), path)
     return [dict(entry) for entry in entries]
+
+
+def _load_archive_metadata(path: Path) -> dict[str, Any]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+    return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def _resolve_archive_label_direction(
+    path: Path,
+    explicit_direction: str | None = None,
+) -> str:
+    if explicit_direction not in (None, ""):
+        return config.canonical_label_direction(explicit_direction)
+    metadata_direction = _load_archive_metadata(path).get("label_direction")
+    # Archives created before direction support were all long-only.
+    return config.canonical_label_direction(
+        metadata_direction if metadata_direction not in (None, "") else "long"
+    )
 
 
 def _load_rank_entry(path: Path, rank: int) -> dict[str, Any]:
@@ -789,6 +855,7 @@ def _build_ensemble_of_ensembles(
     reference_val: SplitPrediction,
     reference_test: SplitPrediction,
     label_mode: str,
+    label_direction: str,
     label_threshold: float,
     selection: str = "and",
 ) -> HorizonAnalysis:
@@ -813,7 +880,7 @@ def _build_ensemble_of_ensembles(
         ),
         label=(
             f"ensemble of individuals {selection_name} ({labels}) | "
-            f"eval={label_mode} thr={float(label_threshold):.4g}"
+            f"eval={label_mode} direction={label_direction} thr={float(label_threshold):.4g}"
         ),
     )
 
@@ -873,18 +940,34 @@ def _return_context_by_horizon(
     raw_df: pd.DataFrame,
     horizons: list[int] | tuple[int, ...],
     label_mode: str,
+    label_direction: str = config.LABEL_DIRECTION,
 ) -> tuple[dict[int, pd.Series], dict[int, pd.DataFrame], dict[int, pd.Series]]:
     return (
         {
-            int(horizon): _max_high_return(raw_df, int(horizon), label_mode=label_mode)
+            int(horizon): _max_high_return(
+                raw_df,
+                int(horizon),
+                label_mode=label_mode,
+                label_direction=label_direction,
+            )
             for horizon in horizons
         },
         {
-            int(horizon): _horizon_path_returns(raw_df, int(horizon), label_mode=label_mode)
+            int(horizon): _horizon_path_returns(
+                raw_df,
+                int(horizon),
+                label_mode=label_mode,
+                label_direction=label_direction,
+            )
             for horizon in horizons
         },
         {
-            int(horizon): _close_exit_return(raw_df, int(horizon), label_mode=label_mode)
+            int(horizon): _close_exit_return(
+                raw_df,
+                int(horizon),
+                label_mode=label_mode,
+                label_direction=label_direction,
+            )
             for horizon in horizons
         },
     )
@@ -894,22 +977,39 @@ def _max_high_return(
     raw_df: pd.DataFrame,
     horizon: int,
     label_mode: str = config.LABEL_MODE,
+    label_direction: str = config.LABEL_DIRECTION,
 ) -> pd.Series:
     data = raw_df.sort_index()
     entry = _entry_open_for_mode(data, label_mode)
     high = pd.to_numeric(data["high"], errors="coerce")
+    low = pd.to_numeric(data["low"], errors="coerce")
     offsets = _future_offsets_for_mode(horizon, label_mode)
+    if config.canonical_label_direction(label_direction) == "short":
+        min_low = pd.concat(
+            [low.shift(-offset) for offset in offsets],
+            axis=1,
+        ).min(axis=1, skipna=False)
+        return config.directional_price_return(
+            min_low,
+            entry,
+            label_direction,
+        ).replace([np.inf, -np.inf], np.nan)
     max_high = pd.concat(
         [high.shift(-offset) for offset in offsets],
         axis=1,
     ).max(axis=1, skipna=False)
-    return (max_high / entry - 1.0).replace([np.inf, -np.inf], np.nan)
+    return config.directional_price_return(
+        max_high,
+        entry,
+        label_direction,
+    ).replace([np.inf, -np.inf], np.nan)
 
 
 def _horizon_path_returns(
     raw_df: pd.DataFrame,
     horizon: int,
     label_mode: str = config.LABEL_MODE,
+    label_direction: str = config.LABEL_DIRECTION,
 ) -> pd.DataFrame:
     data = raw_df.sort_index()
     entry = _entry_open_for_mode(data, label_mode)
@@ -918,9 +1018,21 @@ def _horizon_path_returns(
     close = pd.to_numeric(data["close"], errors="coerce")
     columns: dict[str, pd.Series] = {}
     for step, offset in enumerate(_future_offsets_for_mode(horizon, label_mode), start=1):
-        columns[f"high_h{step}"] = high.shift(-offset) / entry - 1.0
-        columns[f"low_h{step}"] = low.shift(-offset) / entry - 1.0
-        columns[f"close_h{step}"] = close.shift(-offset) / entry - 1.0
+        columns[f"high_h{step}"] = config.directional_price_return(
+            high.shift(-offset),
+            entry,
+            label_direction,
+        )
+        columns[f"low_h{step}"] = config.directional_price_return(
+            low.shift(-offset),
+            entry,
+            label_direction,
+        )
+        columns[f"close_h{step}"] = config.directional_price_return(
+            close.shift(-offset),
+            entry,
+            label_direction,
+        )
     return pd.DataFrame(columns, index=data.index).replace([np.inf, -np.inf], np.nan)
 
 
@@ -928,12 +1040,17 @@ def _close_exit_return(
     raw_df: pd.DataFrame,
     horizon: int,
     label_mode: str = config.LABEL_MODE,
+    label_direction: str = config.LABEL_DIRECTION,
 ) -> pd.Series:
     data = raw_df.sort_index()
     entry = _entry_open_for_mode(data, label_mode)
     close_offset = _close_offset_for_mode(horizon, label_mode)
     close = pd.to_numeric(data["close"], errors="coerce").shift(-close_offset)
-    return (close / entry - 1.0).replace([np.inf, -np.inf], np.nan)
+    return config.directional_price_return(
+        close,
+        entry,
+        label_direction,
+    ).replace([np.inf, -np.inf], np.nan)
 
 
 def _entry_open_for_mode(data: pd.DataFrame, label_mode: str) -> pd.Series:
@@ -977,20 +1094,30 @@ def _mfe_threshold_for_mode(label_mode: str, label_threshold: float) -> float:
     return float(label_threshold)
 
 
-def _label_settings_text(label_mode: str, label_threshold: float) -> str:
+def _label_settings_text(
+    label_mode: str,
+    label_direction: str,
+    label_threshold: float,
+) -> str:
     mode = config.canonical_label_mode(label_mode)
+    direction = config.canonical_label_direction(label_direction)
     if mode == "safe_path_mfe":
         return (
-            f"mode={mode} | floor={float(label_threshold):.4g} | "
+            f"mode={mode} | direction={direction} | floor={float(label_threshold):.4g} | "
             f"tp={float(config.TP_SAFE_CLOSE):.4g}"
         )
-    return f"mode={mode} | thr={float(label_threshold):.4g}"
+    return f"mode={mode} | direction={direction} | thr={float(label_threshold):.4g}"
 
 
-def _label_filename_suffix(label_mode: str, label_threshold: float) -> str:
+def _label_filename_suffix(
+    label_mode: str,
+    label_direction: str,
+    label_threshold: float,
+) -> str:
     mode_name = _filename_token(config.canonical_label_mode(label_mode))
+    direction_name = _filename_token(config.canonical_label_direction(label_direction))
     threshold_name = _threshold_filename_token(float(label_threshold))
-    suffix = f"mode_{mode_name}_thr_{threshold_name}"
+    suffix = f"mode_{mode_name}_{direction_name}_thr_{threshold_name}"
     if config.canonical_label_mode(label_mode) == "safe_path_mfe":
         tp_name = _threshold_filename_token(float(config.TP_SAFE_CLOSE))
         suffix += f"_tp_{tp_name}"
@@ -1003,6 +1130,7 @@ def _plot_individual(
     output_dir: Path,
     ensemble: HorizonAnalysis | None = None,
     label_mode: str = config.LABEL_MODE,
+    label_direction: str = config.LABEL_DIRECTION,
     label_threshold: float = config.LABEL_THRESHOLD,
 ) -> Path:
     rank = int(entry.get("rank", 0) or 0)
@@ -1014,12 +1142,12 @@ def _plot_individual(
     section_titles = [
         (
             f"rank {rank:02d} | {_analysis_label(result)} | "
-            f"{_label_settings_text(label_mode, label_threshold)} | "
+            f"{_label_settings_text(label_mode, label_direction, label_threshold)} | "
             f"score={score:.4f} | features={feature_count}"
         )
         for result in sections
     ]
-    label_suffix = _label_filename_suffix(label_mode, label_threshold)
+    label_suffix = _label_filename_suffix(label_mode, label_direction, label_threshold)
     top_fraction_name = _top_fraction_filename_token()
     filename = (
         f"rank_{rank:02d}_score_{score:.4f}_{label_suffix}_"
@@ -1037,17 +1165,18 @@ def _plot_ensemble_individuals(
     specs: list[EnsembleIndividualSpec],
     entries: list[dict[str, Any]],
     label_mode: str = config.LABEL_MODE,
+    label_direction: str = config.LABEL_DIRECTION,
     label_threshold: float = config.LABEL_THRESHOLD,
 ) -> Path:
     all_sections = list(sections) + list(final_ensembles)
     section_titles = [
-        _member_section_title(spec, entry)
+        _member_section_title(spec, entry, label_direction=label_direction)
         for spec, entry in zip(specs, entries)
     ] + [
-        _final_ensemble_section_title(label_mode, label_threshold, selection)
+        _final_ensemble_section_title(label_mode, label_direction, label_threshold, selection)
         for selection in ["AND", "OR"][: len(final_ensembles)]
     ]
-    label_suffix = _label_filename_suffix(label_mode, label_threshold)
+    label_suffix = _label_filename_suffix(label_mode, label_direction, label_threshold)
     top_fraction_name = _top_fraction_filename_token()
     member_name = "_".join(_member_filename_token(spec) for spec in specs)
     filename = (
@@ -1110,15 +1239,20 @@ def _plot_section_title(ax: plt.Axes, title: str) -> None:
 def _member_ensemble_label(
     spec: EnsembleIndividualSpec,
     label_mode: str,
+    label_direction: str,
     label_threshold: float,
 ) -> str:
     return (
         f"{spec.archive_path.stem} | rank {spec.rank:02d} | "
-        f"{_label_settings_text(label_mode, label_threshold)}"
+        f"{_label_settings_text(label_mode, label_direction, label_threshold)}"
     )
 
 
-def _member_section_title(spec: EnsembleIndividualSpec, entry: dict[str, Any]) -> str:
+def _member_section_title(
+    spec: EnsembleIndividualSpec,
+    entry: dict[str, Any],
+    label_direction: str = config.LABEL_DIRECTION,
+) -> str:
     score = entry.get("score")
     score_text = ""
     if score is not None:
@@ -1127,6 +1261,9 @@ def _member_section_title(spec: EnsembleIndividualSpec, entry: dict[str, Any]) -
         except (TypeError, ValueError):
             score_text = f" | score={score}"
     mode_text = config.canonical_label_mode(spec.label_mode or config.LABEL_MODE)
+    direction_text = config.canonical_label_direction(
+        spec.label_direction or label_direction
+    )
     threshold_text = (
         float(spec.label_threshold)
         if spec.label_threshold is not None
@@ -1134,18 +1271,19 @@ def _member_section_title(spec: EnsembleIndividualSpec, entry: dict[str, Any]) -
     )
     return (
         f"{spec.archive_path.stem} | rank {spec.rank:02d} | "
-        f"{_label_settings_text(mode_text, threshold_text)}{score_text}"
+        f"{_label_settings_text(mode_text, direction_text, threshold_text)}{score_text}"
     )
 
 
 def _final_ensemble_section_title(
     label_mode: str,
+    label_direction: str,
     label_threshold: float,
     selection: str = "AND",
 ) -> str:
     return (
         f"final ensemble {selection} | "
-        f"{_label_settings_text(label_mode, label_threshold)} | "
+        f"{_label_settings_text(label_mode, label_direction, label_threshold)} | "
         f"val-threshold top={config.TRADE_TOP_FRACTION:.0%}"
     )
 
@@ -2020,12 +2158,13 @@ def _parse_ensemble_specs(values: list[str] | None) -> list[EnsembleIndividualSp
             continue
         mode_text: str | None = None
         threshold_text: str | None = None
+        direction_text: str | None = None
         if "#" in value:
             parts = [part.strip() for part in value.split("#")]
-            if len(parts) not in {2, 3, 4}:
+            if len(parts) not in {2, 3, 4, 5}:
                 raise ValueError(
                     "Invalid --ensemble-individual spec. Use "
-                    "ARCHIVE#RANK[#MODE[#THRESHOLD]], got: "
+                    "ARCHIVE#RANK[#MODE[#THRESHOLD[#DIRECTION]]], got: "
                     f"{raw_value!r}"
                 )
             path_text, rank_text = parts[0], parts[1]
@@ -2033,6 +2172,8 @@ def _parse_ensemble_specs(values: list[str] | None) -> list[EnsembleIndividualSp
                 mode_text = parts[2]
             if len(parts) >= 4 and parts[3]:
                 threshold_text = parts[3]
+            if len(parts) >= 5 and parts[4]:
+                direction_text = parts[4]
         elif ":" in value:
             path_text, rank_text = value.rsplit(":", 1)
         else:
@@ -2046,6 +2187,8 @@ def _parse_ensemble_specs(values: list[str] | None) -> list[EnsembleIndividualSp
             raise ValueError(f"Invalid --ensemble-individual spec: {raw_value!r}")
         if mode_text is not None:
             mode_text = config.canonical_label_mode(mode_text)
+        if direction_text is not None:
+            direction_text = config.canonical_label_direction(direction_text)
         specs.append(
             EnsembleIndividualSpec(
                 archive_path=Path(path_text),
@@ -2054,6 +2197,7 @@ def _parse_ensemble_specs(values: list[str] | None) -> list[EnsembleIndividualSp
                 label_threshold=(
                     float(threshold_text) if threshold_text is not None else None
                 ),
+                label_direction=direction_text,
             )
         )
     return specs
@@ -2081,8 +2225,8 @@ def main() -> None:
         default=None,
         help=(
             "Build one chart that ensembles across individuals from one or more archives. "
-            "Each spec is ARCHIVE#RANK[#MODE[#THRESHOLD]], for example "
-            "crypto/results/a.json#1#mfe#0.0035 crypto/results/b.json#3#close_exit#0.001."
+            "Each spec is ARCHIVE#RANK[#MODE[#THRESHOLD[#DIRECTION]]], for example "
+            "crypto/results/a.json#1#mfe#0.0035#long."
         ),
     )
     parser.add_argument("--val-start", default=config.VAL_START)
@@ -2097,6 +2241,14 @@ def main() -> None:
             "Aliases accepted: exit_all -> exit_after_h1, "
             "first_hit_safe_close/safe_close -> safe_path_mfe. "
             f"Default: {config.LABEL_MODE}."
+        ),
+    )
+    parser.add_argument(
+        "--label-direction",
+        default=None,
+        help=(
+            "Long or Short. An explicit value overrides archive metadata. "
+            "Archives created before direction metadata are treated as Long."
         ),
     )
     parser.add_argument(
@@ -2122,6 +2274,7 @@ def main() -> None:
             test_start=args.test_start,
             test_end=args.test_end,
             label_mode=args.label_mode,
+            label_direction=args.label_direction,
             label_threshold=args.label_threshold,
         )
         logger.info("Done. Saved ensemble chart: %s", chart)
@@ -2140,6 +2293,7 @@ def main() -> None:
         test_start=args.test_start,
         test_end=args.test_end,
         label_mode=args.label_mode,
+        label_direction=args.label_direction,
         label_threshold=args.label_threshold,
     )
     logger.info("Done. Saved %d chart(s).", len(charts))

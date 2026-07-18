@@ -135,6 +135,7 @@ class CryptoPipelineTests(unittest.TestCase):
             raw_index=pd.DatetimeIndex(idx),
             tp_threshold=0.004,
             tp_sweep_thresholds=[0.004],
+            label_direction="long",
         )
 
         self.assertEqual(summary["base_low_h1_le_neg01"], 2)
@@ -155,6 +156,47 @@ class CryptoPipelineTests(unittest.TestCase):
             include_close_h2=True,
         )
         self.assertIn("val mean close H2", rendered["split"].tolist())
+
+    def test_backtest_short_uses_low_for_tp_and_high_for_adverse_h1(self):
+        idx = pd.date_range("2024-01-01", periods=8, freq="15min")
+        selected = pd.Index(idx[:3])
+        base_split = SplitSignals(
+            split="val",
+            data=pd.DataFrame(index=idx),
+            selected_index=selected,
+            pred_threshold=0.5,
+            top_fraction=0.25,
+        )
+        empty_exit = SplitSignals(
+            split="val",
+            data=pd.DataFrame(index=idx),
+            selected_index=pd.Index([]),
+            pred_threshold=0.5,
+            top_fraction=0.20,
+        )
+        path_returns = pd.DataFrame(index=idx)
+        for horizon in range(1, 6):
+            path_returns[f"low_h{horizon}"] = 0.0
+            path_returns[f"high_h{horizon}"] = 0.0
+            path_returns[f"close_h{horizon}"] = 0.0
+        path_returns["low_h1"] = [0.005, 0.001, 0.0] + [0.0] * 5
+        path_returns["high_h1"] = [-0.001, -0.0005, 0.0] + [0.0] * 5
+
+        summary, _ = _summarize_split(
+            split="val",
+            base_split=base_split,
+            exit1_split=empty_exit,
+            exit2_split=empty_exit,
+            path_returns=path_returns,
+            raw_index=pd.DatetimeIndex(idx),
+            tp_threshold=0.004,
+            tp_sweep_thresholds=[0.004],
+            label_direction="short",
+        )
+
+        self.assertEqual(summary["base_no_h1"], 2)
+        self.assertEqual(summary["base_low_h1_le_neg01"], 1)
+        self.assertEqual(summary["base_low_h1_le_neg005"], 2)
 
     def test_backtest_base_specs_accept_independent_top_fractions(self):
         mfe_spec = _parse_spec(
@@ -239,6 +281,44 @@ class CryptoPipelineTests(unittest.TestCase):
         pd.testing.assert_series_equal(labeled["future_return_h3"], expected)
         self.assertEqual(labeled["label_h3"].iloc[0], 1.0)
         self.assertTrue(pd.isna(labeled["label_h3"].iloc[-1]))
+
+    def test_short_direction_uses_price_down_as_positive_return(self):
+        idx = pd.date_range("2024-01-01", periods=5, freq="15min")
+        df = pd.DataFrame(
+            {
+                "open": [100.0] * 5,
+                "high": [100.0, 120.0, 130.0, 101.0, 100.0],
+                "low": [100.0, 99.5, 98.0, 99.0, 100.0],
+                "close": [100.0, 100.0, 99.0, 101.0, 100.0],
+                "volume": [10.0] * 5,
+                "trade_count": [10] * 5,
+                "taker_buy_base_volume": [5.0] * 5,
+                "taker_buy_quote_volume": [500.0] * 5,
+            },
+            index=idx,
+        )
+
+        close_labeled = add_binary_labels(
+            df,
+            horizons=[2],
+            label_mode="close_exit",
+            label_direction="Short",
+            threshold=0.005,
+        )
+        self.assertAlmostEqual(close_labeled["future_return_h2"].iloc[0], 0.01)
+        self.assertEqual(close_labeled["label_h2"].iloc[0], 1.0)
+        self.assertAlmostEqual(close_labeled["future_return_h2"].iloc[1], -0.01)
+        self.assertEqual(close_labeled["label_h2"].iloc[1], 0.0)
+
+        mfe_labeled = add_binary_labels(
+            df,
+            horizons=[3],
+            label_mode="mfe",
+            label_direction="Short",
+            threshold=0.015,
+        )
+        self.assertAlmostEqual(mfe_labeled["future_return_h3"].iloc[0], 0.02)
+        self.assertEqual(mfe_labeled["label_h3"].iloc[0], 1.0)
 
     def test_safe_path_mfe_uses_first_hit_and_all_prior_safe_closes(self):
         idx = pd.date_range("2024-01-01", periods=6, freq="15min")
@@ -339,6 +419,60 @@ class CryptoPipelineTests(unittest.TestCase):
             config.get_label_return_fn("safe_path_mfe"),
             config.safe_path_mfe_future_return,
         )
+
+    def test_short_safe_path_mfe_uses_low_hit_and_prior_close_floor(self):
+        idx = pd.date_range("2024-01-01", periods=6, freq="15min")
+
+        def labeled_for(lows, closes):
+            frame = pd.DataFrame(
+                {
+                    "open": [100.0] * 6,
+                    "high": [101.0] * 6,
+                    "low": [100.0, *lows],
+                    "close": [100.0, *closes],
+                    "volume": [10.0] * 6,
+                    "trade_count": [10] * 6,
+                    "taker_buy_base_volume": [5.0] * 6,
+                    "taker_buy_quote_volume": [500.0] * 6,
+                },
+                index=idx,
+            )
+            return add_binary_labels(
+                frame,
+                horizons=[5],
+                label_mode="safe_path_mfe",
+                label_direction="Short",
+            )
+
+        old_tp = config.TP_SAFE_CLOSE
+        try:
+            config.TP_SAFE_CLOSE = 0.004
+
+            hit_h1 = labeled_for(
+                lows=[99.6, 100.0, 100.0, 100.0, 100.0],
+                closes=[101.0, 100.0, 100.0, 100.0, 100.0],
+            )
+            self.assertEqual(hit_h1["label_h5"].iloc[0], 1.0)
+            self.assertAlmostEqual(hit_h1["future_return_h5"].iloc[0], 0.004)
+
+            clean_h3 = labeled_for(
+                lows=[99.9, 99.8, 99.6, 100.0, 100.0],
+                closes=[100.1, 100.15, 100.0, 100.0, 100.0],
+            )
+            self.assertEqual(clean_h3["label_h5"].iloc[0], 1.0)
+            self.assertAlmostEqual(clean_h3["future_return_h5"].iloc[0], 0.004)
+
+            unsafe_before_h3 = labeled_for(
+                lows=[99.9, 99.8, 99.6, 100.0, 100.0],
+                closes=[100.1, 100.3, 100.0, 100.0, 100.0],
+            )
+            self.assertEqual(unsafe_before_h3["label_h5"].iloc[0], 0.0)
+            self.assertAlmostEqual(
+                unsafe_before_h3["future_return_h5"].iloc[0],
+                -0.003,
+            )
+        finally:
+            config.TP_SAFE_CLOSE = old_tp
 
     def test_close_path_mean_label_uses_mean_future_closes_from_next_open(self):
         idx = pd.date_range("2024-01-01", periods=6, freq="15min")
@@ -444,6 +578,7 @@ class CryptoPipelineTests(unittest.TestCase):
             metadata={
                 "horizons": [3, 5],
                 "label_mode": "mfe",
+                "label_direction": "long",
                 "label_threshold": 0.003,
                 "trade_top_fraction": config.TRADE_TOP_FRACTION,
                 "trade_cost": config.TRADE_COST,
@@ -456,7 +591,31 @@ class CryptoPipelineTests(unittest.TestCase):
                 resume_path=Path("archive.json"),
                 horizons=[3, 5],
                 label_mode="payoff",
+                label_direction="long",
                 label_threshold=config.TRADE_COST,
+            )
+
+    def test_resume_metadata_mismatch_checks_label_direction(self):
+        archive = CryptoArchive(
+            metadata={
+                "horizons": [5],
+                "label_mode": "mfe",
+                "label_direction": "short",
+                "label_threshold": 0.003,
+                "fitness_horizon_mode": config.FITNESS_HORIZON_MODE,
+                "trade_top_fraction": config.TRADE_TOP_FRACTION,
+                "trade_cost": config.TRADE_COST,
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "label_direction"):
+            _validate_resume_metadata(
+                archive=archive,
+                resume_path=Path("archive.json"),
+                horizons=[5],
+                label_mode="mfe",
+                label_direction="long",
+                label_threshold=0.003,
             )
 
     def test_resume_metadata_mismatch_checks_safe_path_tp(self):
@@ -467,6 +626,7 @@ class CryptoPipelineTests(unittest.TestCase):
                 metadata={
                     "horizons": [5],
                     "label_mode": "safe_path_mfe",
+                    "label_direction": "long",
                     "label_threshold": -0.002,
                     "tp_safe_close": 0.003,
                     "fitness_horizon_mode": config.FITNESS_HORIZON_MODE,
@@ -481,6 +641,7 @@ class CryptoPipelineTests(unittest.TestCase):
                     resume_path=Path("archive.json"),
                     horizons=[5],
                     label_mode="safe_path_mfe",
+                    label_direction="long",
                     label_threshold=-0.002,
                 )
         finally:
@@ -820,6 +981,18 @@ class CryptoPipelineTests(unittest.TestCase):
         matrix = feature_space.matrix([generated], train_index)
         self.assertEqual(len(matrix), len(train_index))
         self.assertFalse(set(child.features) & RAW_SCALE_COLUMNS)
+
+    def test_expression_cache_is_bounded(self):
+        index = pd.date_range("2024-01-01", periods=20, freq="15min")
+        base = pd.DataFrame({"feature": np.arange(20, dtype=float)}, index=index)
+        space = CryptoFeatureSpace(base, ["feature"])
+
+        for value in range(config.EXPR_CACHE_MAX_ITEMS + 25):
+            space.evaluate(f"const({value})")
+
+        self.assertEqual(space.cache_size, config.EXPR_CACHE_MAX_ITEMS)
+        space.clear_expression_cache()
+        self.assertEqual(space.cache_size, 0)
 
 
 def _synthetic_crypto_frame(n: int) -> pd.DataFrame:

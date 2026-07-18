@@ -29,6 +29,7 @@ from typing import Any
 import pandas as pd
 
 from craw_btc import INTERVAL_TO_MS, OUTPUT_TIMEZONE
+from crypto import config
 from crypto.prod import trade_config
 from crypto.prod.binance_client import BinanceClient
 from crypto.prod.telegram_notify import send_telegram_message, telegram_configured
@@ -85,6 +86,30 @@ def run_once(runtime: TradeRuntime) -> dict[str, Any]:
         return _save_state(
             runtime.state_path,
             _base_state(runtime, prediction, status="NO_SIGNAL", position_open=False),
+        )
+
+    label_direction = config.canonical_label_direction(
+        selected.get("label_direction") or "long"
+    )
+    if label_direction != "long":
+        message = (
+            "The current trader implements Binance Spot long orders only. "
+            f"Refusing {label_direction.upper()} signal to prevent an incorrect BUY order."
+        )
+        return _save_state(
+            runtime.state_path,
+            _base_state(
+                runtime,
+                prediction,
+                selected,
+                status="ERROR",
+                position_open=False,
+                extra={
+                    "block_new_trades": True,
+                    "requires_manual_check": True,
+                    "error": message,
+                },
+            ),
         )
 
     entry_time = _parse_local_ts(prediction.get("entry_candle_time"))
@@ -724,6 +749,11 @@ def _base_state(
         "rank": selected_entry.get("rank") if selected_entry else None,
         "entry_id": selected_entry.get("entry_id") if selected_entry else None,
         "member_count": selected_entry.get("member_count") if selected_entry else None,
+        "label_direction": (
+            config.canonical_label_direction(selected_entry.get("label_direction") or "long")
+            if selected_entry
+            else None
+        ),
         "horizon": _max_horizon(selected_entry) if selected_entry else None,
     }
     if extra:
@@ -942,6 +972,8 @@ def _telegram_message(state: dict[str, Any]) -> str:
         f"Signal: {state.get('signal_time')}",
         f"Entry candle: {state.get('entry_candle_time')}",
     ]
+    if state.get("label_direction"):
+        lines.append(f"Direction: {str(state.get('label_direction')).upper()}")
     if state.get("entry_id") == "final_ensemble":
         lines.append(
             f"Rank/Horizon: final ensemble ({state.get('member_count')} members) / "

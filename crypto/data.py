@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -74,11 +75,13 @@ def add_binary_labels(
     threshold: float | None = None,
     return_fn: Callable[[pd.DataFrame, int], pd.Series] | None = None,
     label_mode: str | None = None,
+    label_direction: str | None = None,
 ) -> pd.DataFrame:
     """
     Add future_return_h{h} and label_h{h}.
 
-    The future_return formula is controlled by label_mode/config.LABEL_MODE.
+    The future_return formula is controlled by label_mode/config.LABEL_MODE and
+    label_direction/config.LABEL_DIRECTION.
     label = 1 if future_return > threshold, else 0. The safe_path_mfe mode
     uses its explicit first-hit/path-safety label instead: first TP hit at
     config.TP_SAFE_CLOSE exists, and all earlier close returns stay above
@@ -86,6 +89,7 @@ def add_binary_labels(
     """
     labeled = df.sort_index().copy()
     selected_mode = config.canonical_label_mode(label_mode)
+    selected_direction = config.canonical_label_direction(label_direction)
     label_return_fn = return_fn or config.get_label_return_fn(selected_mode)
     label_threshold = config.default_label_threshold(selected_mode, threshold)
     for h in horizons:
@@ -95,27 +99,54 @@ def add_binary_labels(
                 labeled,
                 h,
                 close_floor=float(label_threshold),
+                direction=selected_direction,
             )
             labeled[f"future_return_h{h}"] = future_return
             labeled[f"label_h{h}"] = explicit_label
             continue
 
-        future_return = label_return_fn(labeled, h)
+        future_return = _call_label_return_fn(label_return_fn, labeled, h, selected_direction)
         if selected_mode == "exit_after_h1":
-            h1_return = (labeled["high"] - labeled["open"]) / labeled["open"]
-            future_return = future_return.mask(h1_return > float(label_threshold))
+            h1_price = labeled["low"] if selected_direction == "short" else labeled["high"]
+            h1_return = config.directional_price_return(
+                h1_price,
+                labeled["open"],
+                selected_direction,
+            )
+            future_return = future_return.mask(h1_return >= float(label_threshold))
         elif selected_mode == "exit_after_h2":
             entry_open = labeled["open"].shift(1)
-            h1_return = (labeled["high"].shift(1) - entry_open) / entry_open
-            h2_return = (labeled["high"] - entry_open) / entry_open
-            hit_h1_or_h2 = (h1_return > float(label_threshold)) | (
-                h2_return > float(label_threshold)
+            hit_price = labeled["low"] if selected_direction == "short" else labeled["high"]
+            h1_return = config.directional_price_return(
+                hit_price.shift(1),
+                entry_open,
+                selected_direction,
+            )
+            h2_return = config.directional_price_return(
+                hit_price,
+                entry_open,
+                selected_direction,
+            )
+            hit_h1_or_h2 = (h1_return >= float(label_threshold)) | (
+                h2_return >= float(label_threshold)
             )
             future_return = future_return.mask(hit_h1_or_h2)
         labeled[f"future_return_h{h}"] = future_return
         labeled[f"label_h{h}"] = (future_return > float(label_threshold)).astype("float")
         labeled.loc[future_return.isna(), f"label_h{h}"] = np.nan
     return labeled
+
+
+def _call_label_return_fn(
+    return_fn: Callable[[pd.DataFrame, int], pd.Series],
+    df: pd.DataFrame,
+    horizon: int,
+    label_direction: str,
+) -> pd.Series:
+    signature = inspect.signature(return_fn)
+    if "direction" in signature.parameters:
+        return return_fn(df, horizon, direction=label_direction)
+    return return_fn(df, horizon)
 
 
 def split_labeled_by_dates(

@@ -55,6 +55,7 @@ Sua trong `crypto/config.py`.
 HOLDING_HORIZONS = [5]
 LABEL_THRESHOLD = 0.0
 LABEL_MODE = "close_path_mean"
+LABEL_DIRECTION = "Long"
 PAYOFF_TP = 0.004
 TP_SAFE_CLOSE = 0.004
 SAFE_CLOSE_FLOOR = -0.002
@@ -62,6 +63,13 @@ TRADE_COST = 0.002
 ```
 
 Nghia la tao label cho `h3` va `h5`; label = 1 khi `future_return` vuot threshold cua mode dang chay.
+
+`LABEL_DIRECTION` quy dinh chieu tinh return cua label:
+
+- `"Long"`: gia tang la co loi, vi du `close / entry - 1`.
+- `"Short"`: gia giam la co loi, vi du `1 - close / entry`.
+
+Tat ca mode label ben duoi dung chung quy uoc nay. Voi Short, `mfe` dung low thap nhat thay vi high cao nhat; `safe_path_mfe` dung first hit khi low cham TP theo chieu giam. Luu y day chi la huong label/model, khong tu bien bot Spot thanh ban khong.
 
 `LABEL_MODE="close_exit"`:
 
@@ -120,6 +128,12 @@ Co the override threshold bang CLI:
 python -m crypto.main --label-mode mfe --label-threshold 0.003 --help
 ```
 
+Co the override direction bang CLI:
+
+```powershell
+python -m crypto.main --label-mode mfe --label-direction Short --label-threshold 0.003 --help
+```
+
 Chay tien hoa voi payoff label, dung threshold mac dinh la `TRADE_COST`:
 
 ```powershell
@@ -130,6 +144,7 @@ Luu y:
 
 - `--label-mode` va `--label-threshold` trong `crypto.main` anh huong truc tiep den label khi tien hoa.
 - `--label-mode` va `--label-threshold` trong `crypto.analyze` la label/threshold dung de train lai va ve chart.
+- `--label-direction Long/Short` phai khop giua tien hoa, analyze, va train model production neu muon so sanh dung cung mot bai toan.
 - Neu `--label-mode payoff` va bo qua `--label-threshold`, threshold se la `TRADE_COST`; `PAYOFF_TP` chi quy dinh muc TP gross trong cong thuc payoff.
 - Neu `--label-mode safe_path_mfe`, `--label-threshold` la close floor, con TP lay tu `TP_SAFE_CLOSE`.
 - Neu archive duoc tien hoa bang mode/threshold A nhung analyze bang mode/threshold B thi chart la ket qua tai danh gia theo B, khong phai score goc trong archive.

@@ -122,6 +122,7 @@ def train_meta_learner(
     horizons: list[int] | tuple[int, ...] = tuple(config.HOLDING_HORIZONS),
     base_label_mode: str = config.LABEL_MODE,
     base_label_threshold: float | None = None,
+    label_direction: str | None = None,
     meta_label_mode: str = "payoff",
     meta_label_threshold: float | None = None,
     meta_exit_horizon: int | None = None,
@@ -142,6 +143,8 @@ def train_meta_learner(
     if not horizons:
         raise ValueError("At least one horizon is required.")
     meta_exit_horizon = int(meta_exit_horizon or max(horizons))
+
+    label_direction = _resolve_archive_label_direction(archive_path, label_direction)
 
     base_label_mode = config.canonical_label_mode(base_label_mode)
     meta_label_mode = config.canonical_label_mode(meta_label_mode)
@@ -169,8 +172,14 @@ def train_meta_learner(
         horizons=horizons,
         threshold=base_label_threshold,
         label_mode=base_label_mode,
+        label_direction=label_direction,
     )
-    meta_return = config.get_label_return_fn(meta_label_mode)(raw_df, meta_exit_horizon)
+    meta_return_fn = config.get_label_return_fn(meta_label_mode)
+    meta_return = meta_return_fn(
+        raw_df,
+        meta_exit_horizon,
+        direction=label_direction,
+    )
     labeled_df[f"meta_future_return_h{meta_exit_horizon}"] = meta_return
     labeled_df[f"meta_label_h{meta_exit_horizon}"] = (
         meta_return > float(meta_label_threshold)
@@ -299,6 +308,7 @@ def train_meta_learner(
         "chart_path": str(chart_path),
         "base": {
             "label_mode": base_label_mode,
+            "label_direction": label_direction,
             "label_threshold": float(base_label_threshold),
             "horizons": horizons,
             "trade_top_fraction": float(config.TRADE_TOP_FRACTION),
@@ -306,6 +316,7 @@ def train_meta_learner(
         },
         "meta": {
             "label_mode": meta_label_mode,
+            "label_direction": label_direction,
             "label_threshold": float(meta_label_threshold),
             "exit_horizon": int(meta_exit_horizon),
             "signals_only": bool(signals_only),
@@ -1169,6 +1180,18 @@ def _safe_name(text: str) -> str:
     return safe.strip("._") or "meta_learner"
 
 
+def _resolve_archive_label_direction(
+    archive_path: str | Path,
+    explicit_direction: str | None,
+) -> str:
+    if explicit_direction not in (None, ""):
+        return config.canonical_label_direction(explicit_direction)
+    payload = json.loads(Path(archive_path).read_text(encoding="utf-8"))
+    metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+    # Archives created before direction support were long-only.
+    return config.canonical_label_direction(metadata.get("label_direction") or "long")
+
+
 def _ts_str(value: Any) -> str:
     if value is None:
         return ""
@@ -1221,6 +1244,14 @@ def main() -> None:
         type=float,
         default=None,
         help="Base label threshold. Default follows config.default_label_threshold.",
+    )
+    parser.add_argument(
+        "--label-direction",
+        default=None,
+        help=(
+            "Direction shared by base and meta labels. Default: archive metadata; "
+            "old archives without label_direction are treated as Long."
+        ),
     )
     parser.add_argument(
         "--meta-label-mode",
@@ -1279,6 +1310,7 @@ def main() -> None:
         horizons=args.horizons,
         base_label_mode=args.base_label_mode,
         base_label_threshold=args.base_label_threshold,
+        label_direction=args.label_direction,
         meta_label_mode=args.meta_label_mode,
         meta_label_threshold=args.meta_label_threshold,
         meta_exit_horizon=args.meta_exit_horizon,

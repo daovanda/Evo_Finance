@@ -7,6 +7,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import time
 from pathlib import Path
@@ -44,6 +45,7 @@ def run(
     horizons: list[int] | tuple[int, ...] = tuple(config.HOLDING_HORIZONS),
     label_threshold: float | None = None,
     label_mode: str = config.LABEL_MODE,
+    label_direction: str = config.LABEL_DIRECTION,
     trade_top_fraction: float | None = None,
     val_start: str = config.VAL_START,
     test_start: str = config.TEST_START,
@@ -57,6 +59,7 @@ def run(
     config.validate_config()
     horizons = [int(h) for h in horizons]
     label_mode = config.canonical_label_mode(label_mode)
+    label_direction = config.canonical_label_direction(label_direction)
     label_threshold = config.default_label_threshold(label_mode, label_threshold)
     if not np.isfinite(float(label_threshold)):
         raise ValueError("label_threshold must be finite.")
@@ -71,8 +74,9 @@ def run(
     rng = np.random.default_rng(seed)
 
     logger.info(
-        "Run labels: mode=%s | threshold=%g | trade_top_fraction=%.2f%%",
+        "Run labels: mode=%s | direction=%s | threshold=%g | trade_top_fraction=%.2f%%",
         label_mode,
+        label_direction,
         label_threshold,
         100.0 * float(config.TRADE_TOP_FRACTION),
     )
@@ -84,6 +88,7 @@ def run(
         threshold=label_threshold,
         return_fn=label_return_fn,
         label_mode=label_mode,
+        label_direction=label_direction,
     )
     train_df, val_df, test_df = split_labeled_by_dates(
         labeled_df,
@@ -151,6 +156,7 @@ def run(
             resume_path=Path(resume_archive),
             horizons=horizons,
             label_mode=label_mode,
+            label_direction=label_direction,
             label_threshold=label_threshold,
         )
 
@@ -199,10 +205,26 @@ def run(
             best,
         )
 
+        if config.EVOLUTION_GC_EVERY > 0 and iteration % config.EVOLUTION_GC_EVERY == 0:
+            collected = gc.collect()
+            logger.info(
+                "Memory cleanup: expression_cache=%d/%d | collected=%d",
+                feature_space.cache_size,
+                config.EXPR_CACHE_MAX_ITEMS,
+                collected,
+            )
+
         if checkpoint_path is not None and checkpoint_every > 0:
             now = time.time()
             if now - last_checkpoint >= float(checkpoint_every):
-                _save_archive(archive, checkpoint_path, horizons, label_threshold, label_mode)
+                _save_archive(
+                    archive,
+                    checkpoint_path,
+                    horizons,
+                    label_threshold,
+                    label_mode,
+                    label_direction,
+                )
                 last_checkpoint = now
 
     if not archive.is_empty():
@@ -216,10 +238,17 @@ def run(
         )
 
     if save_path is not None:
-        _save_archive(archive, save_path, horizons, label_threshold, label_mode)
+        _save_archive(archive, save_path, horizons, label_threshold, label_mode, label_direction)
         logger.info("Saved crypto archive to %s", save_path)
     if checkpoint_path is not None:
-        _save_archive(archive, checkpoint_path, horizons, label_threshold, label_mode)
+        _save_archive(
+            archive,
+            checkpoint_path,
+            horizons,
+            label_threshold,
+            label_mode,
+            label_direction,
+        )
     return archive
 
 
@@ -259,6 +288,7 @@ def _save_archive(
     horizons: list[int],
     label_threshold: float,
     label_mode: str,
+    label_direction: str,
 ) -> None:
     archive.save(
         path,
@@ -266,6 +296,7 @@ def _save_archive(
             "pipeline": "crypto",
             "horizons": horizons,
             "label_mode": label_mode,
+            "label_direction": label_direction,
             "label_threshold": label_threshold,
             "payoff_tp": config.PAYOFF_TP,
             "tp_safe_close": config.TP_SAFE_CLOSE,
@@ -288,6 +319,7 @@ def _validate_resume_metadata(
     resume_path: Path,
     horizons: list[int],
     label_mode: str,
+    label_direction: str,
     label_threshold: float,
 ) -> None:
     metadata = getattr(archive, "metadata", {}) or {}
@@ -304,9 +336,15 @@ def _validate_resume_metadata(
         if metadata_label_mode not in (None, "")
         else ""
     )
+    metadata_label_direction = metadata.get("label_direction")
+    # Archives created before direction support were all long-only.
+    archive_label_direction = config.canonical_label_direction(
+        metadata_label_direction if metadata_label_direction not in (None, "") else "long"
+    )
     checks: list[tuple[str, object, object]] = [
         ("horizons", [int(h) for h in metadata.get("horizons", [])], [int(h) for h in horizons]),
         ("label_mode", archive_label_mode, label_mode),
+        ("label_direction", archive_label_direction, label_direction),
         ("label_threshold", metadata.get("label_threshold"), float(label_threshold)),
         (
             "fitness_horizon_mode",
@@ -412,6 +450,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--label-direction",
+        default=config.LABEL_DIRECTION,
+        help=(
+            "Label direction. Long means price up is favorable; Short means "
+            f"price down is favorable. Default: {config.LABEL_DIRECTION}."
+        ),
+    )
+    parser.add_argument(
         "--trade-top-fraction",
         type=float,
         default=None,
@@ -439,6 +485,7 @@ def main() -> None:
         horizons=args.horizons,
         label_threshold=args.label_threshold,
         label_mode=args.label_mode,
+        label_direction=args.label_direction,
         trade_top_fraction=args.trade_top_fraction,
         val_start=args.val_start,
         test_start=args.test_start,

@@ -280,7 +280,8 @@ def _prediction_telegram_message(payload: dict[str, Any]) -> str:
 
     for entry in payload.get("entries", []):
         lines.append(
-            f"Rank {entry.get('rank')} | ensemble={entry.get('ensemble_signal')} "
+            f"Rank {entry.get('rank')} | direction={entry.get('label_direction')} "
+            f"| ensemble={entry.get('ensemble_signal')} "
             f"| pred_mean={_fmt_value(entry.get('pred_mean'), 6)}"
         )
         lines.append("Horizon | Prediction | Threshold | Signal | Model")
@@ -300,6 +301,7 @@ def _prediction_telegram_message(payload: dict[str, Any]) -> str:
     if isinstance(final_ensemble, dict):
         lines.append(
             f"Final ensemble | signal={final_ensemble.get('ensemble_signal')} "
+            f"| direction={final_ensemble.get('label_direction')} "
             f"| members={final_ensemble.get('member_count')} "
             f"| pred_mean={_fmt_value(final_ensemble.get('pred_mean'), 6)}"
         )
@@ -512,11 +514,15 @@ def _predict_entry(
     if len(known_signals) != len(predictions):
         ensemble_signal = None
 
+    label_direction = config.canonical_label_direction(
+        entry.get("label_direction") or "long"
+    )
     return {
         "entry_id": entry.get("entry_id"),
         "rank": int(entry.get("rank", 0) or 0),
         "archive": entry.get("archive"),
         "label_mode": entry.get("label_mode"),
+        "label_direction": label_direction,
         "label_threshold": entry.get("label_threshold"),
         "score": entry.get("score"),
         "n_features": len(features),
@@ -559,10 +565,20 @@ def _predict_final_ensemble(
     ]
     pred_mean = float(np.mean(pred_values)) if pred_values else None
     horizon = _max_entry_horizon(selected_entries)
+    directions = {
+        config.canonical_label_direction(entry.get("label_direction") or "long")
+        for entry in selected_entries
+    }
+    direction_conflict = len(directions) != 1
+    label_direction = next(iter(directions)) if not direction_conflict else None
+    if direction_conflict:
+        ensemble_signal = None
     return {
         "entry_id": "final_ensemble",
         "rank": "ensemble",
         "horizon": horizon,
+        "label_direction": label_direction,
+        "direction_conflict": direction_conflict,
         "ensemble_signal": ensemble_signal,
         "pred_mean": pred_mean,
         "member_count": int(len(selected_entries)),
@@ -574,6 +590,7 @@ def _predict_final_ensemble(
                 "rank": entry.get("rank"),
                 "archive": entry.get("archive"),
                 "label_mode": entry.get("label_mode"),
+                "label_direction": entry.get("label_direction"),
                 "label_threshold": entry.get("label_threshold"),
                 "ensemble_signal": entry.get("ensemble_signal"),
                 "pred_mean": entry.get("pred_mean"),

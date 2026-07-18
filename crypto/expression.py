@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import numpy as np
@@ -88,19 +89,34 @@ class CryptoFeatureSpace:
         if missing:
             raise ValueError(f"Base feature frame missing features: {missing[:5]}")
         self._base_set = set(self.base_features)
-        self._cache: dict[str, pd.Series] = {}
+        self._cache: OrderedDict[str, pd.Series] = OrderedDict()
+        self._cache_max_items = int(config.EXPR_CACHE_MAX_ITEMS)
 
     def evaluate(self, formula: str) -> pd.Series:
         formula = str(formula).strip()
-        cached = self._cache.get(formula)
+        if formula in self._base_set:
+            return self.base_df[formula]
+
+        cached = self._cache.pop(formula, None)
         if cached is not None:
+            self._cache[formula] = cached
             return cached
 
         series = self._evaluate_uncached(formula)
         series = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
         series = series.reindex(self.base_df.index)
         self._cache[formula] = series
+        while len(self._cache) > self._cache_max_items:
+            self._cache.popitem(last=False)
         return series
+
+    @property
+    def cache_size(self) -> int:
+        return len(self._cache)
+
+    def clear_expression_cache(self) -> None:
+        """Release all generated-expression Series while retaining base_df."""
+        self._cache.clear()
 
     def matrix(self, formulas: list[str], index: pd.Index | None = None) -> pd.DataFrame:
         cols = {}
@@ -439,4 +455,3 @@ def _sanitize_feature_name(formula: str) -> str:
 def _format_number(value: float) -> str:
     text = f"{float(value):.6g}"
     return "0" if text == "-0" else text
-

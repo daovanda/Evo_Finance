@@ -336,7 +336,7 @@ function render(data) {{
           <tr>
             <td>${{m.entry_id || ''}}</td>
             <td>${{m.rank ?? ''}}</td>
-            <td>${{m.label_mode || ''}} @ ${{fmt(m.label_threshold, 4)}}</td>
+            <td>${{m.label_mode || ''}} / ${{m.label_direction || 'long'}} @ ${{fmt(m.label_threshold, 4)}}</td>
             <td class="${{m.ensemble_signal ? 'signal' : 'nosignal'}}">${{m.ensemble_signal}}</td>
             <td>${{fmt(m.pred_mean, 6)}}</td>
           </tr>
@@ -348,7 +348,7 @@ function render(data) {{
   const entryHtml = entries.map(entry => `
     <table>
       <thead>
-        <tr><th colspan="5">Rank ${{entry.rank}} | ensemble:
+        <tr><th colspan="5">Rank ${{entry.rank}} | direction: ${{entry.label_direction || 'long'}} | ensemble:
           <span class="${{entry.ensemble_signal ? 'signal' : 'nosignal'}}">${{entry.ensemble_signal}}</span>
           | pred mean ${{fmt(entry.pred_mean, 6)}}
         </th></tr>

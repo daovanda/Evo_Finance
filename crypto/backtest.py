@@ -82,6 +82,7 @@ class ModelSpec:
     label_mode: str
     label_threshold: float
     top_fraction: float
+    label_direction: str = "long"
 
 
 @dataclass(frozen=True)
@@ -119,6 +120,7 @@ def run_backtest(
     out_dir: str | Path = DEFAULT_OUT_DIR,
     base_ensemble: str = "and",
     tp_threshold: float | None = None,
+    label_direction: str | None = None,
     val_start: str = config.VAL_START,
     test_start: str = config.TEST_START,
     test_end: str | None = config.TEST_END,
@@ -128,13 +130,26 @@ def run_backtest(
     base_ensemble = str(base_ensemble).strip().lower()
     if base_ensemble not in {"and", "or"}:
         raise ValueError("--base-ensemble must be 'and' or 'or'.")
+    specs = [*base_specs, exit1_spec, exit2_spec]
+    if label_direction not in (None, ""):
+        label_direction = config.canonical_label_direction(label_direction)
+    else:
+        directions = {spec.label_direction for spec in specs}
+        if len(directions) != 1:
+            raise ValueError(
+                "A staged backtest cannot mix Long and Short model specs. "
+                "Use archives with the same label_direction or pass "
+                "--label-direction to explicitly override all specs."
+            )
+        label_direction = directions.pop()
 
     tp = float(tp_threshold if tp_threshold is not None else exit1_spec.label_threshold)
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
     logger.info(
-        "Backtest setup: base_specs=%d | base_ensemble=%s | exit1=%s rank %d | exit2=%s rank %d",
+        "Backtest setup: direction=%s | base_specs=%d | base_ensemble=%s | exit1=%s rank %d | exit2=%s rank %d",
+        label_direction,
         len(base_specs),
         base_ensemble.upper(),
         exit1_spec.archive_path,
@@ -178,6 +193,7 @@ def run_backtest(
         test_start=test_start,
         test_end=test_end,
         purge_bars=purge_bars,
+        label_direction=label_direction,
     )
     required_windows = _required_windows_for_entries(entries)
     feature_space = _cached_feature_space(
@@ -199,6 +215,7 @@ def run_backtest(
             test_start=test_start,
             test_end=test_end,
             purge_bars=purge_bars,
+            label_direction=label_direction,
         )
         base_bundles.append(bundle)
 
@@ -212,6 +229,7 @@ def run_backtest(
         test_start=test_start,
         test_end=test_end,
         purge_bars=purge_bars,
+        label_direction=label_direction,
     )
     exit2_bundle = _train_spec_bundle(
         spec=exit2_spec,
@@ -223,6 +241,7 @@ def run_backtest(
         test_start=test_start,
         test_end=test_end,
         purge_bars=purge_bars,
+        label_direction=label_direction,
     )
     base_bundle = _combine_base_bundles(base_bundles, selection=base_ensemble)
 
@@ -230,6 +249,7 @@ def run_backtest(
         raw_df,
         [horizon],
         label_mode="mfe",
+        label_direction=label_direction,
     )
     path_returns = path_by_horizon[horizon]
 
@@ -249,6 +269,7 @@ def run_backtest(
             raw_index=pd.DatetimeIndex(raw_df.index),
             tp_threshold=tp,
             tp_sweep_thresholds=tp_sweep_thresholds,
+            label_direction=label_direction,
         )
         summary_rows.append(summary_row)
         tp_sweep_rows.extend(split_tp_rows)
@@ -261,6 +282,7 @@ def run_backtest(
         exit2_split=exit2_bundle.val,
         path_returns=path_returns,
         raw_index=pd.DatetimeIndex(raw_df.index),
+        label_direction=label_direction,
     )
     test_strategy = _dynamic_tp_strategy_frame(
         base_split=base_bundle.test,
@@ -268,6 +290,7 @@ def run_backtest(
         exit2_split=exit2_bundle.test,
         path_returns=path_returns,
         raw_index=pd.DatetimeIndex(raw_df.index),
+        label_direction=label_direction,
     )
     tp_optimization = _optimize_dynamic_tp(
         val_frame=val_strategy,
@@ -275,7 +298,14 @@ def run_backtest(
         levels=_tp_optimization_levels(),
         top_k=TP_OPT_TOP_K,
     )
-    run_name = _backtest_name(base_specs, exit1_spec, exit2_spec, base_ensemble, tp)
+    run_name = _backtest_name(
+        base_specs,
+        exit1_spec,
+        exit2_spec,
+        base_ensemble,
+        tp,
+        label_direction=label_direction,
+    )
     csv_path = out_path / f"{run_name}.csv"
     tp_sweep_csv_path = out_path / f"{run_name}_tp_sweep.csv"
     tp_optimization_csv_path = out_path / f"{run_name}_dynamic_tp_top5.csv"
@@ -293,6 +323,7 @@ def run_backtest(
         exit2_label=exit2_bundle.label,
         base_ensemble=base_ensemble,
         tp_threshold=tp,
+        label_direction=label_direction,
     )
     logger.info("Saved summary: %s", csv_path)
     logger.info("Saved TP sweep: %s", tp_sweep_csv_path)
@@ -317,6 +348,7 @@ def _quality_train_index(
     test_start: str,
     test_end: str | None,
     purge_bars: int,
+    label_direction: str,
 ) -> pd.Index:
     labeled = add_binary_labels(
         raw_df,
@@ -324,6 +356,7 @@ def _quality_train_index(
         threshold=spec.label_threshold,
         return_fn=config.get_label_return_fn(spec.label_mode),
         label_mode=spec.label_mode,
+        label_direction=label_direction,
     )
     train_df, _, _ = split_labeled_by_dates(
         labeled,
@@ -363,6 +396,25 @@ def _archive_horizons(path: Path, fallback: list[int], label: str) -> list[int]:
     horizons = _normalize_horizons(raw_horizons, f"{label} metadata.horizons")
     logger.info("%s archive horizons from metadata: %s", label, horizons)
     return horizons
+
+
+def _archive_label_direction(
+    path: Path,
+    explicit_direction: str | None = None,
+) -> str:
+    if explicit_direction not in (None, ""):
+        return config.canonical_label_direction(explicit_direction)
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return config.canonical_label_direction("long")
+    metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+    metadata_direction = (
+        metadata.get("label_direction") if isinstance(metadata, dict) else None
+    )
+    return config.canonical_label_direction(
+        metadata_direction if metadata_direction not in (None, "") else "long"
+    )
 
 
 def _normalize_horizons(values: Any, label: str) -> list[int]:
@@ -421,12 +473,14 @@ def _train_spec_bundle(
     test_start: str,
     test_end: str | None,
     purge_bars: int,
+    label_direction: str,
 ) -> BundleSignals:
     logger.info(
-        "Training %s rank %d | mode=%s threshold=%.6f top=%.2f%% | horizons=%s",
+        "Training %s rank %d | mode=%s direction=%s threshold=%.6f top=%.2f%% | horizons=%s",
         spec.archive_path,
         spec.rank,
         spec.label_mode,
+        label_direction,
         spec.label_threshold,
         spec.top_fraction * 100.0,
         horizons,
@@ -438,6 +492,7 @@ def _train_spec_bundle(
         threshold=spec.label_threshold,
         return_fn=config.get_label_return_fn(spec.label_mode),
         label_mode=spec.label_mode,
+        label_direction=label_direction,
     )
     train_df, val_df, test_df = split_labeled_by_dates(
         labeled,
@@ -466,7 +521,8 @@ def _train_spec_bundle(
 
     label = (
         f"{spec.archive_path.stem} r{spec.rank:02d} "
-        f"{spec.label_mode} thr={spec.label_threshold:.4g} top={spec.top_fraction:.0%}"
+        f"{spec.label_mode} {label_direction} "
+        f"thr={spec.label_threshold:.4g} top={spec.top_fraction:.0%}"
     )
     if len(horizon_results) == 1:
         _, val, test = horizon_results[0]
@@ -684,10 +740,16 @@ def _summarize_split(
     raw_index: pd.DatetimeIndex,
     tp_threshold: float,
     tp_sweep_thresholds: list[float],
+    label_direction: str,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    hit_prefix = _hit_price_prefix(label_direction)
+    adverse_prefix = _adverse_price_prefix(label_direction)
+    hit_h1_col = f"{hit_prefix}_h1"
+    hit_h2_col = f"{hit_prefix}_h2"
+    adverse_h1_col = f"{adverse_prefix}_h1"
     base_selected = pd.Index(base_split.selected_index)
     base_path = path_returns.reindex(base_selected).dropna(
-        subset=["high_h1", "high_h2", "low_h1"]
+        subset=[hit_h1_col, hit_h2_col, adverse_h1_col]
     )
     base_signals = int(len(base_path))
     if base_signals == 0:
@@ -721,11 +783,11 @@ def _summarize_split(
             _empty_stage_tp_rows(split, tp_sweep_thresholds)
         )
 
-    no_h1_index = pd.Index(base_path.index[base_path["high_h1"] <= float(tp_threshold)])
+    no_h1_index = pd.Index(base_path.index[base_path[hit_h1_col] <= float(tp_threshold)])
     no_h1_count = int(len(no_h1_index))
-    low_h1 = pd.to_numeric(base_path["low_h1"], errors="coerce")
-    low_h1_le_neg01_count = int((low_h1 <= -0.001).sum())
-    low_h1_le_neg005_count = int((low_h1 <= -0.0005).sum())
+    adverse_h1 = pd.to_numeric(base_path[adverse_h1_col], errors="coerce")
+    low_h1_le_neg01_count = int((adverse_h1 <= -0.001).sum())
+    low_h1_le_neg005_count = int((adverse_h1 <= -0.0005).sum())
 
     exit1_mapping = _future_bar_mapping(no_h1_index, raw_index, offset=1)
     exit1_selected_index = pd.Index(exit1_split.selected_index)
@@ -743,7 +805,7 @@ def _summarize_split(
     exit1_no_selected_path = path_returns.reindex(exit1_no_selected_base_index)
     exit1_no_selected_no_h2_index = pd.Index(
         exit1_no_selected_path.index[
-            pd.to_numeric(exit1_no_selected_path["high_h2"], errors="coerce")
+            pd.to_numeric(exit1_no_selected_path[hit_h2_col], errors="coerce")
             <= float(tp_threshold)
         ]
     )
@@ -813,6 +875,7 @@ def _summarize_split(
         path_returns=path_returns,
         thresholds=tp_sweep_thresholds,
         min_h=1,
+        label_direction=label_direction,
     )
     base_no_h1_tp_rows = _tp_sweep_rows(
         split=split,
@@ -821,6 +884,7 @@ def _summarize_split(
         path_returns=path_returns,
         thresholds=tp_sweep_thresholds,
         min_h=2,
+        label_direction=label_direction,
     )
     exit1_selected_tp_rows = _tp_sweep_rows(
         split=split,
@@ -829,6 +893,7 @@ def _summarize_split(
         path_returns=path_returns,
         thresholds=tp_sweep_thresholds,
         min_h=2,
+        label_direction=label_direction,
     )
     exit1_no_selected_tp_rows = _tp_sweep_rows(
         split=split,
@@ -837,6 +902,7 @@ def _summarize_split(
         path_returns=path_returns,
         thresholds=tp_sweep_thresholds,
         min_h=2,
+        label_direction=label_direction,
     )
     exit1_no_selected_h2_tp_rows = _tp_sweep_rows(
         split=split,
@@ -846,6 +912,7 @@ def _summarize_split(
         thresholds=tp_sweep_thresholds,
         min_h=2,
         max_h=2,
+        label_direction=label_direction,
     )
 
     exit1_no_selected_no_h2_tp_rows = _tp_sweep_rows(
@@ -855,6 +922,7 @@ def _summarize_split(
         path_returns=path_returns,
         thresholds=tp_sweep_thresholds,
         min_h=3,
+        label_direction=label_direction,
     )
     exit2_selected_tp_rows = _tp_sweep_rows(
         split=split,
@@ -863,6 +931,7 @@ def _summarize_split(
         path_returns=path_returns,
         thresholds=tp_sweep_thresholds,
         min_h=3,
+        label_direction=label_direction,
     )
     exit2_no_selected_tp_rows = _tp_sweep_rows(
         split=split,
@@ -871,6 +940,7 @@ def _summarize_split(
         path_returns=path_returns,
         thresholds=tp_sweep_thresholds,
         min_h=3,
+        label_direction=label_direction,
     )
     return (
         summary,
@@ -906,13 +976,18 @@ def _dynamic_tp_strategy_frame(
     exit2_split: SplitSignals,
     path_returns: pd.DataFrame,
     raw_index: pd.DatetimeIndex,
+    label_direction: str,
 ) -> pd.DataFrame:
-    high_cols = _future_high_columns(path_returns, min_h=1)
-    if len(high_cols) < 3:
+    hit_cols = _future_hit_columns(
+        path_returns,
+        min_h=1,
+        label_direction=label_direction,
+    )
+    if len(hit_cols) < 3:
         return pd.DataFrame()
-    final_h = _max_h_from_high_columns(high_cols)
+    final_h = _max_h_from_hit_columns(hit_cols, label_direction=label_direction)
     close_col = f"close_h{final_h}"
-    required = [*high_cols, close_col]
+    required = [*hit_cols, close_col]
     base_path = path_returns.reindex(pd.Index(base_split.selected_index)).dropna(
         subset=required
     )
@@ -920,10 +995,11 @@ def _dynamic_tp_strategy_frame(
         return pd.DataFrame()
 
     frame = pd.DataFrame(index=base_path.index)
-    frame["high_h1"] = pd.to_numeric(base_path["high_h1"], errors="coerce")
-    frame["high_h2"] = pd.to_numeric(base_path["high_h2"], errors="coerce")
-    h2_plus = _future_high_columns(base_path, min_h=2)
-    h3_plus = _future_high_columns(base_path, min_h=3)
+    hit_prefix = _hit_price_prefix(label_direction)
+    frame["high_h1"] = pd.to_numeric(base_path[f"{hit_prefix}_h1"], errors="coerce")
+    frame["high_h2"] = pd.to_numeric(base_path[f"{hit_prefix}_h2"], errors="coerce")
+    h2_plus = _future_hit_columns(base_path, min_h=2, label_direction=label_direction)
+    h3_plus = _future_hit_columns(base_path, min_h=3, label_direction=label_direction)
     frame["max_high_h2_plus"] = base_path[h2_plus].max(axis=1, skipna=False)
     frame["max_high_h3_plus"] = base_path[h3_plus].max(axis=1, skipna=False)
     frame["close_final"] = pd.to_numeric(base_path[close_col], errors="coerce")
@@ -1140,16 +1216,22 @@ def _tp_sweep_rows(
     thresholds: list[float],
     min_h: int = 2,
     max_h: int | None = None,
+    label_direction: str = config.LABEL_DIRECTION,
 ) -> list[dict[str, Any]]:
     selected_path = path_returns.reindex(selected_base_index)
-    high_cols = _future_high_columns(selected_path, min_h=min_h, max_h=max_h)
-    selected_path = selected_path.dropna(subset=high_cols) if high_cols else selected_path.iloc[0:0]
+    hit_cols = _future_hit_columns(
+        selected_path,
+        min_h=min_h,
+        max_h=max_h,
+        label_direction=label_direction,
+    )
+    selected_path = selected_path.dropna(subset=hit_cols) if hit_cols else selected_path.iloc[0:0]
     total = int(len(selected_path))
-    if total == 0 or not high_cols:
+    if total == 0 or not hit_cols:
         return _empty_tp_sweep_rows(split, thresholds, group=group)
 
-    high_values = selected_path[high_cols].apply(pd.to_numeric, errors="coerce")
-    close_col = f"close_h{_max_h_from_high_columns(high_cols)}"
+    hit_values = selected_path[hit_cols].apply(pd.to_numeric, errors="coerce")
+    close_col = f"close_h{_max_h_from_hit_columns(hit_cols, label_direction=label_direction)}"
     close_values = (
         pd.to_numeric(selected_path[close_col], errors="coerce")
         if close_col in selected_path.columns
@@ -1165,7 +1247,7 @@ def _tp_sweep_rows(
     )
     rows: list[dict[str, Any]] = []
     for threshold in thresholds:
-        hit = (high_values > float(threshold)).any(axis=1)
+        hit = (hit_values > float(threshold)).any(axis=1)
         hit_count = int(hit.sum())
         miss = ~hit
         miss_count = int(miss.sum())
@@ -1187,19 +1269,29 @@ def _tp_sweep_rows(
     return rows
 
 
-def _future_high_columns(
+def _hit_price_prefix(label_direction: str = config.LABEL_DIRECTION) -> str:
+    return "low" if config.canonical_label_direction(label_direction) == "short" else "high"
+
+
+def _adverse_price_prefix(label_direction: str = config.LABEL_DIRECTION) -> str:
+    return "high" if config.canonical_label_direction(label_direction) == "short" else "low"
+
+
+def _future_hit_columns(
     frame: pd.DataFrame,
     min_h: int,
     max_h: int | None = None,
+    label_direction: str = config.LABEL_DIRECTION,
 ) -> list[str]:
     columns: list[tuple[int, str]] = []
+    prefix = f"{_hit_price_prefix(label_direction)}_h"
     min_h = max(int(min_h), 1)
     max_h_value = int(max_h) if max_h is not None else None
     for column in frame.columns:
         text = str(column)
-        if not text.startswith("high_h"):
+        if not text.startswith(prefix):
             continue
-        suffix = text[len("high_h") :]
+        suffix = text[len(prefix) :]
         if not suffix.isdigit():
             continue
         step = int(suffix)
@@ -1210,13 +1302,17 @@ def _future_high_columns(
     return [name for _, name in sorted(columns)]
 
 
-def _max_h_from_high_columns(columns: list[str]) -> int:
+def _max_h_from_hit_columns(
+    columns: list[str],
+    label_direction: str = config.LABEL_DIRECTION,
+) -> int:
     steps: list[int] = []
+    prefix = f"{_hit_price_prefix(label_direction)}_h"
     for column in columns:
         text = str(column)
-        if not text.startswith("high_h"):
+        if not text.startswith(prefix):
             continue
-        suffix = text[len("high_h") :]
+        suffix = text[len(prefix) :]
         if suffix.isdigit():
             steps.append(int(suffix))
     return max(steps) if steps else 1
@@ -1232,6 +1328,7 @@ def _plot_summary(
     exit2_label: str,
     base_ensemble: str,
     tp_threshold: float,
+    label_direction: str,
 ) -> None:
     fig, (
         ax_p1_summary,
@@ -1271,7 +1368,8 @@ def _plot_summary(
         ax_p1_summary,
         _part1_summary_table(summary),
         title=(
-            f"Part 1: exit_after_h1 | base={base_ensemble.upper()} | TP={tp_threshold:.4g}\n"
+            f"Part 1: exit_after_h1 | direction={label_direction} | "
+            f"base={base_ensemble.upper()} | TP={tp_threshold:.4g}\n"
             f"base: {base_label}\nexit_after_h1: {exit1_label}"
         ),
         font_size=7.0,
@@ -1574,6 +1672,7 @@ def _backtest_name(
     exit2_spec: ModelSpec,
     base_ensemble: str,
     tp_threshold: float,
+    label_direction: str = config.LABEL_DIRECTION,
 ) -> str:
     base_name = "_".join(
         (
@@ -1589,6 +1688,7 @@ def _backtest_name(
         f"x2_{_short_safe_name(exit2_spec.archive_path.stem)}_r{exit2_spec.rank:02d}"
     )
     tp_name = _threshold_filename_token(float(tp_threshold))
+    direction_name = config.canonical_label_direction(label_direction)
     exit1_top_name = _threshold_filename_token(float(exit1_spec.top_fraction))
     exit2_top_name = _threshold_filename_token(float(exit2_spec.top_fraction))
     full_name = _safe_name(
@@ -1596,6 +1696,7 @@ def _backtest_name(
             [
                 f"strategy_e1top_{exit1_top_name}",
                 f"e2top_{exit2_top_name}",
+                direction_name,
                 base_ensemble,
                 base_name,
                 exit1_name,
@@ -1616,6 +1717,7 @@ def _backtest_name(
             [
                 f"strategy_e1top_{exit1_top_name}",
                 f"e2top_{exit2_top_name}",
+                direction_name,
                 base_ensemble,
                 f"bases{len(base_specs)}",
                 f"tp_{tp_name}",
@@ -1645,9 +1747,9 @@ def _parse_spec(
     require_top_fraction: bool = False,
 ) -> ModelSpec:
     parts = [part.strip() for part in str(value).split("#")]
-    if len(parts) not in {4, 5}:
+    if len(parts) not in {4, 5, 6}:
         raise ValueError(
-            "Spec must be ARCHIVE#RANK#MODE#THRESHOLD[#TOP_FRACTION], "
+            "Spec must be ARCHIVE#RANK#MODE#THRESHOLD[#TOP_FRACTION[#DIRECTION]], "
             f"got: {value!r}"
         )
     archive_text, rank_text, mode_text, threshold_text = parts[:4]
@@ -1655,12 +1757,19 @@ def _parse_spec(
     if require_top_fraction and len(parts) < 5:
         raise ValueError("Exit spec must include TOP_FRACTION or use a top-fraction CLI option.")
     top_fraction = float(parts[4]) if len(parts) == 5 and parts[4] else float(default_top_fraction)
+    if len(parts) == 6:
+        top_fraction = float(parts[4]) if parts[4] else float(default_top_fraction)
+    direction = _archive_label_direction(
+        Path(archive_text),
+        explicit_direction=parts[5] if len(parts) == 6 and parts[5] else None,
+    )
     if not 0 < top_fraction <= 1:
         raise ValueError(f"top fraction must be in (0, 1], got {top_fraction}.")
     return ModelSpec(
         archive_path=Path(archive_text),
         rank=int(rank_text),
         label_mode=mode_text,
+        label_direction=direction,
         label_threshold=float(threshold_text),
         top_fraction=top_fraction,
     )
@@ -1720,7 +1829,8 @@ def main() -> None:
         nargs="+",
         required=True,
         help=(
-            "Base signal spec(s): ARCHIVE#RANK#MODE#THRESHOLD[#TOP_FRACTION]. "
+            "Base signal spec(s): ARCHIVE#RANK#MODE#THRESHOLD"
+            "[#TOP_FRACTION[#DIRECTION]]. "
             "Each base may use its own fifth-field top fraction; otherwise that base "
             "falls back to config.TRADE_TOP_FRACTION. Quote each spec in the shell."
         ),
@@ -1735,7 +1845,8 @@ def main() -> None:
         "--exit1",
         required=True,
         help=(
-            "Exit-after-H1 model spec: ARCHIVE#RANK#MODE#THRESHOLD[#TOP_FRACTION]. "
+            "Exit-after-H1 model spec: ARCHIVE#RANK#MODE#THRESHOLD"
+            "[#TOP_FRACTION[#DIRECTION]]. "
             "Use mode exit_after_h1."
         ),
     )
@@ -1743,7 +1854,8 @@ def main() -> None:
         "--exit2",
         required=True,
         help=(
-            "Exit-after-H2 model spec: ARCHIVE#RANK#MODE#THRESHOLD[#TOP_FRACTION]. "
+            "Exit-after-H2 model spec: ARCHIVE#RANK#MODE#THRESHOLD"
+            "[#TOP_FRACTION[#DIRECTION]]. "
             "Use mode exit_after_h2."
         ),
     )
@@ -1774,6 +1886,15 @@ def main() -> None:
         help=(
             "TP threshold used to decide whether H1/H2 was hit. "
             "Default: exit1 spec label threshold."
+        ),
+    )
+    parser.add_argument(
+        "--label-direction",
+        default=None,
+        help=(
+            "Override direction for every model spec. Long uses high as TP; "
+            "Short uses low as TP. Default: read each archive metadata; old "
+            "archives without label_direction are treated as Long."
         ),
     )
     parser.add_argument("--data", default=str(config.DATA_PATH), help="Crypto OHLCV CSV path.")
@@ -1828,6 +1949,7 @@ def main() -> None:
             archive_path=exit1_spec.archive_path,
             rank=exit1_spec.rank,
             label_mode=exit1_spec.label_mode,
+            label_direction=exit1_spec.label_direction,
             label_threshold=exit1_spec.label_threshold,
             top_fraction=float(exit1_top_fraction),
         )
@@ -1835,6 +1957,7 @@ def main() -> None:
             archive_path=exit2_spec.archive_path,
             rank=exit2_spec.rank,
             label_mode=exit2_spec.label_mode,
+            label_direction=exit2_spec.label_direction,
             label_threshold=exit2_spec.label_threshold,
             top_fraction=float(exit2_top_fraction),
         )
@@ -1847,6 +1970,7 @@ def main() -> None:
                 out_dir=args.out_dir,
                 base_ensemble=args.base_ensemble,
                 tp_threshold=args.tp_threshold,
+                label_direction=args.label_direction,
                 val_start=args.val_start,
                 test_start=args.test_start,
                 test_end=args.test_end,
