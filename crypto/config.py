@@ -374,7 +374,8 @@ WF_PURGE_BARS: int | None = None  # None => max(HOLDING_HORIZONS) + 1
 
 # Safe feature construction. All features are time-series/ratio normalized;
 # raw price/volume scale columns are intentionally not selectable.
-WINDOWS: list[int] = [1, 2, 3, 4, 5, 7, 10, 14, 20, 30, 40, 50, 60, 80, 120, 160, 240, 320, 400, 480]
+WINDOWS: list[int] = [2, 3, 5, 7, 10, 14, 30, 40, 60, 80, 120, 240, 400, 480]
+# WINDOWS: list[int] = [3, 5, 10, 15, 30, 60, 120, 240, 480, 960, 1440]
 FEATURE_MIN_VALID_RATIO: float = 0.70
 FEATURE_MAX_DOMINANT_VALUE_RATIO: float = 0.985
 FEATURE_CORR_THRESHOLD: float = 0.70
@@ -403,7 +404,7 @@ MAX_RETRY: int = 5
 # Fitness. RETURN_SCORE_SCALE normalizes mean trade return so that one metric
 # cannot dominate merely by being on a wider numerical scale.
 FITNESS_HORIZON_MODE: str = "mean"  # "mean" keeps old behavior; "ensemble" requires all H signals
-TRADE_TOP_FRACTION: float = 0.3
+TRADE_TOP_FRACTION: float = 0.1
 
 MIN_TRADES_PER_SPLIT: int = 20
 TRADE_COST: float = 0.001  # 0.1% Futures round-trip fee plus slippage allowance

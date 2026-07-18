@@ -250,14 +250,14 @@ class CryptoPipelineTests(unittest.TestCase):
         self.assertEqual(labeled["label_h2"].iloc[0], 1.0)
         self.assertTrue(pd.isna(labeled["label_h2"].iloc[-1]))
 
-    def test_mfe_label_uses_next_open_and_future_max_high(self):
+    def test_mfe_label_uses_mfe_but_fitness_return_uses_tp_or_final_close(self):
         idx = pd.date_range("2024-01-01", periods=5, freq="15min")
         df = pd.DataFrame(
             {
                 "open": [100.0] * 5,
-                "high": [100.0, 102.0, 101.0, 104.0, 103.0],
+                "high": [100.0, 104.0, 101.0, 101.0, 101.0],
                 "low": [99.0] * 5,
-                "close": [100.0] * 5,
+                "close": [100.0, 100.0, 100.0, 100.0, 98.0],
                 "volume": [10.0] * 5,
                 "trade_count": [10] * 5,
                 "taker_buy_base_volume": [5.0] * 5,
@@ -270,16 +270,17 @@ class CryptoPipelineTests(unittest.TestCase):
             df,
             horizons=[3],
             threshold=0.03,
-            return_fn=config.mfe_future_return,
+            label_mode="mfe",
         )
 
         expected = pd.Series(
-            [0.04, 0.04, np.nan, np.nan, np.nan],
+            [0.03, -0.02, np.nan, np.nan, np.nan],
             index=idx,
             name="future_return_h3",
         )
         pd.testing.assert_series_equal(labeled["future_return_h3"], expected)
         self.assertEqual(labeled["label_h3"].iloc[0], 1.0)
+        self.assertEqual(labeled["label_h3"].iloc[1], 0.0)
         self.assertTrue(pd.isna(labeled["label_h3"].iloc[-1]))
 
     def test_short_direction_uses_price_down_as_positive_return(self):
@@ -317,7 +318,7 @@ class CryptoPipelineTests(unittest.TestCase):
             label_direction="Short",
             threshold=0.015,
         )
-        self.assertAlmostEqual(mfe_labeled["future_return_h3"].iloc[0], 0.02)
+        self.assertAlmostEqual(mfe_labeled["future_return_h3"].iloc[0], 0.015)
         self.assertEqual(mfe_labeled["label_h3"].iloc[0], 1.0)
 
     def test_safe_path_mfe_uses_first_hit_and_all_prior_safe_closes(self):

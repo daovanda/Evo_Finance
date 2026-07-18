@@ -7,3 +7,5 @@ pip install -r requirements.txt
 
  - Commits on Jun 26, 2026 - them chan nhieu cac feature dung gia tuyet doi gay thien lech
  
+ - Commits on Jul 18, 2026 - them che do Long Short
+ 

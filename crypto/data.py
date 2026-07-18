@@ -82,10 +82,12 @@ def add_binary_labels(
 
     The future_return formula is controlled by label_mode/config.LABEL_MODE and
     label_direction/config.LABEL_DIRECTION.
-    label = 1 if future_return > threshold, else 0. The safe_path_mfe mode
-    uses its explicit first-hit/path-safety label instead: first TP hit at
-    config.TP_SAFE_CLOSE exists, and all earlier close returns stay above
-    the selected close floor.
+    label = 1 if the mode-specific label return > threshold, else 0.
+
+    For mfe, the label source remains maximum favorable excursion, while
+    future_return_h stores the executable strategy payoff used by fitness:
+    threshold on a TP hit, otherwise the close return at the final horizon.
+    The safe_path_mfe mode uses its explicit first-hit/path-safety label.
     """
     labeled = df.sort_index().copy()
     selected_mode = config.canonical_label_mode(label_mode)
@@ -106,6 +108,22 @@ def add_binary_labels(
             continue
 
         future_return = _call_label_return_fn(label_return_fn, labeled, h, selected_direction)
+        if selected_mode == "mfe":
+            close_return = config.close_exit_future_return(
+                labeled,
+                h,
+                direction=selected_direction,
+            )
+            complete = future_return.notna() & close_return.notna()
+            hit_tp = future_return > float(label_threshold)
+            strategy_return = close_return.where(
+                ~hit_tp,
+                float(label_threshold),
+            ).where(complete)
+            labeled[f"future_return_h{h}"] = strategy_return
+            labeled[f"label_h{h}"] = hit_tp.astype("float").where(complete)
+            continue
+
         if selected_mode == "exit_after_h1":
             h1_price = labeled["low"] if selected_direction == "short" else labeled["high"]
             h1_return = config.directional_price_return(
