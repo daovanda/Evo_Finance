@@ -119,15 +119,15 @@ class CryptoFeatureSpace:
         self._cache.clear()
 
     def matrix(self, formulas: list[str], index: pd.Index | None = None) -> pd.DataFrame:
+        target_index = self.base_df.index if index is None else index
         cols = {}
         for formula in formulas:
             name = _sanitize_feature_name(formula)
             if name in cols:
                 name = f"{name}_{len(cols)}"
-            cols[name] = self.evaluate(formula)
-        matrix = pd.DataFrame(cols, index=self.base_df.index)
-        if index is not None:
-            matrix = matrix.loc[index]
+            series = self.evaluate(formula)
+            cols[name] = series if index is None else series.loc[target_index]
+        matrix = pd.DataFrame(cols, index=target_index)
         return matrix.replace([np.inf, -np.inf], np.nan)
 
     def quality(
@@ -278,7 +278,7 @@ def _rolling(fn: str, series: pd.Series, window: int) -> pd.Series:
     if fn == "ts_zscore":
         return _safe_div(series - rolling.mean(), rolling.std())
     if fn == "ts_rank":
-        return rolling.apply(lambda values: pd.Series(values).rank(pct=True).iloc[-1], raw=False)
+        return rolling.rank(method="average", pct=True)
     if fn == "delta":
         return series.diff(window)
     if fn == "shift":

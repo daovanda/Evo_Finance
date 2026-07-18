@@ -64,7 +64,8 @@ def build_feature_frame(
     trade_count_safe = trade_count.where(trade_count > 0)
     true_range = _true_range(high, low, close)
     close_ret_1 = close.pct_change()
-    logret_1 = np.log(close).diff()
+    log_close = np.log(close)
+    logret_1 = log_close.diff()
     log_hl = np.log(_safe_div(high, low))
     log_co = np.log(_safe_div(close, open_))
     log_hc = np.log(_safe_div(high, close))
@@ -73,6 +74,16 @@ def build_feature_frame(
     log_lo = np.log(_safe_div(low, open_))
     upside_logret = logret_1.clip(lower=0.0)
     downside_logret = logret_1.clip(upper=0.0)
+    logret_sq = logret_1.pow(2)
+    upside_logret_sq = upside_logret.pow(2)
+    downside_logret_sq = downside_logret.pow(2)
+    log_hl_sq = log_hl.pow(2)
+    parkinson_component = log_hl_sq / (4.0 * np.log(2.0))
+    garman_klass_component = (
+        0.5 * log_hl_sq
+        - (2.0 * np.log(2.0) - 1.0) * log_co.pow(2)
+    )
+    rogers_satchell_component = (log_hc * log_ho) + (log_lc * log_lo)
     taker_sell_base = volume - taker_base
     taker_sell_quote = quote_volume_proxy - taker_quote
     taker_delta_base = taker_base - taker_sell_base
@@ -110,6 +121,13 @@ def build_feature_frame(
         "trade_size_base": features["trade_size_base"],
         "trade_size_quote": features["trade_size_quote"],
     }
+    flow_log_sources = {
+        name: np.log1p(source.clip(lower=0))
+        for name, source in flow_sources.items()
+    }
+    buy_pressure = features["buy_pressure_base"]
+    buy_pressure_positive = (buy_pressure > 0).astype(float)
+    buy_pressure_negative = (buy_pressure < 0).astype(float)
 
     logger.info("Crypto feature build: base features=%d", len(features))
 
@@ -125,7 +143,7 @@ def build_feature_frame(
         ma = close.rolling(w, min_periods=w).mean()
         std = close.rolling(w, min_periods=w).std()
         ret_w = close.pct_change(w)
-        logret_w = np.log(close).diff(w)
+        logret_w = log_close.diff(w)
         vol_w = logret_1.rolling(w, min_periods=w).std()
         tr_ma = true_range.rolling(w, min_periods=w).mean()
 
@@ -134,20 +152,13 @@ def build_feature_frame(
         features[f"rolling_ret_mean_{w}"] = close_ret_1.rolling(w, min_periods=w).mean()
         features[f"rolling_logret_mean_{w}"] = logret_1.rolling(w, min_periods=w).mean()
         features[f"volatility_{w}"] = vol_w
-        realized_var_mean = logret_1.pow(2).rolling(w, min_periods=w).mean()
-        realized_var_sum = logret_1.pow(2).rolling(w, min_periods=w).sum()
-        upside_var = upside_logret.pow(2).rolling(w, min_periods=w).mean()
-        downside_var = downside_logret.pow(2).rolling(w, min_periods=w).mean()
-        parkinson_var = (log_hl.pow(2) / (4.0 * np.log(2.0))).rolling(
-            w, min_periods=w
-        ).mean()
-        gk_var = (
-            0.5 * log_hl.pow(2)
-            - (2.0 * np.log(2.0) - 1.0) * log_co.pow(2)
-        ).rolling(w, min_periods=w).mean()
-        rs_var = (
-            (log_hc * log_ho) + (log_lc * log_lo)
-        ).rolling(w, min_periods=w).mean()
+        realized_var_mean = logret_sq.rolling(w, min_periods=w).mean()
+        realized_var_sum = logret_sq.rolling(w, min_periods=w).sum()
+        upside_var = upside_logret_sq.rolling(w, min_periods=w).mean()
+        downside_var = downside_logret_sq.rolling(w, min_periods=w).mean()
+        parkinson_var = parkinson_component.rolling(w, min_periods=w).mean()
+        gk_var = garman_klass_component.rolling(w, min_periods=w).mean()
+        rs_var = rogers_satchell_component.rolling(w, min_periods=w).mean()
         realized_vol = _sqrt_nonnegative(realized_var_mean)
         downside_vol = _sqrt_nonnegative(downside_var)
         upside_vol = _sqrt_nonnegative(upside_var)
@@ -180,25 +191,26 @@ def build_feature_frame(
         features[f"skew_ret_{w}"] = close_ret_1.rolling(w, min_periods=w).skew()
         features[f"kurt_ret_{w}"] = close_ret_1.rolling(w, min_periods=w).kurt()
 
-        buy_pressure = features["buy_pressure_base"]
         features[f"buy_pressure_mean_{w}"] = buy_pressure.rolling(w, min_periods=w).mean()
         features[f"buy_pressure_z_{w}"] = _rolling_zscore(buy_pressure, w)
         features[f"buy_pressure_positive_ratio_{w}"] = (
-            (buy_pressure > 0).astype(float).rolling(w, min_periods=w).mean()
+            buy_pressure_positive.rolling(w, min_periods=w).mean()
         )
         features[f"buy_pressure_negative_ratio_{w}"] = (
-            (buy_pressure < 0).astype(float).rolling(w, min_periods=w).mean()
+            buy_pressure_negative.rolling(w, min_periods=w).mean()
         )
         features[f"buy_pressure_persistence_{w}"] = _persistence_ratio(buy_pressure, w)
         features[f"taker_ratio_mean_{w}"] = features["taker_buy_base_ratio"].rolling(w, min_periods=w).mean()
         features[f"taker_ratio_z_{w}"] = _rolling_zscore(features["taker_buy_base_ratio"], w)
+        volume_sum = volume.rolling(w, min_periods=w).sum()
+        quote_volume_sum = quote_volume_proxy.rolling(w, min_periods=w).sum()
         features[f"taker_delta_sum_ratio_{w}"] = _safe_div(
             taker_delta_base.rolling(w, min_periods=w).sum(),
-            volume.rolling(w, min_periods=w).sum(),
+            volume_sum,
         )
         features[f"taker_delta_quote_sum_ratio_{w}"] = _safe_div(
             taker_delta_quote.rolling(w, min_periods=w).sum(),
-            quote_volume_proxy.rolling(w, min_periods=w).sum(),
+            quote_volume_sum,
         )
         features[f"taker_delta_z_{w}"] = _rolling_zscore(
             features["taker_delta_base_ratio"], w
@@ -209,11 +221,11 @@ def build_feature_frame(
         features[f"taker_delta_accel_{w}"] = features[f"taker_delta_sum_ratio_{w}"].diff(w)
         features[f"signed_volume_sum_ratio_{w}"] = _safe_div(
             signed_volume.rolling(w, min_periods=w).sum(),
-            volume.rolling(w, min_periods=w).sum(),
+            volume_sum,
         )
 
         for name, source in flow_sources.items():
-            log_source = np.log1p(source.clip(lower=0))
+            log_source = flow_log_sources[name]
             rolling_mean = source.rolling(w, min_periods=w).mean()
             features[f"{name}_ratio_{w}"] = _safe_div(source, rolling_mean) - 1.0
             features[f"{name}_log_z_{w}"] = _rolling_zscore(log_source, w)
@@ -383,16 +395,7 @@ def _efficiency_ratio(close: pd.Series, window: int) -> pd.Series:
 
 
 def _rolling_rank_pct(series: pd.Series, window: int) -> pd.Series:
-    def rank_last(values: np.ndarray) -> float:
-        last = values[-1]
-        if np.isnan(last):
-            return np.nan
-        valid = values[~np.isnan(values)]
-        if len(valid) == 0:
-            return np.nan
-        less = np.sum(valid < last)
-        equal = np.sum(valid == last)
-        average_rank = less + ((equal + 1.0) / 2.0)
-        return float(average_rank / len(valid))
-
-    return series.rolling(window, min_periods=window).apply(rank_last, raw=True)
+    return series.rolling(window, min_periods=window).rank(
+        method="average",
+        pct=True,
+    )

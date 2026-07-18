@@ -22,7 +22,12 @@ from crypto.main import _validate_resume_metadata
 from crypto.data import CryptoFold, add_binary_labels, split_labeled_by_dates
 from crypto.evolution import CryptoArchive, CryptoIndividual, CryptoMutator
 from crypto.expression import CryptoFeatureSpace
-from crypto.features import RAW_SCALE_COLUMNS, build_feature_frame, selectable_features
+from crypto.features import (
+    RAW_SCALE_COLUMNS,
+    _rolling_rank_pct,
+    build_feature_frame,
+    selectable_features,
+)
 from crypto.fitness import CryptoFitnessEvaluator, _internal_early_stop_split
 
 
@@ -994,6 +999,56 @@ class CryptoPipelineTests(unittest.TestCase):
         self.assertEqual(space.cache_size, config.EXPR_CACHE_MAX_ITEMS)
         space.clear_expression_cache()
         self.assertEqual(space.cache_size, 0)
+
+    def test_rolling_rank_matches_legacy_average_rank(self):
+        index = pd.date_range("2024-01-01", periods=12, freq="15min")
+        series = pd.Series(
+            [1.0, 2.0, 2.0, 4.0, np.nan, 3.0, 3.0, 1.0, 5.0, 5.0, 2.0, 4.0],
+            index=index,
+        )
+
+        def legacy_rank_last(values: np.ndarray) -> float:
+            last = values[-1]
+            if np.isnan(last):
+                return np.nan
+            valid = values[~np.isnan(values)]
+            less = np.sum(valid < last)
+            equal = np.sum(valid == last)
+            return float((less + ((equal + 1.0) / 2.0)) / len(valid))
+
+        expected = series.rolling(4, min_periods=4).apply(legacy_rank_last, raw=True)
+        actual = _rolling_rank_pct(series, 4)
+        pd.testing.assert_series_equal(actual, expected, check_exact=True)
+
+        space = CryptoFeatureSpace(pd.DataFrame({"feature": series}), ["feature"])
+        expression_rank = space.evaluate("ts_rank(feature, 4)")
+        pd.testing.assert_series_equal(
+            expression_rank,
+            expected.rename("feature"),
+            check_exact=True,
+        )
+
+    def test_expression_matrix_fold_slice_matches_full_matrix_then_slice(self):
+        index = pd.date_range("2024-01-01", periods=30, freq="15min")
+        base = pd.DataFrame(
+            {
+                "left": np.linspace(-1.0, 1.0, len(index)),
+                "right": np.arange(len(index), dtype=float),
+            },
+            index=index,
+        )
+        formulas = ["left", "ts_rank(right, 5)", "(left + right)"]
+        fold_index = index[10:23]
+        space = CryptoFeatureSpace(base, ["left", "right"])
+
+        full_matrix = space.matrix(formulas)
+        fold_matrix = space.matrix(formulas, fold_index)
+
+        pd.testing.assert_frame_equal(
+            fold_matrix,
+            full_matrix.loc[fold_index],
+            check_exact=True,
+        )
 
 
 def _synthetic_crypto_frame(n: int) -> pd.DataFrame:
