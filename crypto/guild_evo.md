@@ -57,8 +57,8 @@ LABEL_THRESHOLD = 0.0
 LABEL_MODE = "close_path_mean"
 LABEL_DIRECTION = "Long"
 PAYOFF_TP = 0.004
-TP_SAFE_CLOSE = 0.004
-SAFE_CLOSE_FLOOR = -0.002
+TP_SAFE_PATH = 0.004
+SAFE_ADVERSE_FLOOR = -0.002
 TRADE_COST = 0.002
 ```
 
@@ -110,11 +110,12 @@ Mode `payoff` mo phong gross payoff cua rule: cham TP thi tinh loi bang `PAYOFF_
 
 ```text
 entry = open(t+1)
-first_hit_h = horizon dau tien co high(t+h) / entry - 1 >= TP_SAFE_CLOSE
+first_hit_h = horizon dau tien co high(t+h) / entry - 1 >= TP_SAFE_PATH
+stop_h = horizon dau tien co low(t+h) / entry - 1 <= SAFE_ADVERSE_FLOOR
 label = first_hit_h ton tai va moi close_return tu H1 den truoc first_hit_h > label_threshold
 ```
 
-Mode nay dung de tim mau cham TP nhung duong close truoc khi cham TP khong bi xau qua. Neu khong truyen `--label-threshold`, mode nay tu dung `SAFE_CLOSE_FLOOR`; `TP_SAFE_CLOSE` la muc TP rieng, vi du `0.004` la `0.4%`.
+Mode nay dung adverse extreme theo quy tac stop-first. Voi Long, `low` duoc kiem tra truoc `high`; voi Short, `high` duoc kiem tra truoc `low`. Neu mot nen cham ca stop va TP thi label=0. Neu khong truyen `--label-threshold`, mode nay tu dung `SAFE_ADVERSE_FLOOR`; `TP_SAFE_PATH` la muc TP rieng, vi du `0.004` la `0.4%`.
 
 Co the override label mode bang CLI, khong can sua file config:
 
@@ -146,7 +147,7 @@ Luu y:
 - `--label-mode` va `--label-threshold` trong `crypto.analyze` la label/threshold dung de train lai va ve chart.
 - `--label-direction Long/Short` phai khop giua tien hoa, analyze, va train model production neu muon so sanh dung cung mot bai toan.
 - Neu `--label-mode payoff` va bo qua `--label-threshold`, threshold se la `TRADE_COST`; `PAYOFF_TP` chi quy dinh muc TP gross trong cong thuc payoff.
-- Neu `--label-mode safe_path_mfe`, `--label-threshold` la close floor, con TP lay tu `TP_SAFE_CLOSE`.
+- Neu `--label-mode safe_path_mfe`, `--label-threshold` la adverse low/high floor theo quy tac stop-first, con TP lay tu `TP_SAFE_PATH`.
 - Neu archive duoc tien hoa bang mode/threshold A nhung analyze bang mode/threshold B thi chart la ket qua tai danh gia theo B, khong phai score goc trong archive.
 
 ### Final split

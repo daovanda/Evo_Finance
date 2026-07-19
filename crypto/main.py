@@ -299,12 +299,13 @@ def _save_archive(
             "label_direction": label_direction,
             "label_threshold": label_threshold,
             "payoff_tp": config.PAYOFF_TP,
-            "tp_safe_close": config.TP_SAFE_CLOSE,
-            "safe_close_floor": (
+            "tp_safe_path": config.TP_SAFE_PATH,
+            "safe_adverse_floor": (
                 float(label_threshold)
                 if label_mode == "safe_path_mfe"
-                else float(config.SAFE_CLOSE_FLOOR)
+                else float(config.SAFE_ADVERSE_FLOOR)
             ),
+            "safe_path_rule": config.SAFE_PATH_RULE,
             "fitness_horizon_mode": config.FITNESS_HORIZON_MODE,
             "fitness": config.FITNESS_WEIGHTS,
             "trade_top_fraction": config.TRADE_TOP_FRACTION,
@@ -357,8 +358,15 @@ def _validate_resume_metadata(
     if label_mode == "payoff" and archive_label_mode == "payoff":
         checks.append(("payoff_tp", metadata.get("payoff_tp"), float(config.PAYOFF_TP)))
     if label_mode == "safe_path_mfe" and archive_label_mode == "safe_path_mfe":
+        archive_rule = metadata.get("safe_path_rule")
+        if archive_rule != config.SAFE_PATH_RULE:
+            raise ValueError(
+                "Resume archive uses an incompatible safe_path_mfe rule. "
+                f"Archive={resume_path}, archive rule={archive_rule!r}, "
+                f"required rule={config.SAFE_PATH_RULE!r}. Start a new archive."
+            )
         checks.append(
-            ("tp_safe_close", metadata.get("tp_safe_close"), float(config.TP_SAFE_CLOSE))
+            ("tp_safe_path", metadata.get("tp_safe_path"), float(config.TP_SAFE_PATH))
         )
 
     mismatches: list[str] = []
@@ -435,8 +443,9 @@ def main() -> None:
         default=None,
         help=(
             "Label threshold. Default is LABEL_THRESHOLD for ordinary modes, "
-            "TRADE_COST for payoff, and SAFE_CLOSE_FLOOR for safe_path_mfe. "
-            "For safe_path_mfe, TP is config.TP_SAFE_CLOSE."
+            "TRADE_COST for payoff, and SAFE_ADVERSE_FLOOR for safe_path_mfe. "
+            "For safe_path_mfe this is the stop-first adverse low/high floor; "
+            "TP is config.TP_SAFE_PATH."
         ),
     )
     parser.add_argument(

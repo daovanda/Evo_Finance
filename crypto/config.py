@@ -24,8 +24,9 @@ LABEL_THRESHOLD: float = 0.0  # label=1 when future_return > threshold
 LABEL_MODE: str = "close_path_mean"
 LABEL_DIRECTION: str = "Long"  # "Long" => price up is favorable, "Short" => price down is favorable
 PAYOFF_TP: float = 0.004  # only used by LABEL_MODE="payoff"
-TP_SAFE_CLOSE: float = 0.0035  # TP used by LABEL_MODE="safe_path_mfe"
-SAFE_CLOSE_FLOOR: float = -0.002  # close floor used by LABEL_MODE="safe_path_mfe"
+TP_SAFE_PATH: float = 0.003  # TP used by LABEL_MODE="safe_path_mfe"
+SAFE_ADVERSE_FLOOR: float = -0.0015  # stop-first low/high floor for safe_path_mfe
+SAFE_PATH_RULE: str = "adverse_stop_first_v1"
 
 
 LABEL_DIRECTION_ALIASES: dict[str, str] = {
@@ -110,32 +111,34 @@ def mfe_future_return(
 def safe_path_mfe_outcome(
     df: Any,
     horizon: int,
-    close_floor: float | None = None,
+    adverse_floor: float | None = None,
     direction: str | None = None,
 ) -> tuple[pd.Series, pd.Series]:
-    """Return checkpoint-strategy returns and the first-hit safe-path label.
+    """Return stop-first strategy returns and the first-hit safe-path label.
 
     For a signal at t, entry is open(t+1). The first horizon whose favorable
-    extreme reaches ``TP_SAFE_CLOSE`` is a positive label only when every
-    close from H1 up to the candle before that first hit remained above
-    ``close_floor`` relative to entry in the selected direction:
+    extreme reaches ``TP_SAFE_PATH`` is a positive label only when the
+    adverse extreme has remained strictly above ``adverse_floor`` through the
+    first-hit candle:
 
-        Long:  first_hit_h = first h where high_h / open_H1 - 1 >= TP_SAFE_CLOSE
-        Short: first_hit_h = first h where 1 - low_h / open_H1 >= TP_SAFE_CLOSE
-        label = first_hit_h exists and all close_h_before_first_hit > close_floor
+        Long:  first_hit_h = first h where high_h / open_H1 - 1 >= TP_SAFE_PATH
+               stopped when low_h / open_H1 - 1 <= adverse_floor
+        Short: first_hit_h = first h where 1 - low_h / open_H1 >= TP_SAFE_PATH
+               stopped when 1 - high_h / open_H1 <= adverse_floor
 
-    A TP hit is evaluated before that horizon's close because the live limit
-    order would already have exited the position.
+    The adverse extreme is evaluated before the favorable extreme on every
+    candle. If both TP and stop are touched in one OHLC candle, the sample is
+    conservatively treated as stopped and receives label 0.
 
-    The returned strategy outcome is TP on a valid first hit, the close return
-    at the first failed safety checkpoint, or the final close return when
-    neither event occurs. A complete h-candle path is required.
+    The returned strategy outcome is TP on a valid first hit, adverse_floor on
+    a stop, or the final close return when neither event occurs. A complete
+    h-candle path is required.
     """
     h = int(horizon)
     if h < 1:
         raise ValueError("horizon must be positive for safe_path_mfe.")
 
-    floor = float(SAFE_CLOSE_FLOOR if close_floor is None else close_floor)
+    floor = float(SAFE_ADVERSE_FLOOR if adverse_floor is None else adverse_floor)
     entry_open = df["open"].shift(-1)
     future_highs = pd.concat(
         [df["high"].shift(-offset) for offset in range(1, h + 1)],
@@ -151,8 +154,10 @@ def safe_path_mfe_outcome(
     )
     if canonical_label_direction(direction) == "short":
         hit_returns = directional_price_return(future_lows, entry_open, direction)
+        adverse_returns = directional_price_return(future_highs, entry_open, direction)
     else:
         hit_returns = directional_price_return(future_highs, entry_open, direction)
+        adverse_returns = directional_price_return(future_lows, entry_open, direction)
     close_returns = directional_price_return(future_closes, entry_open, direction)
     complete_path = (
         entry_open.notna()
@@ -165,14 +170,14 @@ def safe_path_mfe_outcome(
     label = pd.Series(False, index=df.index, dtype="bool")
     outcome = pd.Series(float("nan"), index=df.index, dtype="float64")
     for position in range(h):
-        hit_now = active & hit_returns.iloc[:, position].ge(float(TP_SAFE_CLOSE))
-        label.loc[hit_now] = True
-        outcome.loc[hit_now] = float(TP_SAFE_CLOSE)
-        active.loc[hit_now] = False
+        stopped_now = active & adverse_returns.iloc[:, position].le(floor)
+        outcome.loc[stopped_now] = floor
+        active.loc[stopped_now] = False
 
-        unsafe_close = active & close_returns.iloc[:, position].le(floor)
-        outcome.loc[unsafe_close] = close_returns.iloc[:, position].loc[unsafe_close]
-        active.loc[unsafe_close] = False
+        hit_now = active & hit_returns.iloc[:, position].ge(float(TP_SAFE_PATH))
+        label.loc[hit_now] = True
+        outcome.loc[hit_now] = float(TP_SAFE_PATH)
+        active.loc[hit_now] = False
 
     outcome.loc[active] = close_returns.iloc[:, -1].loc[active]
     label_float = label.astype("float64").where(complete_path)
@@ -354,7 +359,7 @@ def default_label_threshold(mode: str | None = None, threshold: float | None = N
     if selected_mode == "payoff":
         return float(TRADE_COST)
     if selected_mode == "safe_path_mfe":
-        return float(SAFE_CLOSE_FLOOR)
+        return float(SAFE_ADVERSE_FLOOR)
     return float(LABEL_THRESHOLD)
 
 
@@ -374,7 +379,7 @@ WF_PURGE_BARS: int | None = None  # None => max(HOLDING_HORIZONS) + 1
 
 # Safe feature construction. All features are time-series/ratio normalized;
 # raw price/volume scale columns are intentionally not selectable.
-WINDOWS: list[int] = [2, 3, 5, 7, 10, 14, 30, 40, 60, 80, 120, 240, 400, 480]
+WINDOWS: list[int] = [1, 2, 3, 4, 5, 7, 10, 14, 20, 30, 40, 50, 60, 80, 120, 160, 240, 320, 400, 480]
 # WINDOWS: list[int] = [3, 5, 10, 15, 30, 60, 120, 240, 480, 960, 1440]
 FEATURE_MIN_VALID_RATIO: float = 0.70
 FEATURE_MAX_DOMINANT_VALUE_RATIO: float = 0.985
@@ -390,7 +395,7 @@ EVOLUTION_GC_EVERY: int = 25  # iterations; 0 disables explicit garbage collecti
 # Individual/evolution knobs.
 FEATURE_MIN: int = 4
 FEATURE_MAX: int = 24
-ARCHIVE_SIZE: int = 50
+ARCHIVE_SIZE: int = 50 
 TIME_BUDGET_SECONDS: float = 3600.0
 RESTART_PROB: float = 0.001
 CHECKPOINT_EVERY_SECONDS: float = 12 * 60 * 60
@@ -407,13 +412,13 @@ FITNESS_HORIZON_MODE: str = "mean"  # "mean" keeps old behavior; "ensemble" requ
 TRADE_TOP_FRACTION: float = 0.1
 
 MIN_TRADES_PER_SPLIT: int = 20
-TRADE_COST: float = 0.001  # 0.1% Futures round-trip fee plus slippage allowance
+TRADE_COST: float = 0.0005  # 0.1% Futures round-trip fee plus slippage allowance
 RETURN_SCORE_SCALE: float = 0.01
 BAD_AUC_THRESHOLD: float = 0.50
 
 FITNESS_WEIGHTS: dict[str, float] = {
     "auc_edge": 0.40,
-    "precision_excess": 0.50,  #old: 0.30
+    "precision_excess": 0.30,  #old: 0.30
     "trade_return_score": 0.20, #old: 0.20
     "auc_std": -0.20, #old: -0.20
     "overfit_gap": -0.25, #old: -0.25
@@ -464,10 +469,10 @@ def validate_config() -> None:
     canonical_label_direction()
     if PAYOFF_TP <= 0:
         raise ValueError("PAYOFF_TP must be positive.")
-    if not isfinite(float(TP_SAFE_CLOSE)) or TP_SAFE_CLOSE <= 0:
-        raise ValueError("TP_SAFE_CLOSE must be finite and positive.")
-    if not isfinite(float(SAFE_CLOSE_FLOOR)):
-        raise ValueError("SAFE_CLOSE_FLOOR must be finite.")
+    if not isfinite(float(TP_SAFE_PATH)) or TP_SAFE_PATH <= 0:
+        raise ValueError("TP_SAFE_PATH must be finite and positive.")
+    if not isfinite(float(SAFE_ADVERSE_FLOOR)):
+        raise ValueError("SAFE_ADVERSE_FLOOR must be finite.")
     if FEATURE_MIN < 1 or FEATURE_MAX < FEATURE_MIN:
         raise ValueError("Require 1 <= FEATURE_MIN <= FEATURE_MAX.")
     if EXPR_MAX_DEPTH < 1:

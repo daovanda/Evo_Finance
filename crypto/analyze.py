@@ -1090,7 +1090,7 @@ def _is_exit_after_h2_mode(label_mode: str) -> bool:
 
 def _mfe_threshold_for_mode(label_mode: str, label_threshold: float) -> float:
     if config.canonical_label_mode(label_mode) == "safe_path_mfe":
-        return float(config.TP_SAFE_CLOSE)
+        return float(config.TP_SAFE_PATH)
     return float(label_threshold)
 
 
@@ -1104,7 +1104,7 @@ def _label_settings_text(
     if mode == "safe_path_mfe":
         return (
             f"mode={mode} | direction={direction} | floor={float(label_threshold):.4g} | "
-            f"tp={float(config.TP_SAFE_CLOSE):.4g}"
+            f"tp={float(config.TP_SAFE_PATH):.4g}"
         )
     return f"mode={mode} | direction={direction} | thr={float(label_threshold):.4g}"
 
@@ -1119,7 +1119,7 @@ def _label_filename_suffix(
     threshold_name = _threshold_filename_token(float(label_threshold))
     suffix = f"mode_{mode_name}_{direction_name}_thr_{threshold_name}"
     if config.canonical_label_mode(label_mode) == "safe_path_mfe":
-        tp_name = _threshold_filename_token(float(config.TP_SAFE_CLOSE))
+        tp_name = _threshold_filename_token(float(config.TP_SAFE_PATH))
         suffix += f"_tp_{tp_name}"
     return suffix
 
@@ -2258,8 +2258,8 @@ def main() -> None:
         help=(
             "Label threshold used when recalculating labels. Default is "
             "LABEL_THRESHOLD for ordinary modes, TRADE_COST for payoff, and "
-            "SAFE_CLOSE_FLOOR for safe_path_mfe. For safe_path_mfe, TP is "
-            "config.TP_SAFE_CLOSE."
+            "SAFE_ADVERSE_FLOOR for safe_path_mfe. For safe_path_mfe this is "
+            "the stop-first adverse low/high floor; TP is config.TP_SAFE_PATH."
         ),
     )
     args = parser.parse_args()

@@ -536,12 +536,13 @@ def _config_snapshot(
         "label_direction": label_direction,
         "label_threshold": float(label_threshold),
         "payoff_tp": float(config.PAYOFF_TP),
-        "tp_safe_close": float(config.TP_SAFE_CLOSE),
-        "safe_close_floor": (
+        "tp_safe_path": float(config.TP_SAFE_PATH),
+        "safe_adverse_floor": (
             float(label_threshold)
             if label_mode == "safe_path_mfe"
-            else float(config.SAFE_CLOSE_FLOOR)
+            else float(config.SAFE_ADVERSE_FLOOR)
         ),
+        "safe_path_rule": config.SAFE_PATH_RULE,
         "trade_cost": float(config.TRADE_COST),
         "val_start": val_start,
         "test_start": test_start,
@@ -571,7 +572,7 @@ def _entry_id(
     if str(label_mode).strip().lower() == "payoff":
         suffix = f"_tp_{_threshold_token(float(config.PAYOFF_TP))}"
     elif str(label_mode).strip().lower() == "safe_path_mfe":
-        suffix = f"_tp_{_threshold_token(float(config.TP_SAFE_CLOSE))}"
+        suffix = f"_tp_{_threshold_token(float(config.TP_SAFE_PATH))}"
     return _safe_name(
         f"{Path(archive_path).stem}_r{int(rank):02d}_{label_mode}_{label_direction}_thr_"
         f"{_threshold_token(float(label_threshold))}{suffix}"
@@ -727,8 +728,8 @@ def main() -> None:
         help=(
             "Label threshold used when training production models. Default is "
             "LABEL_THRESHOLD for ordinary modes, TRADE_COST for payoff, and "
-            "SAFE_CLOSE_FLOOR for safe_path_mfe. For safe_path_mfe, TP is "
-            "config.TP_SAFE_CLOSE."
+            "SAFE_ADVERSE_FLOOR for safe_path_mfe. For safe_path_mfe this is "
+            "the stop-first adverse low/high floor; TP is config.TP_SAFE_PATH."
         ),
     )
     args = parser.parse_args()

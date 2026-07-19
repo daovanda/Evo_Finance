@@ -326,15 +326,15 @@ class CryptoPipelineTests(unittest.TestCase):
         self.assertAlmostEqual(mfe_labeled["future_return_h3"].iloc[0], 0.015)
         self.assertEqual(mfe_labeled["label_h3"].iloc[0], 1.0)
 
-    def test_safe_path_mfe_uses_first_hit_and_all_prior_safe_closes(self):
+    def test_long_safe_path_mfe_uses_stop_first_adverse_lows(self):
         idx = pd.date_range("2024-01-01", periods=6, freq="15min")
 
-        def labeled_for(highs, closes, threshold=None):
+        def labeled_for(highs, lows, closes):
             frame = pd.DataFrame(
                 {
                     "open": [100.0] * 6,
                     "high": [100.0, *highs],
-                    "low": [99.0] * 6,
+                    "low": [100.0, *lows],
                     "close": [100.0, *closes],
                     "volume": [10.0] * 6,
                     "trade_count": [10] * 6,
@@ -347,48 +347,62 @@ class CryptoPipelineTests(unittest.TestCase):
                 frame,
                 horizons=[5],
                 label_mode="safe_path_mfe",
-                threshold=threshold,
+                threshold=-0.002,
             )
 
-        old_tp = config.TP_SAFE_CLOSE
+        old_tp = config.TP_SAFE_PATH
         try:
-            config.TP_SAFE_CLOSE = 0.004
+            config.TP_SAFE_PATH = 0.004
 
-            hit_h1 = labeled_for(
+            clean_hit_h1 = labeled_for(
                 highs=[100.4, 100.0, 100.0, 100.0, 100.0],
-                closes=[99.0, 100.0, 100.0, 100.0, 100.0],
+                lows=[99.9, 99.9, 99.9, 99.9, 99.9],
+                closes=[100.1, 100.0, 100.0, 100.0, 100.0],
             )
-            self.assertEqual(hit_h1["label_h5"].iloc[0], 1.0)
-            self.assertAlmostEqual(hit_h1["future_return_h5"].iloc[0], 0.004)
+            self.assertEqual(clean_hit_h1["label_h5"].iloc[0], 1.0)
+            self.assertAlmostEqual(clean_hit_h1["future_return_h5"].iloc[0], 0.004)
+
+            both_hit_and_stop_h1 = labeled_for(
+                highs=[100.4, 100.0, 100.0, 100.0, 100.0],
+                lows=[99.8, 99.9, 99.9, 99.9, 99.9],
+                closes=[100.1, 100.0, 100.0, 100.0, 100.0],
+            )
+            self.assertEqual(both_hit_and_stop_h1["label_h5"].iloc[0], 0.0)
+            self.assertAlmostEqual(
+                both_hit_and_stop_h1["future_return_h5"].iloc[0],
+                -0.002,
+            )
 
             clean_h3 = labeled_for(
                 highs=[100.1, 100.2, 100.4, 100.0, 100.0],
-                closes=[99.9, 99.85, 100.0, 100.0, 100.0],
+                lows=[99.9, 99.85, 99.9, 99.9, 99.9],
+                closes=[100.0, 100.0, 100.1, 100.0, 100.0],
             )
             self.assertEqual(clean_h3["label_h5"].iloc[0], 1.0)
             self.assertAlmostEqual(clean_h3["future_return_h5"].iloc[0], 0.004)
 
-            unsafe_before_h3 = labeled_for(
+            stopped_before_h3 = labeled_for(
                 highs=[100.1, 100.2, 100.4, 100.0, 100.0],
-                closes=[99.9, 99.7, 100.0, 100.0, 100.0],
+                lows=[99.9, 99.7, 99.9, 99.9, 99.9],
+                closes=[100.0, 99.9, 100.1, 100.0, 100.0],
             )
-            self.assertEqual(unsafe_before_h3["label_h5"].iloc[0], 0.0)
+            self.assertEqual(stopped_before_h3["label_h5"].iloc[0], 0.0)
             self.assertAlmostEqual(
-                unsafe_before_h3["future_return_h5"].iloc[0],
-                -0.003,
+                stopped_before_h3["future_return_h5"].iloc[0],
+                -0.002,
             )
-            self.assertTrue(unsafe_before_h3["label_h5"].iloc[1:].isna().all())
+            self.assertTrue(stopped_before_h3["label_h5"].iloc[1:].isna().all())
         finally:
-            config.TP_SAFE_CLOSE = old_tp
+            config.TP_SAFE_PATH = old_tp
 
-    def test_safe_path_mfe_threshold_overrides_default_close_floor(self):
+    def test_safe_path_mfe_threshold_overrides_default_adverse_floor(self):
         idx = pd.date_range("2024-01-01", periods=4, freq="15min")
         frame = pd.DataFrame(
             {
                 "open": [100.0] * 4,
                 "high": [100.0, 100.1, 100.4, 100.0],
-                "low": [99.0] * 4,
-                "close": [100.0, 99.85, 100.0, 100.0],
+                "low": [100.0, 99.85, 99.9, 99.9],
+                "close": [100.0, 100.0, 100.1, 100.0],
                 "volume": [10.0] * 4,
                 "trade_count": [10] * 4,
                 "taker_buy_base_volume": [5.0] * 4,
@@ -396,13 +410,14 @@ class CryptoPipelineTests(unittest.TestCase):
             },
             index=idx,
         )
-        old_tp = config.TP_SAFE_CLOSE
+        old_tp = config.TP_SAFE_PATH
         try:
-            config.TP_SAFE_CLOSE = 0.004
+            config.TP_SAFE_PATH = 0.004
             default_floor = add_binary_labels(
                 frame,
                 horizons=[2],
                 label_mode="safe_path_mfe",
+                threshold=-0.002,
             )
             tighter_floor = add_binary_labels(
                 frame,
@@ -411,29 +426,29 @@ class CryptoPipelineTests(unittest.TestCase):
                 threshold=-0.001,
             )
         finally:
-            config.TP_SAFE_CLOSE = old_tp
+            config.TP_SAFE_PATH = old_tp
 
         self.assertEqual(default_floor["label_h2"].iloc[0], 1.0)
         self.assertEqual(tighter_floor["label_h2"].iloc[0], 0.0)
 
-    def test_safe_path_mfe_is_registered_with_its_close_floor_default(self):
+    def test_safe_path_mfe_is_registered_with_its_adverse_floor_default(self):
         self.assertEqual(
             config.default_label_threshold("safe_path_mfe"),
-            config.SAFE_CLOSE_FLOOR,
+            config.SAFE_ADVERSE_FLOOR,
         )
         self.assertIs(
             config.get_label_return_fn("safe_path_mfe"),
             config.safe_path_mfe_future_return,
         )
 
-    def test_short_safe_path_mfe_uses_low_hit_and_prior_close_floor(self):
+    def test_short_safe_path_mfe_uses_stop_first_adverse_highs(self):
         idx = pd.date_range("2024-01-01", periods=6, freq="15min")
 
-        def labeled_for(lows, closes):
+        def labeled_for(highs, lows, closes):
             frame = pd.DataFrame(
                 {
                     "open": [100.0] * 6,
-                    "high": [101.0] * 6,
+                    "high": [100.0, *highs],
                     "low": [100.0, *lows],
                     "close": [100.0, *closes],
                     "volume": [10.0] * 6,
@@ -448,37 +463,52 @@ class CryptoPipelineTests(unittest.TestCase):
                 horizons=[5],
                 label_mode="safe_path_mfe",
                 label_direction="Short",
+                threshold=-0.002,
             )
 
-        old_tp = config.TP_SAFE_CLOSE
+        old_tp = config.TP_SAFE_PATH
         try:
-            config.TP_SAFE_CLOSE = 0.004
+            config.TP_SAFE_PATH = 0.004
 
-            hit_h1 = labeled_for(
+            clean_hit_h1 = labeled_for(
+                highs=[100.1, 100.1, 100.1, 100.1, 100.1],
                 lows=[99.6, 100.0, 100.0, 100.0, 100.0],
-                closes=[101.0, 100.0, 100.0, 100.0, 100.0],
+                closes=[99.9, 100.0, 100.0, 100.0, 100.0],
             )
-            self.assertEqual(hit_h1["label_h5"].iloc[0], 1.0)
-            self.assertAlmostEqual(hit_h1["future_return_h5"].iloc[0], 0.004)
+            self.assertEqual(clean_hit_h1["label_h5"].iloc[0], 1.0)
+            self.assertAlmostEqual(clean_hit_h1["future_return_h5"].iloc[0], 0.004)
+
+            both_hit_and_stop_h1 = labeled_for(
+                highs=[100.2, 100.1, 100.1, 100.1, 100.1],
+                lows=[99.6, 100.0, 100.0, 100.0, 100.0],
+                closes=[99.9, 100.0, 100.0, 100.0, 100.0],
+            )
+            self.assertEqual(both_hit_and_stop_h1["label_h5"].iloc[0], 0.0)
+            self.assertAlmostEqual(
+                both_hit_and_stop_h1["future_return_h5"].iloc[0],
+                -0.002,
+            )
 
             clean_h3 = labeled_for(
+                highs=[100.1, 100.15, 100.1, 100.1, 100.1],
                 lows=[99.9, 99.8, 99.6, 100.0, 100.0],
-                closes=[100.1, 100.15, 100.0, 100.0, 100.0],
+                closes=[100.0, 100.0, 99.9, 100.0, 100.0],
             )
             self.assertEqual(clean_h3["label_h5"].iloc[0], 1.0)
             self.assertAlmostEqual(clean_h3["future_return_h5"].iloc[0], 0.004)
 
-            unsafe_before_h3 = labeled_for(
+            stopped_before_h3 = labeled_for(
+                highs=[100.1, 100.3, 100.1, 100.1, 100.1],
                 lows=[99.9, 99.8, 99.6, 100.0, 100.0],
-                closes=[100.1, 100.3, 100.0, 100.0, 100.0],
+                closes=[100.0, 100.1, 99.9, 100.0, 100.0],
             )
-            self.assertEqual(unsafe_before_h3["label_h5"].iloc[0], 0.0)
+            self.assertEqual(stopped_before_h3["label_h5"].iloc[0], 0.0)
             self.assertAlmostEqual(
-                unsafe_before_h3["future_return_h5"].iloc[0],
-                -0.003,
+                stopped_before_h3["future_return_h5"].iloc[0],
+                -0.002,
             )
         finally:
-            config.TP_SAFE_CLOSE = old_tp
+            config.TP_SAFE_PATH = old_tp
 
     def test_close_path_mean_label_uses_mean_future_closes_from_next_open(self):
         idx = pd.date_range("2024-01-01", periods=6, freq="15min")
@@ -625,23 +655,24 @@ class CryptoPipelineTests(unittest.TestCase):
             )
 
     def test_resume_metadata_mismatch_checks_safe_path_tp(self):
-        old_tp = config.TP_SAFE_CLOSE
+        old_tp = config.TP_SAFE_PATH
         try:
-            config.TP_SAFE_CLOSE = 0.004
+            config.TP_SAFE_PATH = 0.004
             archive = CryptoArchive(
                 metadata={
                     "horizons": [5],
                     "label_mode": "safe_path_mfe",
                     "label_direction": "long",
                     "label_threshold": -0.002,
-                    "tp_safe_close": 0.003,
+                    "tp_safe_path": 0.003,
+                    "safe_path_rule": config.SAFE_PATH_RULE,
                     "fitness_horizon_mode": config.FITNESS_HORIZON_MODE,
                     "trade_top_fraction": config.TRADE_TOP_FRACTION,
                     "trade_cost": config.TRADE_COST,
                 }
             )
 
-            with self.assertRaisesRegex(ValueError, "tp_safe_close"):
+            with self.assertRaisesRegex(ValueError, "tp_safe_path"):
                 _validate_resume_metadata(
                     archive=archive,
                     resume_path=Path("archive.json"),
@@ -651,7 +682,31 @@ class CryptoPipelineTests(unittest.TestCase):
                     label_threshold=-0.002,
                 )
         finally:
-            config.TP_SAFE_CLOSE = old_tp
+            config.TP_SAFE_PATH = old_tp
+
+    def test_resume_rejects_legacy_safe_path_rule(self):
+        archive = CryptoArchive(
+            metadata={
+                "horizons": [5],
+                "label_mode": "safe_path_mfe",
+                "label_direction": "long",
+                "label_threshold": -0.002,
+                "tp_safe_path": config.TP_SAFE_PATH,
+                "fitness_horizon_mode": config.FITNESS_HORIZON_MODE,
+                "trade_top_fraction": config.TRADE_TOP_FRACTION,
+                "trade_cost": config.TRADE_COST,
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "incompatible safe_path_mfe rule"):
+            _validate_resume_metadata(
+                archive=archive,
+                resume_path=Path("legacy_safe_path.json"),
+                horizons=[5],
+                label_mode="safe_path_mfe",
+                label_direction="long",
+                label_threshold=-0.002,
+            )
 
     def test_label_mode_mfe_is_used_by_default_labeling(self):
         idx = pd.date_range("2024-01-01", periods=5, freq="15min")

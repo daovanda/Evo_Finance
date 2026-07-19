@@ -100,7 +100,7 @@ def add_binary_labels(
             future_return, explicit_label = config.safe_path_mfe_outcome(
                 labeled,
                 h,
-                close_floor=float(label_threshold),
+                adverse_floor=float(label_threshold),
                 direction=selected_direction,
             )
             labeled[f"future_return_h{h}"] = future_return
