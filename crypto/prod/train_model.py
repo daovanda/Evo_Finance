@@ -543,6 +543,7 @@ def _config_snapshot(
             else float(config.SAFE_ADVERSE_FLOOR)
         ),
         "safe_path_rule": config.SAFE_PATH_RULE,
+        "precision_only": label_mode == "adverse_floor",
         "trade_cost": float(config.TRADE_COST),
         "val_start": val_start,
         "test_start": test_start,
@@ -729,7 +730,8 @@ def main() -> None:
             "Label threshold used when training production models. Default is "
             "LABEL_THRESHOLD for ordinary modes, TRADE_COST for payoff, and "
             "SAFE_ADVERSE_FLOOR for safe_path_mfe. For safe_path_mfe this is "
-            "the stop-first adverse low/high floor; TP is config.TP_SAFE_PATH."
+            "the stop-first adverse low/high floor; TP is config.TP_SAFE_PATH. "
+            "For adverse_floor use a positive distance such as 0.003."
         ),
     )
     args = parser.parse_args()

@@ -108,6 +108,39 @@ def mfe_future_return(
     return directional_price_return(max_high, entry_open, direction)
 
 
+def adverse_floor_future_return(
+    df: Any,
+    horizon: int,
+    direction: str | None = None,
+) -> Any:
+    """Worst adverse excursion from the next-candle entry open.
+
+    Long uses the minimum low from H1 through Hh. Short uses the maximum
+    high over the same path and converts it to a directional return. The
+    result is normally non-positive; ``crypto.data.add_binary_labels`` uses
+    it only to build the adverse-floor label and passes a zero return to
+    fitness.
+    """
+    h = int(horizon)
+    if h < 1:
+        raise ValueError("horizon must be positive for adverse_floor.")
+
+    entry_open = df["open"].shift(-1)
+    future_highs = pd.concat(
+        [df["high"].shift(-offset) for offset in range(1, h + 1)],
+        axis=1,
+    )
+    future_lows = pd.concat(
+        [df["low"].shift(-offset) for offset in range(1, h + 1)],
+        axis=1,
+    )
+    if canonical_label_direction(direction) == "short":
+        adverse_price = future_highs.max(axis=1, skipna=False)
+    else:
+        adverse_price = future_lows.min(axis=1, skipna=False)
+    return directional_price_return(adverse_price, entry_open, direction)
+
+
 def safe_path_mfe_outcome(
     df: Any,
     horizon: int,
@@ -325,6 +358,7 @@ LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
     "close_exit": close_exit_future_return,
     "close_path_mean": close_path_mean_future_return,
     "mfe": mfe_future_return,
+    "adverse_floor": adverse_floor_future_return,
     "safe_path_mfe": safe_path_mfe_future_return,
     "payoff": payoff_future_return,
     "exit_after_h1": exit_after_h1_future_return,
@@ -379,7 +413,7 @@ WF_PURGE_BARS: int | None = None  # None => max(HOLDING_HORIZONS) + 1
 
 # Safe feature construction. All features are time-series/ratio normalized;
 # raw price/volume scale columns are intentionally not selectable.
-WINDOWS: list[int] = [1, 2, 3, 4, 5, 7, 10, 14, 20, 30, 40, 50, 60, 80, 120, 160, 240, 320, 400, 480]
+WINDOWS: list[int] = [1, 2, 3, 4, 5, 7, 10, 14, 20, 30, 40, 50, 60, 80, 120, 160, 240, 320, 400, 480, 600, 800, 960, 1200, 1440]
 # WINDOWS: list[int] = [3, 5, 10, 15, 30, 60, 120, 240, 480, 960, 1440]
 FEATURE_MIN_VALID_RATIO: float = 0.70
 FEATURE_MAX_DOMINANT_VALUE_RATIO: float = 0.985
@@ -418,7 +452,7 @@ BAD_AUC_THRESHOLD: float = 0.50
 
 FITNESS_WEIGHTS: dict[str, float] = {
     "auc_edge": 0.40,
-    "precision_excess": 0.30,  #old: 0.30
+    "precision_excess": 0.50,  #old: 0.30
     "trade_return_score": 0.20, #old: 0.20
     "auc_std": -0.20, #old: -0.20
     "overfit_gap": -0.25, #old: -0.25

@@ -36,11 +36,13 @@ class CryptoFitnessEvaluator:
         lgbm_params: dict | None = None,
         num_boost_round: int = config.LGBM_NUM_BOOST_ROUND,
         early_stopping_rounds: int = config.LGBM_EARLY_STOPPING,
+        precision_only: bool = False,
     ):
         self.horizons = [int(h) for h in horizons]
         self.lgbm_params = dict(lgbm_params or config.LGBM_PARAMS)
         self.num_boost_round = int(num_boost_round)
         self.early_stopping_rounds = int(early_stopping_rounds)
+        self.precision_only = bool(precision_only)
 
     def evaluate_walk_forward(
         self,
@@ -449,6 +451,7 @@ class CryptoFitnessEvaluator:
             y_true=train_exit[exit_label_col],
             pred_df=train_pred_df,
             future_return=train_exit[exit_ret_col],
+            charge_trade_cost=not self.precision_only,
         )
         val_thresholds = _ensemble_thresholds(val_pred_df)
         val_metrics = _ensemble_trade_metrics(
@@ -456,12 +459,14 @@ class CryptoFitnessEvaluator:
             pred_df=val_pred_df,
             future_return=val_exit[exit_ret_col],
             thresholds=val_thresholds,
+            charge_trade_cost=not self.precision_only,
         )
         test_metrics = _ensemble_trade_metrics(
             y_true=test_exit[exit_label_col],
             pred_df=test_pred_df,
             future_return=test_exit[exit_ret_col],
             thresholds=val_thresholds,
+            charge_trade_cost=not self.precision_only,
         )
 
         return {
@@ -482,7 +487,10 @@ class CryptoFitnessEvaluator:
             "final_val_bad_ratio": float(
                 val_metrics.auc <= config.BAD_AUC_THRESHOLD
                 or val_metrics.precision_excess <= 0.0
-                or val_metrics.trade_return_score <= 0.0
+                or (
+                    not self.precision_only
+                    and val_metrics.trade_return_score <= 0.0
+                )
             ),
             "final_test_mean_auc": float(test_metrics.auc),
             "final_test_auc_edge": float(test_metrics.auc - 0.5),
@@ -495,7 +503,10 @@ class CryptoFitnessEvaluator:
             "final_test_bad_ratio": float(
                 test_metrics.auc <= config.BAD_AUC_THRESHOLD
                 or test_metrics.precision_excess <= 0.0
-                or test_metrics.trade_return_score <= 0.0
+                or (
+                    not self.precision_only
+                    and test_metrics.trade_return_score <= 0.0
+                )
             ),
             "final_val_overfit_gap": float(max(0.0, train_metrics.auc - val_metrics.auc)),
             "final_test_overfit_gap": float(max(0.0, train_metrics.auc - test_metrics.auc)),
@@ -531,8 +542,16 @@ class CryptoFitnessEvaluator:
         y_val = val[label_col].astype(int)
 
         if y_train.nunique() < 2 or y_val.nunique() < 2:
-            train_metrics = _neutral_metrics(y_train, train[ret_col])
-            val_metrics = _neutral_metrics(y_val, val[ret_col])
+            train_metrics = _neutral_metrics(
+                y_train,
+                train[ret_col],
+                charge_trade_cost=not self.precision_only,
+            )
+            val_metrics = _neutral_metrics(
+                y_val,
+                val[ret_col],
+                charge_trade_cost=not self.precision_only,
+            )
         else:
             booster = self._train_booster(X_train, y_train, X_val, y_val)
             train_pred = pd.Series(booster.predict(X_train), index=train.index)
@@ -542,18 +561,23 @@ class CryptoFitnessEvaluator:
                 y_true=y_train,
                 pred=train_pred,
                 future_return=train[ret_col],
+                charge_trade_cost=not self.precision_only,
             )
             val_metrics = _classification_trade_metrics(
                 y_true=y_val,
                 pred=val_pred,
                 future_return=val[ret_col],
+                charge_trade_cost=not self.precision_only,
             )
 
         overfit_gap = max(0.0, train_metrics.auc - val_metrics.auc)
         bad_fold = float(
             val_metrics.auc <= config.BAD_AUC_THRESHOLD
             or val_metrics.precision_excess <= 0.0
-            or val_metrics.trade_return_score <= 0.0
+            or (
+                not self.precision_only
+                and val_metrics.trade_return_score <= 0.0
+            )
         )
         return {
             "horizon": float(horizon),
@@ -645,18 +669,23 @@ class CryptoFitnessEvaluator:
             y_true=train_exit[exit_label_col],
             pred_df=train_pred_df,
             future_return=train_exit[exit_ret_col],
+            charge_trade_cost=not self.precision_only,
         )
         val_metrics = _ensemble_trade_metrics(
             y_true=val_exit[exit_label_col],
             pred_df=val_pred_df,
             future_return=val_exit[exit_ret_col],
+            charge_trade_cost=not self.precision_only,
         )
 
         overfit_gap = max(0.0, train_metrics.auc - val_metrics.auc)
         bad_fold = float(
             val_metrics.auc <= config.BAD_AUC_THRESHOLD
             or val_metrics.precision_excess <= 0.0
-            or val_metrics.trade_return_score <= 0.0
+            or (
+                not self.precision_only
+                and val_metrics.trade_return_score <= 0.0
+            )
             or val_metrics.n_trades <= 0
         )
         return {
@@ -704,9 +733,21 @@ class CryptoFitnessEvaluator:
         y_test = test[label_col].astype(int)
 
         if y_train.nunique() < 2:
-            train_metrics = _neutral_metrics(y_train, train[ret_col])
-            val_metrics = _neutral_metrics(y_val, val[ret_col])
-            test_metrics = _neutral_metrics(y_test, test[ret_col])
+            train_metrics = _neutral_metrics(
+                y_train,
+                train[ret_col],
+                charge_trade_cost=not self.precision_only,
+            )
+            val_metrics = _neutral_metrics(
+                y_val,
+                val[ret_col],
+                charge_trade_cost=not self.precision_only,
+            )
+            test_metrics = _neutral_metrics(
+                y_test,
+                test[ret_col],
+                charge_trade_cost=not self.precision_only,
+            )
         else:
             booster = self._train_booster_final(X_train, y_train, X_val, y_val)
             train_pred = pd.Series(booster.predict(X_train), index=train.index)
@@ -717,27 +758,36 @@ class CryptoFitnessEvaluator:
                 y_true=y_train,
                 pred=train_pred,
                 future_return=train[ret_col],
+                charge_trade_cost=not self.precision_only,
             )
             val_metrics = _classification_trade_metrics(
                 y_true=y_val,
                 pred=val_pred,
                 future_return=val[ret_col],
+                charge_trade_cost=not self.precision_only,
             )
             test_metrics = _classification_trade_metrics(
                 y_true=y_test,
                 pred=test_pred,
                 future_return=test[ret_col],
+                charge_trade_cost=not self.precision_only,
             )
 
         val_bad = float(
             val_metrics.auc <= config.BAD_AUC_THRESHOLD
             or val_metrics.precision_excess <= 0.0
-            or val_metrics.trade_return_score <= 0.0
+            or (
+                not self.precision_only
+                and val_metrics.trade_return_score <= 0.0
+            )
         )
         test_bad = float(
             test_metrics.auc <= config.BAD_AUC_THRESHOLD
             or test_metrics.precision_excess <= 0.0
-            or test_metrics.trade_return_score <= 0.0
+            or (
+                not self.precision_only
+                and test_metrics.trade_return_score <= 0.0
+            )
         )
         return {
             "horizon": float(horizon),
@@ -876,6 +926,7 @@ def _classification_trade_metrics(
     y_true: pd.Series,
     pred: pd.Series,
     future_return: pd.Series,
+    charge_trade_cost: bool = True,
 ) -> SplitMetrics:
     data = (
         pd.DataFrame({"y": y_true, "pred": pred, "ret": future_return})
@@ -894,7 +945,9 @@ def _classification_trade_metrics(
     )
     traded = data.nlargest(n_trades, "pred")
     precision = float(traded["y"].mean()) if n_trades else 0.0
-    net_return = traded["ret"].astype(float) - float(config.TRADE_COST)
+    net_return = traded["ret"].astype(float)
+    if charge_trade_cost:
+        net_return = net_return - float(config.TRADE_COST)
     trade_return_mean = float(net_return.mean()) if len(net_return) else 0.0
     trade_return_score = float(
         np.clip(trade_return_mean / float(config.RETURN_SCORE_SCALE), -1.0, 1.0)
@@ -916,6 +969,7 @@ def _ensemble_trade_metrics(
     pred_df: pd.DataFrame,
     future_return: pd.Series,
     thresholds: dict[str, float] | None = None,
+    charge_trade_cost: bool = True,
 ) -> SplitMetrics:
     data = (
         pd.concat(
@@ -951,7 +1005,9 @@ def _ensemble_trade_metrics(
 
     traded = data[selected_mask]
     precision = float(traded["y"].mean()) if len(traded) else 0.0
-    net_return = traded["ret"].astype(float) - float(config.TRADE_COST)
+    net_return = traded["ret"].astype(float)
+    if charge_trade_cost:
+        net_return = net_return - float(config.TRADE_COST)
     trade_return_mean = float(net_return.mean()) if len(net_return) else 0.0
     trade_return_score = float(
         np.clip(trade_return_mean / float(config.RETURN_SCORE_SCALE), -1.0, 1.0)
@@ -1021,11 +1077,17 @@ def _internal_early_stop_split(
     return X_fit, y_fit, X_stop, y_stop
 
 
-def _neutral_metrics(y_true: pd.Series, future_return: pd.Series) -> SplitMetrics:
+def _neutral_metrics(
+    y_true: pd.Series,
+    future_return: pd.Series,
+    charge_trade_cost: bool = True,
+) -> SplitMetrics:
     base_rate = float(pd.to_numeric(y_true, errors="coerce").dropna().mean() or 0.0)
     mean_return = float(
         pd.to_numeric(future_return, errors="coerce").dropna().mean() or 0.0
-    ) - float(config.TRADE_COST)
+    )
+    if charge_trade_cost:
+        mean_return -= float(config.TRADE_COST)
     return SplitMetrics(
         auc=0.5,
         precision_at_trade=base_rate,

@@ -1,8 +1,51 @@
 """Analyze crypto archive individuals on final val/test splits.
 
-Example:
-    python -m crypto.analyze --archive crypto/results/crypto_btc_seed1_12h.json --top 5
-    python -m crypto.analyze --archive crypto/results/crypto_btc_seed1_12h.json --rank 1 3
+PowerShell, analyze rank 1 with an explicit evaluation label:
+    python -m crypto.analyze `
+      --archive crypto/results/crypto_btc_payoff_h5_seed1_resume_seed2_36h.checkpoint.json `
+      --data data/crypto/BTCUSDT_15m.csv `
+      --out-dir crypto/results/chart `
+      --rank 1 `
+      --label-mode payoff `
+      --label-direction Long `
+      --label-threshold 0.002
+
+PowerShell, analyze the top five archive entries:
+    python -m crypto.analyze `
+      --archive crypto/results/crypto_btc_payoff_h5_seed1_resume_seed2_36h.checkpoint.json `
+      --data data/crypto/BTCUSDT_15m.csv `
+      --out-dir crypto/results/chart `
+      --top 5 `
+      --label-mode payoff `
+      --label-direction Long `
+      --label-threshold 0.002
+
+PowerShell, ensemble rank 1 from archives trained with different labels:
+    python -m crypto.analyze `
+      --ensemble-individual `
+        "crypto/results/crypto_btc_mfe_seed1_12h.json#1#mfe#0.003#Long" `
+        "crypto/results/crypto_btc_close_exit_seed1_12h.json#1#close_exit#0.001#Long" `
+      --data data/crypto/BTCUSDT_15m.csv `
+      --out-dir crypto/results/chart `
+      --label-mode mfe `
+      --label-direction Long `
+      --label-threshold 0.003
+
+Bash/VM, analyze a single rank:
+    python -m crypto.analyze \
+      --archive crypto/results/crypto_btc_payoff_h5_seed1_resume_seed2_36h.checkpoint.json \
+      --data data/crypto/BTCUSDT_15m.csv \
+      --out-dir crypto/results/chart \
+      --rank 1 \
+      --label-mode payoff \
+      --label-direction Long \
+      --label-threshold 0.002
+
+Ensemble spec format:
+    ARCHIVE#RANK[#MODE[#THRESHOLD[#DIRECTION]]]
+
+TRADE_TOP_FRACTION and mode-specific constants are read from crypto/config.py.
+Charts are written to crypto/results/chart unless --out-dir is provided.
 """
 
 from __future__ import annotations
@@ -1105,6 +1148,11 @@ def _label_settings_text(
         return (
             f"mode={mode} | direction={direction} | floor={float(label_threshold):.4g} | "
             f"tp={float(config.TP_SAFE_PATH):.4g}"
+        )
+    if mode == "adverse_floor":
+        return (
+            f"mode={mode} | direction={direction} | "
+            f"adverse_floor={-float(label_threshold):.4g}"
         )
     return f"mode={mode} | direction={direction} | thr={float(label_threshold):.4g}"
 
@@ -2259,7 +2307,8 @@ def main() -> None:
             "Label threshold used when recalculating labels. Default is "
             "LABEL_THRESHOLD for ordinary modes, TRADE_COST for payoff, and "
             "SAFE_ADVERSE_FLOOR for safe_path_mfe. For safe_path_mfe this is "
-            "the stop-first adverse low/high floor; TP is config.TP_SAFE_PATH."
+            "the stop-first adverse low/high floor; TP is config.TP_SAFE_PATH. "
+            "For adverse_floor use a positive distance such as 0.003."
         ),
     )
     args = parser.parse_args()

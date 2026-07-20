@@ -28,7 +28,11 @@ from crypto.features import (
     build_feature_frame,
     selectable_features,
 )
-from crypto.fitness import CryptoFitnessEvaluator, _internal_early_stop_split
+from crypto.fitness import (
+    CryptoFitnessEvaluator,
+    _classification_trade_metrics,
+    _internal_early_stop_split,
+)
 
 
 class CryptoPipelineTests(unittest.TestCase):
@@ -325,6 +329,74 @@ class CryptoPipelineTests(unittest.TestCase):
         )
         self.assertAlmostEqual(mfe_labeled["future_return_h3"].iloc[0], 0.015)
         self.assertEqual(mfe_labeled["label_h3"].iloc[0], 1.0)
+
+    def test_adverse_floor_uses_directional_path_and_zero_fitness_return(self):
+        idx = pd.date_range("2024-01-01", periods=8, freq="15min")
+        frame = pd.DataFrame(
+            {
+                "open": [100.0] * 8,
+                "high": [100.0, 100.2, 100.2, 100.2, 100.4, 100.1, 100.1, 100.1],
+                "low": [100.0, 99.8, 99.8, 99.8, 99.6, 99.9, 99.9, 99.9],
+                "close": [100.0] * 8,
+                "volume": [10.0] * 8,
+                "trade_count": [10] * 8,
+                "taker_buy_base_volume": [5.0] * 8,
+                "taker_buy_quote_volume": [500.0] * 8,
+            },
+            index=idx,
+        )
+
+        long_labeled = add_binary_labels(
+            frame,
+            horizons=[3],
+            label_mode="adverse_floor",
+            label_direction="Long",
+            threshold=0.003,
+        )
+        short_labeled = add_binary_labels(
+            frame,
+            horizons=[3],
+            label_mode="adverse_floor",
+            label_direction="Short",
+            threshold=0.003,
+        )
+
+        self.assertEqual(long_labeled["label_h3"].iloc[0], 1.0)
+        self.assertEqual(long_labeled["label_h3"].iloc[1], 0.0)
+        self.assertEqual(short_labeled["label_h3"].iloc[0], 1.0)
+        self.assertEqual(short_labeled["label_h3"].iloc[1], 0.0)
+        self.assertTrue((long_labeled["future_return_h3"].dropna() == 0.0).all())
+        self.assertTrue((short_labeled["future_return_h3"].dropna() == 0.0).all())
+        self.assertTrue(long_labeled["label_h3"].iloc[-3:].isna().all())
+        self.assertIs(
+            config.get_label_return_fn("adverse_floor"),
+            config.adverse_floor_future_return,
+        )
+
+    def test_precision_only_metrics_do_not_charge_trade_cost_on_zero_return(self):
+        y = pd.Series([1, 0, 1, 0])
+        pred = pd.Series([0.9, 0.8, 0.7, 0.6])
+        zero_return = pd.Series([0.0] * 4)
+
+        metrics = _classification_trade_metrics(
+            y_true=y,
+            pred=pred,
+            future_return=zero_return,
+            charge_trade_cost=False,
+        )
+
+        self.assertEqual(metrics.trade_return_mean, 0.0)
+        self.assertEqual(metrics.trade_return_score, 0.0)
+
+    def test_adverse_floor_rejects_non_positive_threshold(self):
+        frame = _synthetic_crypto_frame(20)
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            add_binary_labels(
+                frame,
+                horizons=[3],
+                label_mode="adverse_floor",
+                threshold=0.0,
+            )
 
     def test_long_safe_path_mfe_uses_stop_first_adverse_lows(self):
         idx = pd.date_range("2024-01-01", periods=6, freq="15min")
@@ -954,6 +1026,66 @@ class CryptoPipelineTests(unittest.TestCase):
         self.assertIn("mean_auc", individual.metrics)
         self.assertIn("precision_excess", individual.metrics)
         self.assertIn("trade_return_score", individual.metrics)
+
+    def test_adverse_floor_fitness_is_return_neutral_in_walk_forward_and_final(self):
+        df = _synthetic_crypto_frame(900)
+        labeled = add_binary_labels(
+            df,
+            horizons=[3],
+            threshold=0.005,
+            label_mode="adverse_floor",
+            label_direction="Long",
+        )
+        feature_df = pd.DataFrame(
+            {"ret": df["close"].pct_change().fillna(0.0)},
+            index=df.index,
+        )
+        feature_space = CryptoFeatureSpace(feature_df, ["ret"])
+        individual = CryptoIndividual(features=["ret"])
+        fold = CryptoFold(
+            name="wf_01",
+            train_df=labeled.iloc[:600],
+            val_df=labeled.iloc[620:750],
+            train_start=labeled.index[0],
+            train_end=labeled.index[599],
+            val_start=labeled.index[620],
+            val_end=labeled.index[749],
+        )
+        params = {
+            "objective": "binary",
+            "metric": "auc",
+            "learning_rate": 0.05,
+            "num_leaves": 7,
+            "max_depth": 3,
+            "min_data_in_leaf": 20,
+            "force_col_wise": True,
+            "verbose": -1,
+            "seed": 19,
+        }
+        evaluator = CryptoFitnessEvaluator(
+            horizons=[3],
+            lgbm_params=params,
+            num_boost_round=5,
+            early_stopping_rounds=2,
+            precision_only=True,
+        )
+
+        score = evaluator.evaluate_walk_forward(individual, [fold], feature_space)
+        final = evaluator.evaluate_final(
+            individual=individual,
+            train_df=labeled.iloc[:600],
+            val_df=labeled.iloc[620:750],
+            test_df=labeled.iloc[760:890],
+            feature_data=feature_space,
+        )
+
+        self.assertTrue(np.isfinite(score))
+        self.assertEqual(individual.metrics["trade_return_mean"], 0.0)
+        self.assertEqual(individual.metrics["trade_return_score"], 0.0)
+        self.assertEqual(final["final_val_trade_return_mean"], 0.0)
+        self.assertEqual(final["final_val_trade_return_score"], 0.0)
+        self.assertEqual(final["final_test_trade_return_mean"], 0.0)
+        self.assertEqual(final["final_test_trade_return_score"], 0.0)
 
     def test_crypto_final_evaluation_appends_final_metrics(self):
         df = _synthetic_crypto_frame(900)

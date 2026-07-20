@@ -9,21 +9,55 @@ This module evaluates the practical flow:
    profit, exit_after_h2 is evaluated at t+2.
 4. Report each stage with table-only charts.
 
-Examples:
-    python -m crypto.backtest ^
-      --base "crypto/results/crypto_btc_mfe_h5_seed1_12h.json#1#mfe#0.003#0.15" ^
-      --base "crypto/results/crypto_btc_close_exit_h5_seed1_12h.json#1#close_exit#0.001#0.25" ^
-      --base-ensemble and ^
-      --exit1 crypto/results/crypto_btc_exit_after_h1_h5_noh1_tp04_seed1_12h.json#1#exit_after_h1#0.004 ^
-      --exit2 crypto/results/crypto_btc_exit_after_h2_h5_tp04_seed1_12h.json#1#exit_after_h2#0.004 ^
-      --tp-threshold 0.004
+Model spec format:
+    ARCHIVE#RANK#MODE#THRESHOLD[#TOP_FRACTION[#DIRECTION]]
+
+Always quote model specs in PowerShell because an unquoted ``#`` starts a
+comment.
+
+PowerShell, one payoff base with both staged exit models:
+    python -m crypto.backtest `
+      --base "crypto/results/crypto_btc_payoff_h5_seed1_resume_seed2_36h.checkpoint.json#1#payoff#0.002#0.10#Long" `
+      --base-ensemble and `
+      --exit1 "crypto/results/crypto_btc_exit_after_h1_h5_tp04_seed1_12h.json#1#exit_after_h1#0.004#0.20#Long" `
+      --exit2 "crypto/results/crypto_btc_exit_after_h2_h5_tp04_seed1_12h.json#1#exit_after_h2#0.004#0.10#Long" `
+      --tp-threshold 0.004 `
+      --label-direction Long `
+      --data data/crypto/BTCUSDT_15m.csv `
+      --out-dir crypto/results/backtest
+
+PowerShell, require agreement between MFE and close-exit base individuals:
+    python -m crypto.backtest `
+      --base "crypto/results/crypto_btc_mfe_seed1_12h.json#1#mfe#0.003#0.10#Long" `
+      --base "crypto/results/crypto_btc_close_exit_seed1_12h.json#1#close_exit#0.001#0.10#Long" `
+      --base-ensemble and `
+      --exit1 "crypto/results/crypto_btc_exit_after_h1_h5_tp04_seed1_12h.json#1#exit_after_h1#0.004#0.20#Long" `
+      --exit2 "crypto/results/crypto_btc_exit_after_h2_h5_tp04_seed1_12h.json#1#exit_after_h2#0.004#0.10#Long" `
+      --tp-threshold 0.004 `
+      --label-direction Long `
+      --data data/crypto/BTCUSDT_15m.csv `
+      --out-dir crypto/results/backtest
+
+Bash/VM, one payoff base with both staged exit models:
+    python -m crypto.backtest \
+      --base "crypto/results/crypto_btc_payoff_h5_seed1_resume_seed2_36h.checkpoint.json#1#payoff#0.002#0.10#Long" \
+      --base-ensemble and \
+      --exit1 "crypto/results/crypto_btc_exit_after_h1_h5_tp04_seed1_12h.json#1#exit_after_h1#0.004#0.20#Long" \
+      --exit2 "crypto/results/crypto_btc_exit_after_h2_h5_tp04_seed1_12h.json#1#exit_after_h2#0.004#0.10#Long" \
+      --tp-threshold 0.004 \
+      --label-direction Long \
+      --data data/crypto/BTCUSDT_15m.csv \
+      --out-dir crypto/results/backtest
+
+Omit the top-fraction field from an exit spec to use EXIT_TOP_FRACTIONS, or
+override it with --exit1-top-fraction/--exit2-top-fraction. Results are written
+to crypto/results/backtest unless --out-dir is provided.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
-import itertools
 import json
 import logging
 import re
@@ -67,8 +101,8 @@ TP_SWEEP_START: float = -0.002
 TP_SWEEP_END: float = 0.005
 TP_SWEEP_STEP: float = 0.0005
 EXIT_TOP_FRACTIONS: list[float] = [0.10 ,0.20, 0.30, 0.40, 0.50, 0.6, 0.7]
-TP_OPT_START: float = 0.0025
-TP_OPT_END: float = 0.0060
+TP_OPT_START: float = 0.0020
+TP_OPT_END: float = 0.0070
 TP_OPT_STEP: float = 0.0005
 TP_OPT_TOP_K: int = 5
 
@@ -1046,24 +1080,16 @@ def _optimize_dynamic_tp(
 
     val_arrays = _dynamic_tp_arrays(val_frame)
     test_arrays = _dynamic_tp_arrays(test_frame)
-    candidates: list[tuple[float, float, tuple[float, ...], dict[str, float]]] = []
-    for combo in itertools.product(levels, repeat=5):
-        val_metrics = _simulate_dynamic_tp_arrays(val_arrays, combo)
-        candidates.append(
-            (
-                float(val_metrics["e_net"]),
-                float(val_metrics["hit_rate"]),
-                tuple(float(value) for value in combo),
-                val_metrics,
-            )
-        )
-    candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    candidates = _top_dynamic_tp_candidates(val_arrays, levels, top_k)
 
     rows: list[dict[str, Any]] = []
-    for rank, (_, _, combo, val_metrics) in enumerate(
-        candidates[: max(int(top_k), 0)],
-        start=1,
-    ):
+    for rank, (total_return, hit_count, combo) in enumerate(candidates, start=1):
+        val_metrics = {
+            "e_net": total_return / len(val_arrays["close_final"])
+            - float(config.TRADE_COST),
+            "hit_rate": hit_count / len(val_arrays["close_final"]),
+            "n_trades": float(len(val_arrays["close_final"])),
+        }
         test_metrics = _simulate_dynamic_tp_arrays(test_arrays, combo)
         rows.append(
             {
@@ -1082,6 +1108,108 @@ def _optimize_dynamic_tp(
             }
         )
     return pd.DataFrame(rows, columns=columns)
+
+
+def _top_dynamic_tp_candidates(
+    arrays: dict[str, np.ndarray],
+    levels: list[float],
+    top_k: int,
+) -> list[tuple[float, int, tuple[float, ...]]]:
+    """Return the exact top dynamic-TP grid combinations without a 5-D product."""
+    keep = max(int(top_k), 0)
+    n = len(arrays["close_final"])
+    if keep == 0 or n == 0:
+        return []
+
+    close_final = arrays["close_final"]
+    all_rows = np.ones(n, dtype=bool)
+    top_candidates: list[tuple[float, int, tuple[float, ...]]] = []
+
+    for tp_h1 in levels:
+        hit_h1 = all_rows & (arrays["high_h1"] > tp_h1)
+        after_h1 = ~hit_h1
+        h1_total = float(hit_h1.sum()) * float(tp_h1)
+        h1_hits = int(hit_h1.sum())
+
+        exit1_selected = after_h1 & arrays["exit1_selected"]
+        exit1_options = _tp_branch_options(
+            close_final,
+            arrays["max_high_h2_plus"],
+            exit1_selected,
+            levels,
+        )
+
+        exit1_no_selected = after_h1 & ~arrays["exit1_selected"]
+        downstream_options: list[tuple[float, int, tuple[float, ...]]] = []
+        for tp_h2 in levels:
+            hit_h2 = exit1_no_selected & (arrays["high_h2"] > tp_h2)
+            after_h2 = exit1_no_selected & ~hit_h2
+            h2_total = float(hit_h2.sum()) * float(tp_h2)
+            h2_hits = int(hit_h2.sum())
+
+            exit2_selected = after_h2 & arrays["exit2_selected"]
+            exit2_selected_options = _tp_branch_options(
+                close_final,
+                arrays["max_high_h3_plus"],
+                exit2_selected,
+                levels,
+            )
+            exit2_no_selected = after_h2 & ~arrays["exit2_selected"]
+            exit2_no_options = _tp_branch_options(
+                close_final,
+                arrays["max_high_h3_plus"],
+                exit2_no_selected,
+                levels,
+            )
+
+            for selected_total, selected_hits, tp_exit2 in exit2_selected_options:
+                for no_total, no_hits, tp_exit2_no in exit2_no_options:
+                    downstream_options.append(
+                        (
+                            h2_total + selected_total + no_total,
+                            h2_hits + selected_hits + no_hits,
+                            (float(tp_h2), float(tp_exit2), float(tp_exit2_no)),
+                        )
+                    )
+        downstream_options = _take_top_candidates(downstream_options, keep)
+
+        combined: list[tuple[float, int, tuple[float, ...]]] = []
+        for exit1_total, exit1_hits, tp_exit1 in exit1_options:
+            for downstream_total, downstream_hits, downstream_combo in downstream_options:
+                combined.append(
+                    (
+                        h1_total + exit1_total + downstream_total,
+                        h1_hits + exit1_hits + downstream_hits,
+                        (float(tp_h1), float(tp_exit1), *downstream_combo),
+                    )
+                )
+        top_candidates.extend(_take_top_candidates(combined, keep))
+
+    return _take_top_candidates(top_candidates, keep)
+
+
+def _tp_branch_options(
+    close_final: np.ndarray,
+    favorable_move: np.ndarray,
+    mask: np.ndarray,
+    levels: list[float],
+) -> list[tuple[float, int, float]]:
+    branch_close = close_final[mask]
+    branch_move = favorable_move[mask]
+    options: list[tuple[float, int, float]] = []
+    for threshold in levels:
+        hit = branch_move > float(threshold)
+        total = float(np.where(hit, float(threshold), branch_close).sum())
+        options.append((total, int(hit.sum()), float(threshold)))
+    return options
+
+
+def _take_top_candidates(
+    candidates: list[tuple[float, int, tuple[float, ...]]],
+    top_k: int,
+) -> list[tuple[float, int, tuple[float, ...]]]:
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    return candidates[: max(int(top_k), 0)]
 
 
 def _dynamic_tp_arrays(frame: pd.DataFrame) -> dict[str, np.ndarray]:

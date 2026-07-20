@@ -88,6 +88,9 @@ def add_binary_labels(
     future_return_h stores the executable strategy payoff used by fitness:
     threshold on a TP hit, otherwise the close return at the final horizon.
     The safe_path_mfe mode uses its explicit first-hit/path-safety label.
+    For adverse_floor, label=1 means the full future path stays above the
+    directional adverse floor, while future_return_h is zero because this
+    mode is optimized as a classification filter rather than a payoff model.
     """
     labeled = df.sort_index().copy()
     selected_mode = config.canonical_label_mode(label_mode)
@@ -108,6 +111,23 @@ def add_binary_labels(
             continue
 
         future_return = _call_label_return_fn(label_return_fn, labeled, h, selected_direction)
+        if selected_mode == "adverse_floor":
+            if float(label_threshold) <= 0.0:
+                raise ValueError(
+                    "adverse_floor label_threshold must be positive; "
+                    "for example 0.003 means the path must stay above -0.3%."
+                )
+            complete = future_return.notna()
+            adverse_floor = -float(label_threshold)
+            explicit_label = future_return.gt(adverse_floor).astype("float64").where(complete)
+            labeled[f"future_return_h{h}"] = pd.Series(
+                0.0,
+                index=labeled.index,
+                dtype="float64",
+            ).where(complete)
+            labeled[f"label_h{h}"] = explicit_label
+            continue
+
         if selected_mode == "mfe":
             close_return = config.close_exit_future_return(
                 labeled,

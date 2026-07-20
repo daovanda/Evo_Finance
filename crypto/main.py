@@ -1,7 +1,49 @@
 """Run crypto feature evolution.
 
-Example:
-    python -m crypto.main --data data/crypto/BTCUSDT_15m.csv --budget 3600 --seed 1
+PowerShell, start a new 12-hour payoff run:
+    python -m crypto.main `
+      --data data/crypto/BTCUSDT_15m.csv `
+      --budget 43200 `
+      --seed 1 `
+      --horizons 5 `
+      --label-mode payoff `
+      --label-direction Long `
+      --label-threshold 0.002 `
+      --trade-top-fraction 0.10 `
+      --save crypto/results/crypto_btc_long_payoff_h5_seed1_12h.json `
+      --checkpoint-every 3600
+
+PowerShell, continue an archive for another 12 hours with a new RNG seed:
+    python -m crypto.main `
+      --data data/crypto/BTCUSDT_15m.csv `
+      --budget 43200 `
+      --seed 2 `
+      --horizons 5 `
+      --label-mode payoff `
+      --label-direction Long `
+      --label-threshold 0.002 `
+      --trade-top-fraction 0.10 `
+      --resume crypto/results/crypto_btc_long_payoff_h5_seed1_12h.json `
+      --save crypto/results/crypto_btc_long_payoff_h5_seed1_24h.json `
+      --checkpoint-every 3600
+
+Bash/VM, start the same run and save a log:
+    python -m crypto.main \
+      --data data/crypto/BTCUSDT_15m.csv \
+      --budget 43200 \
+      --seed 1 \
+      --horizons 5 \
+      --label-mode payoff \
+      --label-direction Long \
+      --label-threshold 0.002 \
+      --trade-top-fraction 0.10 \
+      --save crypto/results/crypto_btc_long_payoff_h5_seed1_12h.json \
+      --checkpoint-every 3600 \
+      2>&1 | tee crypto/results/run_crypto_btc_long_payoff_h5_seed1_12h.log
+
+Mode-specific constants such as PAYOFF_TP, TP_SAFE_PATH, TRADE_COST, and the
+fitness weights are read from crypto/config.py. Resume metadata must match the
+effective CLI and config values.
 """
 
 from __future__ import annotations
@@ -63,6 +105,11 @@ def run(
     label_threshold = config.default_label_threshold(label_mode, label_threshold)
     if not np.isfinite(float(label_threshold)):
         raise ValueError("label_threshold must be finite.")
+    if label_mode == "adverse_floor" and float(label_threshold) <= 0.0:
+        raise ValueError(
+            "adverse_floor label_threshold must be positive; pass for example "
+            "--label-threshold 0.003."
+        )
     if trade_top_fraction is not None:
         trade_top_fraction = float(trade_top_fraction)
         if not np.isfinite(trade_top_fraction) or not 0.0 < trade_top_fraction <= 1.0:
@@ -144,7 +191,10 @@ def run(
         train_index=feature_quality_index,
         seed=int(rng.integers(1 << 31)),
     )
-    evaluator = CryptoFitnessEvaluator(horizons=horizons)
+    evaluator = CryptoFitnessEvaluator(
+        horizons=horizons,
+        precision_only=label_mode == "adverse_floor",
+    )
     archive = (
         CryptoArchive.load(resume_archive)
         if resume_archive is not None
@@ -311,6 +361,7 @@ def _save_archive(
             "trade_top_fraction": config.TRADE_TOP_FRACTION,
             "trade_cost": config.TRADE_COST,
             "return_score_scale": config.RETURN_SCORE_SCALE,
+            "precision_only": label_mode == "adverse_floor",
         },
     )
 
@@ -445,7 +496,8 @@ def main() -> None:
             "Label threshold. Default is LABEL_THRESHOLD for ordinary modes, "
             "TRADE_COST for payoff, and SAFE_ADVERSE_FLOOR for safe_path_mfe. "
             "For safe_path_mfe this is the stop-first adverse low/high floor; "
-            "TP is config.TP_SAFE_PATH."
+            "TP is config.TP_SAFE_PATH. For adverse_floor use a positive "
+            "distance, for example 0.003 means the path must stay above -0.003."
         ),
     )
     parser.add_argument(
