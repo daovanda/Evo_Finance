@@ -41,7 +41,8 @@ Bash/VM, start the same run and save a log:
       --checkpoint-every 3600 \
       2>&1 | tee crypto/results/run_crypto_btc_long_payoff_h5_seed1_12h.log
 
-Mode-specific constants such as PAYOFF_TP, TP_SAFE_PATH, TRADE_COST, and the
+Mode-specific constants such as PAYOFF_TP, PAYOFF_ADVERSE_FLOOR, TP_SAFE_PATH,
+TRADE_COST, and the
 fitness weights are read from crypto/config.py. Resume metadata must match the
 effective CLI and config values.
 """
@@ -193,7 +194,7 @@ def run(
     )
     evaluator = CryptoFitnessEvaluator(
         horizons=horizons,
-        precision_only=label_mode == "adverse_floor",
+        precision_only=config.is_precision_only_label_mode(label_mode),
     )
     archive = (
         CryptoArchive.load(resume_archive)
@@ -288,7 +289,9 @@ def run(
         )
 
     if save_path is not None:
-        _save_archive(archive, save_path, horizons, label_threshold, label_mode, label_direction)
+        _save_archive(
+            archive, save_path, horizons, label_threshold, label_mode, label_direction
+        )
         logger.info("Saved crypto archive to %s", save_path)
     if checkpoint_path is not None:
         _save_archive(
@@ -329,7 +332,9 @@ def _evaluate_final_archive(
             logger.warning("Final evaluation failed for rank %d: %s", rank, exc)
             continue
         ok += 1
-    logger.info("Final evaluation completed: %d/%d entries evaluated.", ok, len(archive))
+    logger.info(
+        "Final evaluation completed: %d/%d entries evaluated.", ok, len(archive)
+    )
 
 
 def _save_archive(
@@ -349,6 +354,7 @@ def _save_archive(
             "label_direction": label_direction,
             "label_threshold": label_threshold,
             "payoff_tp": config.PAYOFF_TP,
+            "payoff_adverse_floor": config.PAYOFF_ADVERSE_FLOOR,
             "tp_safe_path": config.TP_SAFE_PATH,
             "safe_adverse_floor": (
                 float(label_threshold)
@@ -361,7 +367,7 @@ def _save_archive(
             "trade_top_fraction": config.TRADE_TOP_FRACTION,
             "trade_cost": config.TRADE_COST,
             "return_score_scale": config.RETURN_SCORE_SCALE,
-            "precision_only": label_mode == "adverse_floor",
+            "precision_only": config.is_precision_only_label_mode(label_mode),
         },
     )
 
@@ -391,10 +397,16 @@ def _validate_resume_metadata(
     metadata_label_direction = metadata.get("label_direction")
     # Archives created before direction support were all long-only.
     archive_label_direction = config.canonical_label_direction(
-        metadata_label_direction if metadata_label_direction not in (None, "") else "long"
+        metadata_label_direction
+        if metadata_label_direction not in (None, "")
+        else "long"
     )
     checks: list[tuple[str, object, object]] = [
-        ("horizons", [int(h) for h in metadata.get("horizons", [])], [int(h) for h in horizons]),
+        (
+            "horizons",
+            [int(h) for h in metadata.get("horizons", [])],
+            [int(h) for h in horizons],
+        ),
         ("label_mode", archive_label_mode, label_mode),
         ("label_direction", archive_label_direction, label_direction),
         ("label_threshold", metadata.get("label_threshold"), float(label_threshold)),
@@ -403,11 +415,22 @@ def _validate_resume_metadata(
             str(metadata.get("fitness_horizon_mode", "")).strip().lower(),
             config.FITNESS_HORIZON_MODE,
         ),
-        ("trade_top_fraction", metadata.get("trade_top_fraction"), float(config.TRADE_TOP_FRACTION)),
+        (
+            "trade_top_fraction",
+            metadata.get("trade_top_fraction"),
+            float(config.TRADE_TOP_FRACTION),
+        ),
         ("trade_cost", metadata.get("trade_cost"), float(config.TRADE_COST)),
     ]
     if label_mode == "payoff" and archive_label_mode == "payoff":
         checks.append(("payoff_tp", metadata.get("payoff_tp"), float(config.PAYOFF_TP)))
+        checks.append(
+            (
+                "payoff_adverse_floor",
+                metadata.get("payoff_adverse_floor"),
+                float(config.PAYOFF_ADVERSE_FLOOR),
+            )
+        )
     if label_mode == "safe_path_mfe" and archive_label_mode == "safe_path_mfe":
         archive_rule = metadata.get("safe_path_rule")
         if archive_rule != config.SAFE_PATH_RULE:
@@ -433,12 +456,18 @@ def _validate_resume_metadata(
             try:
                 archive_float = float(archive_value)
             except (TypeError, ValueError):
-                mismatches.append(f"{name}: archive={archive_value!r}, current={current_value!r}")
+                mismatches.append(
+                    f"{name}: archive={archive_value!r}, current={current_value!r}"
+                )
                 continue
             if not np.isclose(archive_float, current_value, rtol=0.0, atol=1e-12):
-                mismatches.append(f"{name}: archive={archive_float!r}, current={current_value!r}")
+                mismatches.append(
+                    f"{name}: archive={archive_float!r}, current={current_value!r}"
+                )
         elif archive_value != current_value:
-            mismatches.append(f"{name}: archive={archive_value!r}, current={current_value!r}")
+            mismatches.append(
+                f"{name}: archive={archive_value!r}, current={current_value!r}"
+            )
 
     if mismatches:
         joined = "; ".join(mismatches)
@@ -470,7 +499,9 @@ def _parse_horizons(text: str) -> list[int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data", default=str(config.DATA_PATH), help="Crypto OHLCV CSV path.")
+    parser.add_argument(
+        "--data", default=str(config.DATA_PATH), help="Crypto OHLCV CSV path."
+    )
     parser.add_argument("--budget", type=float, default=config.TIME_BUDGET_SECONDS)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -478,7 +509,9 @@ def main() -> None:
         default=str(config.DEFAULT_ARCHIVE_PATH),
         help=f"Output archive JSON path. Default: {config.DEFAULT_ARCHIVE_PATH}",
     )
-    parser.add_argument("--resume", default=None, help="Resume from a crypto archive JSON.")
+    parser.add_argument(
+        "--resume", default=None, help="Resume from a crypto archive JSON."
+    )
     parser.add_argument(
         "--horizons",
         type=_parse_horizons,
@@ -497,7 +530,9 @@ def main() -> None:
             "TRADE_COST for payoff, and SAFE_ADVERSE_FLOOR for safe_path_mfe. "
             "For safe_path_mfe this is the stop-first adverse low/high floor; "
             "TP is config.TP_SAFE_PATH. For adverse_floor use a positive "
-            "distance, for example 0.003 means the path must stay above -0.003."
+            "distance, for example 0.003 means the path must stay above -0.003. "
+            "For high_exit this is the directional return threshold of the "
+            "exact H candle high (Long) or low (Short)."
         ),
     )
     parser.add_argument(
@@ -531,10 +566,14 @@ def main() -> None:
     parser.add_argument("--test-start", default=config.TEST_START)
     parser.add_argument("--test-end", default=config.TEST_END)
     parser.add_argument("--wf-end", default=None)
-    parser.add_argument("--wf-min-train-months", type=int, default=config.WF_MIN_TRAIN_MONTHS)
+    parser.add_argument(
+        "--wf-min-train-months", type=int, default=config.WF_MIN_TRAIN_MONTHS
+    )
     parser.add_argument("--wf-val-months", type=int, default=config.WF_VAL_MONTHS)
     parser.add_argument("--wf-step-months", type=int, default=config.WF_STEP_MONTHS)
-    parser.add_argument("--checkpoint-every", type=float, default=config.CHECKPOINT_EVERY_SECONDS)
+    parser.add_argument(
+        "--checkpoint-every", type=float, default=config.CHECKPOINT_EVERY_SECONDS
+    )
     args = parser.parse_args()
 
     run(

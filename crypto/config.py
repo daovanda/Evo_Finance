@@ -22,8 +22,12 @@ DEFAULT_ARCHIVE_PATH: Path = RESULTS_DIR / "crypto_btc_archive.json"
 HOLDING_HORIZONS: list[int] = [5]
 LABEL_THRESHOLD: float = 0.0  # label=1 when future_return > threshold
 LABEL_MODE: str = "close_path_mean"
-LABEL_DIRECTION: str = "Long"  # "Long" => price up is favorable, "Short" => price down is favorable
-PAYOFF_TP: float = 0.004  # only used by LABEL_MODE="payoff"
+LABEL_DIRECTION: str = (
+    "Long"  # "Long" => price up is favorable, "Short" => price down is favorable
+)
+PAYOFF_TP: float = 0.004  # legacy payoff archives were evolved with TP=0.40%
+# Effectively disables the newer adverse-path filter for legacy payoff archives.
+PAYOFF_ADVERSE_FLOOR: float = -999.0
 TP_SAFE_PATH: float = 0.003  # TP used by LABEL_MODE="safe_path_mfe"
 SAFE_ADVERSE_FLOOR: float = -0.0015  # stop-first low/high floor for safe_path_mfe
 SAFE_PATH_RULE: str = "adverse_stop_first_v1"
@@ -47,7 +51,9 @@ def canonical_label_direction(direction: str | None = None) -> str:
     return selected
 
 
-def directional_price_return(price: Any, entry: Any, direction: str | None = None) -> Any:
+def directional_price_return(
+    price: Any, entry: Any, direction: str | None = None
+) -> Any:
     """Return price move in the selected trade direction.
 
     Long:  price / entry - 1
@@ -79,6 +85,29 @@ def close_exit_future_return(
     entry_open = df["open"].shift(-1)
     exit_close = df["close"].shift(-h)
     return directional_price_return(exit_close, entry_open, direction)
+
+
+def high_exit_future_return(
+    df: Any,
+    horizon: int,
+    direction: str | None = None,
+) -> Any:
+    """Favorable extreme of the exact exit candle relative to entry open.
+
+    For a signal at t, entry is open(t+1). Long uses high(t+h), while Short
+    uses low(t+h) and converts the move into a positive directional return.
+    Unlike ``mfe_future_return``, this does not take an extreme over H1..Hh.
+    """
+    h = int(horizon)
+    if h < 1:
+        raise ValueError("horizon must be positive for high_exit.")
+    entry_open = df["open"].shift(-1)
+    exit_price = (
+        df["low"].shift(-h)
+        if canonical_label_direction(direction) == "short"
+        else df["high"].shift(-h)
+    )
+    return directional_price_return(exit_price, entry_open, direction)
 
 
 def mfe_future_return(
@@ -356,6 +385,7 @@ def payoff_future_return(
 
 LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
     "close_exit": close_exit_future_return,
+    "high_exit": high_exit_future_return,
     "close_path_mean": close_path_mean_future_return,
     "mfe": mfe_future_return,
     "adverse_floor": adverse_floor_future_return,
@@ -381,12 +411,23 @@ def canonical_label_mode(mode: str | None = None) -> str:
     return selected_mode
 
 
+PRECISION_ONLY_LABEL_MODES: frozenset[str] = frozenset(
+    {"adverse_floor", "high_exit"}
+)
+
+
+def is_precision_only_label_mode(mode: str | None = None) -> bool:
+    return canonical_label_mode(mode) in PRECISION_ONLY_LABEL_MODES
+
+
 def get_label_return_fn(mode: str | None = None) -> Callable[[Any, int], Any]:
     selected_mode = canonical_label_mode(mode)
     return LABEL_RETURN_FNS[selected_mode]
 
 
-def default_label_threshold(mode: str | None = None, threshold: float | None = None) -> float:
+def default_label_threshold(
+    mode: str | None = None, threshold: float | None = None
+) -> float:
     if threshold is not None:
         return float(threshold)
     selected_mode = canonical_label_mode(mode)
@@ -413,7 +454,33 @@ WF_PURGE_BARS: int | None = None  # None => max(HOLDING_HORIZONS) + 1
 
 # Safe feature construction. All features are time-series/ratio normalized;
 # raw price/volume scale columns are intentionally not selectable.
-WINDOWS: list[int] = [1, 2, 3, 4, 5, 7, 10, 14, 20, 30, 40, 50, 60, 80, 120, 160, 240, 320, 400, 480, 600, 800, 960, 1200, 1440]
+WINDOWS: list[int] = [
+    1,
+    2,
+    3,
+    4,
+    5,
+    7,
+    10,
+    14,
+    20,
+    30,
+    40,
+    50,
+    60,
+    80,
+    120,
+    160,
+    240,
+    320,
+    400,
+    480,
+    600,
+    800,
+    960,
+    1200,
+    1440,
+]
 # WINDOWS: list[int] = [3, 5, 10, 15, 30, 60, 120, 240, 480, 960, 1440]
 FEATURE_MIN_VALID_RATIO: float = 0.70
 FEATURE_MAX_DOMINANT_VALUE_RATIO: float = 0.985
@@ -429,7 +496,7 @@ EVOLUTION_GC_EVERY: int = 25  # iterations; 0 disables explicit garbage collecti
 # Individual/evolution knobs.
 FEATURE_MIN: int = 4
 FEATURE_MAX: int = 24
-ARCHIVE_SIZE: int = 50 
+ARCHIVE_SIZE: int = 50
 TIME_BUDGET_SECONDS: float = 3600.0
 RESTART_PROB: float = 0.001
 CHECKPOINT_EVERY_SECONDS: float = 12 * 60 * 60
@@ -442,8 +509,10 @@ MAX_RETRY: int = 5
 
 # Fitness. RETURN_SCORE_SCALE normalizes mean trade return so that one metric
 # cannot dominate merely by being on a wider numerical scale.
-FITNESS_HORIZON_MODE: str = "mean"  # "mean" keeps old behavior; "ensemble" requires all H signals
-TRADE_TOP_FRACTION: float = 0.1
+FITNESS_HORIZON_MODE: str = (
+    "mean"  # "mean" keeps old behavior; "ensemble" requires all H signals
+)
+TRADE_TOP_FRACTION: float = 0.05
 
 MIN_TRADES_PER_SPLIT: int = 20
 TRADE_COST: float = 0.0005  # 0.1% Futures round-trip fee plus slippage allowance
@@ -451,12 +520,12 @@ RETURN_SCORE_SCALE: float = 0.01
 BAD_AUC_THRESHOLD: float = 0.50
 
 FITNESS_WEIGHTS: dict[str, float] = {
-    "auc_edge": 0.40,
-    "precision_excess": 0.50,  #old: 0.30
-    "trade_return_score": 0.20, #old: 0.20
-    "auc_std": -0.20, #old: -0.20
-    "overfit_gap": -0.25, #old: -0.25
-    "bad_fold_ratio": -0.30 #old: -0.30
+    "auc_edge": 0.20, # old: 0.40
+    "precision_excess": 0.50,  # old: 0.30
+    "trade_return_score": 0.20,  # old: 0.20
+    "auc_std": -0.30,  # old: -0.20
+    "overfit_gap": -0.25,  # old: -0.25
+    "bad_fold_ratio": -0.30,  # old: -0.30
 }
 
 # Binary LightGBM. These are deliberately conservative because evolution itself
@@ -503,6 +572,8 @@ def validate_config() -> None:
     canonical_label_direction()
     if PAYOFF_TP <= 0:
         raise ValueError("PAYOFF_TP must be positive.")
+    if not isfinite(float(PAYOFF_ADVERSE_FLOOR)) or PAYOFF_ADVERSE_FLOOR >= 0:
+        raise ValueError("PAYOFF_ADVERSE_FLOOR must be finite and negative.")
     if not isfinite(float(TP_SAFE_PATH)) or TP_SAFE_PATH <= 0:
         raise ValueError("TP_SAFE_PATH must be finite and positive.")
     if not isfinite(float(SAFE_ADVERSE_FLOOR)):

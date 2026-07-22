@@ -2308,7 +2308,8 @@ def main() -> None:
             "LABEL_THRESHOLD for ordinary modes, TRADE_COST for payoff, and "
             "SAFE_ADVERSE_FLOOR for safe_path_mfe. For safe_path_mfe this is "
             "the stop-first adverse low/high floor; TP is config.TP_SAFE_PATH. "
-            "For adverse_floor use a positive distance such as 0.003."
+            "For adverse_floor use a positive distance such as 0.003. For "
+            "high_exit this is the directional threshold of the exact H candle."
         ),
     )
     args = parser.parse_args()

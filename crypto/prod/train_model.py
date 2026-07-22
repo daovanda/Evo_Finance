@@ -61,7 +61,9 @@ def train_from_archive(
     """Train one LightGBM model per selected individual and horizon."""
     config.validate_config()
     archive_path = Path(archive_path)
-    selected_entries = _filter_entries(_load_archive_entries(archive_path), top=top, ranks=ranks)
+    selected_entries = _filter_entries(
+        _load_archive_entries(archive_path), top=top, ranks=ranks
+    )
 
     run_name = run_name or archive_path.stem
     model_dir = Path(output_dir) / _safe_name(run_name)
@@ -215,7 +217,9 @@ def train_ensemble_from_specs(
     raw_df = load_ohlcv(data_path)
     purge_bars = config.purge_bars_for_horizons(config.HOLDING_HORIZONS)
 
-    logger.info("Building crypto feature matrix; quality filter uses default final train rows.")
+    logger.info(
+        "Building crypto feature matrix; quality filter uses default final train rows."
+    )
     default_labeled_df = add_binary_labels(
         raw_df,
         horizons=config.HOLDING_HORIZONS,
@@ -363,7 +367,9 @@ def _train_one_horizon(
     if y_train.nunique() < 2:
         raise ValueError(f"h{horizon}: train label is constant.")
 
-    X_val = feature_space.matrix(features, val.index) if not val.empty else pd.DataFrame()
+    X_val = (
+        feature_space.matrix(features, val.index) if not val.empty else pd.DataFrame()
+    )
     y_val = val[label_col].astype(int) if not val.empty else pd.Series(dtype=int)
 
     booster = _train_booster(X_train, y_train, X_val, y_val)
@@ -405,7 +411,9 @@ def _train_one_horizon(
 
 
 def _top_prediction_threshold(pred: pd.Series) -> float | None:
-    pred = pd.to_numeric(pred, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    pred = (
+        pd.to_numeric(pred, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    )
     if pred.empty:
         return None
     n_select = min(
@@ -436,7 +444,9 @@ def _train_booster(
                 free_raw_data=False,
             )
         ]
-        callbacks.insert(0, lgb.early_stopping(config.LGBM_EARLY_STOPPING, verbose=False))
+        callbacks.insert(
+            0, lgb.early_stopping(config.LGBM_EARLY_STOPPING, verbose=False)
+        )
 
     return lgb.train(
         params=dict(config.LGBM_PARAMS),
@@ -536,6 +546,7 @@ def _config_snapshot(
         "label_direction": label_direction,
         "label_threshold": float(label_threshold),
         "payoff_tp": float(config.PAYOFF_TP),
+        "payoff_adverse_floor": float(config.PAYOFF_ADVERSE_FLOOR),
         "tp_safe_path": float(config.TP_SAFE_PATH),
         "safe_adverse_floor": (
             float(label_threshold)
@@ -543,7 +554,7 @@ def _config_snapshot(
             else float(config.SAFE_ADVERSE_FLOOR)
         ),
         "safe_path_rule": config.SAFE_PATH_RULE,
-        "precision_only": label_mode == "adverse_floor",
+        "precision_only": config.is_precision_only_label_mode(label_mode),
         "trade_cost": float(config.TRADE_COST),
         "val_start": val_start,
         "test_start": test_start,
@@ -571,7 +582,10 @@ def _entry_id(
 ) -> str:
     suffix = ""
     if str(label_mode).strip().lower() == "payoff":
-        suffix = f"_tp_{_threshold_token(float(config.PAYOFF_TP))}"
+        suffix = (
+            f"_tp_{_threshold_token(float(config.PAYOFF_TP))}"
+            f"_floor_{_threshold_token(float(config.PAYOFF_ADVERSE_FLOOR))}"
+        )
     elif str(label_mode).strip().lower() == "safe_path_mfe":
         suffix = f"_tp_{_threshold_token(float(config.TP_SAFE_PATH))}"
     return _safe_name(
@@ -662,7 +676,9 @@ def _parse_ensemble_specs(values: list[str] | None) -> list[EnsembleIndividualSp
                 archive_path=Path(path_text),
                 rank=int(rank_text),
                 label_mode=mode_text,
-                label_threshold=float(threshold_text) if threshold_text is not None else None,
+                label_threshold=float(threshold_text)
+                if threshold_text is not None
+                else None,
                 label_direction=direction_text,
             )
         )
@@ -672,7 +688,9 @@ def _parse_ensemble_specs(values: list[str] | None) -> list[EnsembleIndividualSp
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archive", default=None, help="Crypto archive JSON path.")
-    parser.add_argument("--data", default=str(config.DATA_PATH), help="Crypto OHLCV CSV path.")
+    parser.add_argument(
+        "--data", default=str(config.DATA_PATH), help="Crypto OHLCV CSV path."
+    )
     parser.add_argument(
         "--out-dir",
         default=str(DEFAULT_MODEL_DIR),
@@ -683,7 +701,9 @@ def main() -> None:
         default=None,
         help="Output subdirectory name under --out-dir. Default: archive filename stem.",
     )
-    parser.add_argument("--top", type=int, default=None, help="Train only top N entries.")
+    parser.add_argument(
+        "--top", type=int, default=None, help="Train only top N entries."
+    )
     parser.add_argument(
         "--rank",
         nargs="+",
@@ -731,7 +751,8 @@ def main() -> None:
             "LABEL_THRESHOLD for ordinary modes, TRADE_COST for payoff, and "
             "SAFE_ADVERSE_FLOOR for safe_path_mfe. For safe_path_mfe this is "
             "the stop-first adverse low/high floor; TP is config.TP_SAFE_PATH. "
-            "For adverse_floor use a positive distance such as 0.003."
+            "For adverse_floor use a positive distance such as 0.003. For "
+            "high_exit this is the directional threshold of the exact H candle."
         ),
     )
     args = parser.parse_args()
@@ -752,7 +773,9 @@ def main() -> None:
         )
     else:
         if not args.archive:
-            parser.error("--archive is required unless --ensemble-individual is provided.")
+            parser.error(
+                "--archive is required unless --ensemble-individual is provided."
+            )
         manifest_path = train_from_archive(
             archive_path=args.archive,
             data_path=args.data,

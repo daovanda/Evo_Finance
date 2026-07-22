@@ -77,6 +77,21 @@ Tat ca mode label ben duoi dung chung quy uoc nay. Voi Short, `mfe` dung low tha
 future_return(t, h) = (close(t+h) - open(t+1)) / open(t+1)
 ```
 
+`LABEL_MODE="high_exit"`:
+
+```text
+entry = open(t+1)
+Long:  label_source(t, h) = high(t+h) / entry - 1
+Short: label_source(t, h) = 1 - low(t+h) / entry
+label = label_source > label_threshold
+future_return(t, h) = 0
+```
+
+Mode `high_exit` chi dung high/low cua dung nen H, khong lay max/min tren
+H1..H. Day la mode precision-only: fitness van tinh AUC, precision excess,
+overfit gap va bad-fold ratio, nhung `trade_return_mean` va
+`trade_return_score` bang 0 va khong bi tru `TRADE_COST`.
+
 `LABEL_MODE="mfe"`:
 
 ```text

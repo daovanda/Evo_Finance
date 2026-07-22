@@ -17,7 +17,7 @@ comment.
 
 PowerShell, one payoff base with both staged exit models:
     python -m crypto.backtest `
-      --base "crypto/results/crypto_btc_payoff_h5_seed1_resume_seed2_36h.checkpoint.json#1#payoff#0.002#0.10#Long" `
+      --base "crypto/results/crypto_btc_payoff_h5_seed1_resume_seed2_48h.json#1#payoff#0.002#0.05#Long" `
       --base-ensemble and `
       --exit1 "crypto/results/crypto_btc_exit_after_h1_h5_tp04_seed1_12h.json#1#exit_after_h1#0.004#0.20#Long" `
       --exit2 "crypto/results/crypto_btc_exit_after_h2_h5_tp04_seed1_12h.json#1#exit_after_h2#0.004#0.10#Long" `
@@ -98,9 +98,22 @@ logger = logging.getLogger("crypto.backtest")
 
 DEFAULT_OUT_DIR = config.RESULTS_DIR / "backtest"
 TP_SWEEP_START: float = -0.002
-TP_SWEEP_END: float = 0.005
+TP_SWEEP_END: float = 0.007
 TP_SWEEP_STEP: float = 0.0005
-EXIT_TOP_FRACTIONS: list[float] = [0.10 ,0.20, 0.30, 0.40, 0.50, 0.6, 0.7]
+BASE_FRACTION_BAND_STEP: float = 0.05
+BASE_FRACTION_BAND_MAX: float = 0.50
+SCORE_BAND_RANGES: list[tuple[float, float]] = [
+    (0.00, 0.05),
+    (0.05, 0.10),
+    (0.10, 0.15),
+    (0.15, 0.20),
+    (0.20, 0.25),
+    (0.25, 0.30),
+]
+SCORE_BAND_TP_OPT_START: float = -0.0070
+SCORE_BAND_TP_OPT_END: float = 0.0070
+SCORE_BAND_TP_OPT_STEP: float = 0.0005
+EXIT_TOP_FRACTIONS: list[float] = [0.10, 0.20, 0.30, 0.40, 0.50, 0.6, 0.7]
 TP_OPT_START: float = 0.0020
 TP_OPT_END: float = 0.0070
 TP_OPT_STEP: float = 0.0005
@@ -143,6 +156,7 @@ class BacktestResult:
     csv_path: Path
     tp_sweep_csv_path: Path
     tp_optimization_csv_path: Path
+    score_band_strategy_csv_path: Path
     chart_path: Path
 
 
@@ -171,9 +185,8 @@ def run_backtest(
         directions = {spec.label_direction for spec in specs}
         if len(directions) != 1:
             raise ValueError(
-                "A staged backtest cannot mix Long and Short model specs. "
-                "Use archives with the same label_direction or pass "
-                "--label-direction to explicitly override all specs."
+                "Mixed Long and Short model specs require --label-direction "
+                "to select the common strategy evaluation direction."
             )
         label_direction = directions.pop()
 
@@ -182,8 +195,9 @@ def run_backtest(
     out_path.mkdir(parents=True, exist_ok=True)
 
     logger.info(
-        "Backtest setup: direction=%s | base_specs=%d | base_ensemble=%s | exit1=%s rank %d | exit2=%s rank %d",
+        "Backtest setup: evaluation_direction=%s | train_directions=%s | base_specs=%d | base_ensemble=%s | exit1=%s rank %d | exit2=%s rank %d",
         label_direction,
+        [spec.label_direction for spec in specs],
         len(base_specs),
         base_ensemble.upper(),
         exit1_spec.archive_path,
@@ -193,7 +207,9 @@ def run_backtest(
     )
     logger.info("Loading crypto data from %s", data_path)
     raw_df = load_ohlcv(data_path)
-    base_horizons = _normalize_horizons(config.HOLDING_HORIZONS, "config.HOLDING_HORIZONS")
+    base_horizons = _normalize_horizons(
+        config.HOLDING_HORIZONS, "config.HOLDING_HORIZONS"
+    )
     exit1_horizons = _archive_horizons(
         exit1_spec.archive_path,
         fallback=base_horizons,
@@ -227,7 +243,6 @@ def run_backtest(
         test_start=test_start,
         test_end=test_end,
         purge_bars=purge_bars,
-        label_direction=label_direction,
     )
     required_windows = _required_windows_for_entries(entries)
     feature_space = _cached_feature_space(
@@ -249,7 +264,6 @@ def run_backtest(
             test_start=test_start,
             test_end=test_end,
             purge_bars=purge_bars,
-            label_direction=label_direction,
         )
         base_bundles.append(bundle)
 
@@ -263,7 +277,6 @@ def run_backtest(
         test_start=test_start,
         test_end=test_end,
         purge_bars=purge_bars,
-        label_direction=label_direction,
     )
     exit2_bundle = _train_spec_bundle(
         spec=exit2_spec,
@@ -275,7 +288,6 @@ def run_backtest(
         test_start=test_start,
         test_end=test_end,
         purge_bars=purge_bars,
-        label_direction=label_direction,
     )
     base_bundle = _combine_base_bundles(base_bundles, selection=base_ensemble)
 
@@ -309,6 +321,15 @@ def run_backtest(
         tp_sweep_rows.extend(split_tp_rows)
 
     summary = pd.DataFrame(summary_rows)
+    tp_sweep_rows.extend(
+        _base_fraction_band_tp_rows(
+            base_bundles=base_bundles,
+            selection=base_ensemble,
+            path_returns=path_returns,
+            thresholds=tp_sweep_thresholds,
+            label_direction=label_direction,
+        )
+    )
     tp_sweep = pd.DataFrame(tp_sweep_rows)
     val_strategy = _dynamic_tp_strategy_frame(
         base_split=base_bundle.val,
@@ -332,6 +353,15 @@ def run_backtest(
         levels=_tp_optimization_levels(),
         top_k=TP_OPT_TOP_K,
     )
+    score_band_strategy = _score_band_staged_strategy(
+        base_bundles=base_bundles,
+        selection=base_ensemble,
+        exit1_bundle=exit1_bundle,
+        exit2_bundle=exit2_bundle,
+        path_returns=path_returns,
+        raw_index=pd.DatetimeIndex(raw_df.index),
+        label_direction=label_direction,
+    )
     run_name = _backtest_name(
         base_specs,
         exit1_spec,
@@ -343,14 +373,17 @@ def run_backtest(
     csv_path = out_path / f"{run_name}.csv"
     tp_sweep_csv_path = out_path / f"{run_name}_tp_sweep.csv"
     tp_optimization_csv_path = out_path / f"{run_name}_dynamic_tp_top5.csv"
+    score_band_strategy_csv_path = out_path / f"{run_name}_score_band_strategy.csv"
     chart_path = out_path / f"{run_name}.png"
     summary.to_csv(csv_path, index=False)
     tp_sweep.to_csv(tp_sweep_csv_path, index=False)
     tp_optimization.to_csv(tp_optimization_csv_path, index=False)
+    score_band_strategy.to_csv(score_band_strategy_csv_path, index=False)
     _plot_summary(
         summary=summary,
         tp_sweep=tp_sweep,
         tp_optimization=tp_optimization,
+        score_band_strategy=score_band_strategy,
         chart_path=chart_path,
         base_label=base_bundle.label,
         exit1_label=exit1_bundle.label,
@@ -362,6 +395,7 @@ def run_backtest(
     logger.info("Saved summary: %s", csv_path)
     logger.info("Saved TP sweep: %s", tp_sweep_csv_path)
     logger.info("Saved dynamic TP top %d: %s", TP_OPT_TOP_K, tp_optimization_csv_path)
+    logger.info("Saved score-band staged strategy: %s", score_band_strategy_csv_path)
     logger.info("Saved chart: %s", chart_path)
     return BacktestResult(
         summary=summary,
@@ -370,6 +404,7 @@ def run_backtest(
         csv_path=csv_path,
         tp_sweep_csv_path=tp_sweep_csv_path,
         tp_optimization_csv_path=tp_optimization_csv_path,
+        score_band_strategy_csv_path=score_band_strategy_csv_path,
         chart_path=chart_path,
     )
 
@@ -382,7 +417,6 @@ def _quality_train_index(
     test_start: str,
     test_end: str | None,
     purge_bars: int,
-    label_direction: str,
 ) -> pd.Index:
     labeled = add_binary_labels(
         raw_df,
@@ -390,7 +424,7 @@ def _quality_train_index(
         threshold=spec.label_threshold,
         return_fn=config.get_label_return_fn(spec.label_mode),
         label_mode=spec.label_mode,
-        label_direction=label_direction,
+        label_direction=spec.label_direction,
     )
     train_df, _, _ = split_labeled_by_dates(
         labeled,
@@ -453,7 +487,9 @@ def _archive_label_direction(
 
 def _normalize_horizons(values: Any, label: str) -> list[int]:
     if isinstance(values, (str, bytes)) or not isinstance(values, (list, tuple, set)):
-        raise ValueError(f"{label} must be a list of positive integers, got: {values!r}")
+        raise ValueError(
+            f"{label} must be a list of positive integers, got: {values!r}"
+        )
     horizons = sorted({int(value) for value in values})
     if not horizons:
         raise ValueError(f"{label} must not be empty.")
@@ -507,8 +543,8 @@ def _train_spec_bundle(
     test_start: str,
     test_end: str | None,
     purge_bars: int,
-    label_direction: str,
 ) -> BundleSignals:
+    label_direction = spec.label_direction
     logger.info(
         "Training %s rank %d | mode=%s direction=%s threshold=%.6f top=%.2f%% | horizons=%s",
         spec.archive_path,
@@ -551,7 +587,9 @@ def _train_spec_bundle(
             horizon_results.append(result)
 
     if not horizon_results:
-        raise ValueError(f"No valid horizon model for {spec.archive_path} rank {spec.rank}.")
+        raise ValueError(
+            f"No valid horizon model for {spec.archive_path} rank {spec.rank}."
+        )
 
     label = (
         f"{spec.archive_path.stem} r{spec.rank:02d} "
@@ -590,7 +628,9 @@ def _train_one_horizon_signal(
     val = _valid_frame(val_df, label_col, ret_col)
     test = _valid_frame(test_df, label_col, ret_col)
     if train.empty or val.empty or test.empty:
-        logger.warning("h%d skipped: empty train/val/test after label filtering.", horizon)
+        logger.warning(
+            "h%d skipped: empty train/val/test after label filtering.", horizon
+        )
         return None
 
     X_train = feature_space.matrix(individual.features, train.index)
@@ -707,7 +747,11 @@ def _combine_base_bundles(
 ) -> BundleSignals:
     if len(bundles) == 1:
         return bundles[0]
-    label = f"base {str(selection).upper()} (" + " + ".join(item.label for item in bundles) + ")"
+    label = (
+        f"base {str(selection).upper()} ("
+        + " + ".join(item.label for item in bundles)
+        + ")"
+    )
     return BundleSignals(
         label=label,
         val=_combine_bundle_splits("val", [item.val for item in bundles], selection),
@@ -720,11 +764,15 @@ def _combine_bundle_splits(
     splits: list[SplitSignals],
     selection: str,
 ) -> SplitSignals:
-    selected_index = _combine_indices([item.selected_index for item in splits], selection)
+    selected_index = _combine_indices(
+        [item.selected_index for item in splits], selection
+    )
     common_index = splits[0].data.index
     for item in splits[1:]:
         common_index = common_index.union(item.data.index)
-    pred_frame = pd.concat([item.data["pred"].reindex(common_index) for item in splits], axis=1)
+    pred_frame = pd.concat(
+        [item.data["pred"].reindex(common_index) for item in splits], axis=1
+    )
     label_frame = pd.concat(
         [item.data["label"].reindex(common_index) for item in splits],
         axis=1,
@@ -746,7 +794,9 @@ def _combine_bundle_splits(
 
 
 def _selected_pred_threshold(data: pd.DataFrame, selected_index: pd.Index) -> float:
-    selected = data.reindex(data.index.intersection(selected_index)).dropna(subset=["pred"])
+    selected = data.reindex(data.index.intersection(selected_index)).dropna(
+        subset=["pred"]
+    )
     if selected.empty:
         return float("nan")
     return float(pd.to_numeric(selected["pred"], errors="coerce").min())
@@ -763,6 +813,172 @@ def _combine_indices(indices: list[pd.Index], selection: str) -> pd.Index:
         else:
             selected = selected.intersection(current)
     return selected if selected is not None else pd.Index([])
+
+
+def _base_fraction_band_tp_rows(
+    base_bundles: list[BundleSignals],
+    selection: str,
+    path_returns: pd.DataFrame,
+    thresholds: list[float],
+    label_direction: str,
+) -> list[dict[str, Any]]:
+    """Measure disjoint 5%-wide base-signal score bands.
+
+    Each member learns its cumulative top-fraction cutoff from validation.
+    The same member cutoff is then applied to test before member indices are
+    combined with the configured AND/OR rule.
+    """
+    if not base_bundles:
+        return []
+    rows: list[dict[str, Any]] = []
+    bands_by_split = _base_fraction_band_indices(
+        base_bundles,
+        selection=selection,
+        max_fraction=BASE_FRACTION_BAND_MAX,
+    )
+    for split_name, split_bands in bands_by_split.items():
+        for band_start, band_end, band_selected in split_bands:
+            band_rows = _tp_sweep_rows(
+                split=split_name,
+                group="base_fraction_band",
+                selected_base_index=band_selected,
+                path_returns=path_returns,
+                thresholds=thresholds,
+                min_h=1,
+                label_direction=label_direction,
+            )
+            low_h1_rows = _low_h1_sweep_rows(
+                split=split_name,
+                selected_base_index=band_selected,
+                path_returns=path_returns,
+                thresholds=thresholds,
+                label_direction=label_direction,
+            )
+            for row in [*band_rows, *low_h1_rows]:
+                row["band_start"] = band_start
+                row["band_end"] = float(band_end)
+            rows.extend(band_rows)
+            rows.extend(low_h1_rows)
+    return rows
+
+
+def _base_fraction_band_indices(
+    base_bundles: list[BundleSignals],
+    selection: str,
+    max_fraction: float,
+) -> dict[str, list[tuple[float, float, pd.Index]]]:
+    band_count = int(round(float(max_fraction) / BASE_FRACTION_BAND_STEP))
+    band_ends = [
+        float(step_index * BASE_FRACTION_BAND_STEP)
+        for step_index in range(1, band_count + 1)
+    ]
+    member_cutoffs = [
+        [_top_fraction_cutoff(bundle.val.data, fraction) for fraction in band_ends]
+        for bundle in base_bundles
+    ]
+    result: dict[str, list[tuple[float, float, pd.Index]]] = {}
+    for split_name in ("val", "test"):
+        previous_cumulative = pd.Index([])
+        split_bands: list[tuple[float, float, pd.Index]] = []
+        for band_index, band_end in enumerate(band_ends):
+            member_indices: list[pd.Index] = []
+            for member_index, bundle in enumerate(base_bundles):
+                split_signals = bundle.val if split_name == "val" else bundle.test
+                if split_name == "val":
+                    selected = _top_fraction_indices(split_signals.data, band_end)
+                else:
+                    selected = _indices_at_or_above_cutoff(
+                        split_signals.data,
+                        member_cutoffs[member_index][band_index],
+                    )
+                member_indices.append(selected)
+            cumulative = _combine_indices(member_indices, selection=selection)
+            band_selected = cumulative.difference(previous_cumulative, sort=False)
+            band_start = float(band_end - BASE_FRACTION_BAND_STEP)
+            split_bands.append((band_start, band_end, band_selected))
+            previous_cumulative = cumulative
+        result[split_name] = split_bands
+    return result
+
+
+def _top_fraction_cutoff(data: pd.DataFrame, fraction: float) -> float:
+    selected = _top_fraction_indices(data, fraction)
+    if len(selected) == 0:
+        return float("nan")
+    pred = pd.to_numeric(data.loc[selected, "pred"], errors="coerce").dropna()
+    return float(pred.min()) if not pred.empty else float("nan")
+
+
+def _top_fraction_indices(data: pd.DataFrame, fraction: float) -> pd.Index:
+    if data.empty or "pred" not in data.columns:
+        return pd.Index([])
+    pred = pd.to_numeric(data["pred"], errors="coerce").dropna()
+    if pred.empty:
+        return pd.Index([])
+    n_select = min(
+        len(pred),
+        max(1, int(np.ceil(len(pred) * float(fraction) - 1e-12))),
+    )
+    return pd.Index(pred.nlargest(n_select).index)
+
+
+def _indices_at_or_above_cutoff(data: pd.DataFrame, cutoff: float) -> pd.Index:
+    if data.empty or "pred" not in data.columns or not np.isfinite(cutoff):
+        return pd.Index([])
+    pred = pd.to_numeric(data["pred"], errors="coerce")
+    return pd.Index(data.index[pred >= float(cutoff)])
+
+
+def _low_h1_sweep_rows(
+    split: str,
+    selected_base_index: pd.Index,
+    path_returns: pd.DataFrame,
+    thresholds: list[float],
+    label_direction: str,
+) -> list[dict[str, Any]]:
+    selected_path = path_returns.reindex(selected_base_index)
+    if "low_h1" not in selected_path.columns:
+        selected_path = selected_path.iloc[0:0]
+    else:
+        selected_path = selected_path.dropna(subset=["low_h1"])
+    total = int(len(selected_path))
+    directional_low = (
+        pd.to_numeric(selected_path["low_h1"], errors="coerce")
+        if "low_h1" in selected_path.columns
+        else pd.Series(dtype=float)
+    )
+    raw_low = (
+        -directional_low
+        if config.canonical_label_direction(label_direction) == "short"
+        else directional_low
+    )
+
+    rows: list[dict[str, Any]] = []
+    for threshold in thresholds:
+        hit_count: int | float = float("nan")
+        hit_rate = float("nan")
+        miss_count: int | float = float("nan")
+        if float(threshold) >= 0.0:
+            hit = raw_low < -float(threshold)
+            hit_count = int(hit.sum())
+            hit_rate = hit_count / total if total else 0.0
+            miss_count = total - hit_count
+        rows.append(
+            {
+                "split": split,
+                "group": "base_fraction_band_low_h1",
+                "tp_threshold": float(threshold),
+                "sample_count": total,
+                "hit_count": hit_count,
+                "hit_rate": hit_rate,
+                "miss_count": miss_count,
+                "miss_return_mean": float("nan"),
+                "close_h2_return_mean": float("nan"),
+                "two_sided_count": float("nan"),
+                "two_sided_rate": float("nan"),
+            }
+        )
+    return rows
 
 
 def _summarize_split(
@@ -813,11 +1029,11 @@ def _summarize_split(
             "base_pred_threshold": _json_safe_float(base_split.pred_threshold),
             "tp_threshold": float(tp_threshold),
         }
-        return summary, (
-            _empty_stage_tp_rows(split, tp_sweep_thresholds)
-        )
+        return summary, (_empty_stage_tp_rows(split, tp_sweep_thresholds))
 
-    no_h1_index = pd.Index(base_path.index[base_path[hit_h1_col] <= float(tp_threshold)])
+    no_h1_index = pd.Index(
+        base_path.index[base_path[hit_h1_col] <= float(tp_threshold)]
+    )
     no_h1_count = int(len(no_h1_index))
     adverse_h1 = pd.to_numeric(base_path[adverse_h1_col], errors="coerce")
     low_h1_le_neg01_count = int((adverse_h1 <= -0.001).sum())
@@ -845,7 +1061,9 @@ def _summarize_split(
     )
     exit1_no_selected_no_h2_count = int(len(exit1_no_selected_no_h2_index))
 
-    exit2_mapping = _future_bar_mapping(exit1_no_selected_no_h2_index, raw_index, offset=2)
+    exit2_mapping = _future_bar_mapping(
+        exit1_no_selected_no_h2_index, raw_index, offset=2
+    )
     exit2_selected_index = pd.Index(exit2_split.selected_index)
     exit2_selected_mapping = exit2_mapping[
         exit2_mapping["exit_index"].isin(exit2_selected_index)
@@ -872,7 +1090,9 @@ def _summarize_split(
             low_h1_le_neg005_count / base_signals if base_signals else 0.0
         ),
         "exit1_selected": exit1_selected_count,
-        "exit1_selected_rate": exit1_selected_count / no_h1_count if no_h1_count else 0.0,
+        "exit1_selected_rate": exit1_selected_count / no_h1_count
+        if no_h1_count
+        else 0.0,
         "exit1_no_selected": exit1_no_selected_count,
         "exit1_no_selected_rate": (
             exit1_no_selected_count / no_h1_count if no_h1_count else 0.0
@@ -910,6 +1130,7 @@ def _summarize_split(
         thresholds=tp_sweep_thresholds,
         min_h=1,
         label_direction=label_direction,
+        include_two_sided_move=True,
     )
     base_no_h1_tp_rows = _tp_sweep_rows(
         split=split,
@@ -990,9 +1211,7 @@ def _summarize_split(
 
 
 def _tp_optimization_levels() -> list[float]:
-    count = int(
-        np.floor((TP_OPT_END - TP_OPT_START) / TP_OPT_STEP + 1e-12)
-    ) + 1
+    count = int(np.floor((TP_OPT_END - TP_OPT_START) / TP_OPT_STEP + 1e-12)) + 1
     levels = [float(TP_OPT_START + idx * TP_OPT_STEP) for idx in range(max(count, 0))]
     if not levels:
         raise ValueError("Dynamic TP optimization requires at least one TP level.")
@@ -1017,11 +1236,16 @@ def _dynamic_tp_strategy_frame(
         min_h=1,
         label_direction=label_direction,
     )
+    adverse_cols = _future_price_columns(
+        path_returns,
+        _adverse_price_prefix(label_direction),
+        min_h=1,
+    )
     if len(hit_cols) < 3:
         return pd.DataFrame()
     final_h = _max_h_from_hit_columns(hit_cols, label_direction=label_direction)
     close_col = f"close_h{final_h}"
-    required = [*hit_cols, close_col]
+    required = [*hit_cols, *adverse_cols, "close_h2", close_col]
     base_path = path_returns.reindex(pd.Index(base_split.selected_index)).dropna(
         subset=required
     )
@@ -1032,27 +1256,397 @@ def _dynamic_tp_strategy_frame(
     hit_prefix = _hit_price_prefix(label_direction)
     frame["high_h1"] = pd.to_numeric(base_path[f"{hit_prefix}_h1"], errors="coerce")
     frame["high_h2"] = pd.to_numeric(base_path[f"{hit_prefix}_h2"], errors="coerce")
+    adverse_prefix = _adverse_price_prefix(label_direction)
+    frame["adverse_h1"] = pd.to_numeric(
+        base_path[f"{adverse_prefix}_h1"], errors="coerce"
+    )
+    frame["adverse_h2"] = pd.to_numeric(
+        base_path[f"{adverse_prefix}_h2"], errors="coerce"
+    )
     h2_plus = _future_hit_columns(base_path, min_h=2, label_direction=label_direction)
     h3_plus = _future_hit_columns(base_path, min_h=3, label_direction=label_direction)
     frame["max_high_h2_plus"] = base_path[h2_plus].max(axis=1, skipna=False)
     frame["max_high_h3_plus"] = base_path[h3_plus].max(axis=1, skipna=False)
+    adverse_h3_plus = _future_price_columns(
+        base_path,
+        adverse_prefix,
+        min_h=3,
+    )
+    frame["min_adverse_h3_plus"] = base_path[adverse_h3_plus].min(
+        axis=1,
+        skipna=False,
+    )
+    frame["close_h2"] = pd.to_numeric(base_path["close_h2"], errors="coerce")
     frame["close_final"] = pd.to_numeric(base_path[close_col], errors="coerce")
 
     exit1_mapping = _future_bar_mapping(frame.index, raw_index, offset=1)
     exit2_mapping = _future_bar_mapping(frame.index, raw_index, offset=2)
     exit1_selected = pd.Series(
-        exit1_mapping["exit_index"].isin(pd.Index(exit1_split.selected_index)).to_numpy(),
+        exit1_mapping["exit_index"]
+        .isin(pd.Index(exit1_split.selected_index))
+        .to_numpy(),
         index=pd.Index(exit1_mapping["base_index"]),
         dtype=bool,
     )
     exit2_selected = pd.Series(
-        exit2_mapping["exit_index"].isin(pd.Index(exit2_split.selected_index)).to_numpy(),
+        exit2_mapping["exit_index"]
+        .isin(pd.Index(exit2_split.selected_index))
+        .to_numpy(),
         index=pd.Index(exit2_mapping["base_index"]),
         dtype=bool,
     )
-    frame["exit1_selected"] = exit1_selected.reindex(frame.index).fillna(False).astype(bool)
-    frame["exit2_selected"] = exit2_selected.reindex(frame.index).fillna(False).astype(bool)
+    frame["exit1_selected"] = (
+        exit1_selected.reindex(frame.index).fillna(False).astype(bool)
+    )
+    frame["exit2_selected"] = (
+        exit2_selected.reindex(frame.index).fillna(False).astype(bool)
+    )
     return frame.replace([np.inf, -np.inf], np.nan).dropna()
+
+
+def _score_band_staged_strategy(
+    base_bundles: list[BundleSignals],
+    selection: str,
+    exit1_bundle: BundleSignals,
+    exit2_bundle: BundleSignals,
+    path_returns: pd.DataFrame,
+    raw_index: pd.DatetimeIndex,
+    label_direction: str,
+) -> pd.DataFrame:
+    columns = [
+        "split",
+        "score_band",
+        "band_start",
+        "band_end",
+        "tp_h1",
+        "tp_exit1_selected",
+        "tp_exit1_no_selected",
+        "tp_exit2_selected",
+        "tp_exit2_no_selected",
+        "trades",
+        "hit_h1",
+        "hit_h2_exit1_selected",
+        "hit_h2_exit1_no_selected",
+        "hit_h3_h5_exit2_selected",
+        "hit_h3_h5_exit2_no_selected",
+        "close_h5",
+        "hit_rate",
+        "gross_mean",
+        "e_net",
+    ]
+    max_fraction = max(end for _, end in SCORE_BAND_RANGES)
+    bands_by_split = _base_fraction_band_indices(
+        base_bundles,
+        selection=selection,
+        max_fraction=max_fraction,
+    )
+    frames_by_split: dict[str, dict[tuple[float, float], pd.DataFrame]] = {}
+    for split_name, split_bands in bands_by_split.items():
+        exit1_split = exit1_bundle.val if split_name == "val" else exit1_bundle.test
+        exit2_split = exit2_bundle.val if split_name == "val" else exit2_bundle.test
+        split_frames: dict[tuple[float, float], pd.DataFrame] = {}
+        for band_start, band_end, selected_index in split_bands:
+            band_key = _score_band_key(band_start, band_end)
+            if not _is_score_band_range(*band_key):
+                continue
+            base_split = SplitSignals(
+                split=split_name,
+                data=pd.DataFrame(index=selected_index),
+                selected_index=selected_index,
+                pred_threshold=float("nan"),
+                top_fraction=float(band_end),
+            )
+            split_frames[band_key] = _dynamic_tp_strategy_frame(
+                base_split=base_split,
+                exit1_split=exit1_split,
+                exit2_split=exit2_split,
+                path_returns=path_returns,
+                raw_index=raw_index,
+                label_direction=label_direction,
+            )
+        frames_by_split[split_name] = split_frames
+
+    tp_levels = _score_band_tp_optimization_levels()
+    selected_tp_by_band = {
+        band_key: _optimize_score_band_tp_combo(val_frame, tp_levels)
+        for band_key, val_frame in frames_by_split.get("val", {}).items()
+    }
+    rows: list[dict[str, Any]] = []
+    for split_name in ("val", "test"):
+        detailed_frames: list[pd.DataFrame] = []
+        for band_start, band_end in SCORE_BAND_RANGES:
+            band_key = _score_band_key(band_start, band_end)
+            frame = frames_by_split.get(split_name, {}).get(band_key, pd.DataFrame())
+            tp_combo = selected_tp_by_band.get(band_key)
+            if tp_combo is None:
+                continue
+            frame = frame.copy()
+            frame["band_start"] = float(band_start)
+            frame["band_end"] = float(band_end)
+            (
+                frame["tp_h1"],
+                frame["tp_exit1_selected"],
+                frame["tp_exit1_no_selected"],
+                frame["tp_exit2_selected"],
+                frame["tp_exit2_no_selected"],
+            ) = tp_combo
+            detailed = _simulate_score_band_staged_frame(frame)
+            detailed_frames.append(detailed)
+            rows.append(
+                _score_band_strategy_metrics(
+                    detailed,
+                    split=split_name,
+                    band_start=band_start,
+                    band_end=band_end,
+                    tp_combo=tp_combo,
+                )
+            )
+        if detailed_frames:
+            all_detailed = pd.concat(detailed_frames, axis=0)
+            rows.append(
+                _score_band_strategy_metrics(
+                    all_detailed,
+                    split=split_name,
+                    band_start=float("nan"),
+                    band_end=float("nan"),
+                    tp_combo=None,
+                )
+            )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _is_score_band_range(band_start: float, band_end: float) -> bool:
+    return any(
+        np.isclose(band_start, configured_start)
+        and np.isclose(band_end, configured_end)
+        for configured_start, configured_end in SCORE_BAND_RANGES
+    )
+
+
+def _score_band_key(band_start: float, band_end: float) -> tuple[float, float]:
+    return (round(float(band_start), 10), round(float(band_end), 10))
+
+
+def _score_band_tp_optimization_levels() -> list[float]:
+    count = (
+        int(
+            np.floor(
+                (SCORE_BAND_TP_OPT_END - SCORE_BAND_TP_OPT_START)
+                / SCORE_BAND_TP_OPT_STEP
+                + 1e-12
+            )
+        )
+        + 1
+    )
+    return [
+        float(SCORE_BAND_TP_OPT_START + idx * SCORE_BAND_TP_OPT_STEP)
+        for idx in range(max(count, 0))
+    ]
+
+
+def _optimize_score_band_tp_combo(
+    val_frame: pd.DataFrame,
+    levels: list[float],
+) -> tuple[float, float, float, float, float] | None:
+    if val_frame.empty or not levels:
+        return None
+    positive_levels = [float(level) for level in levels if float(level) > 0.0]
+    if not positive_levels:
+        return None
+    arrays = _score_band_strategy_arrays(val_frame)
+    best: tuple[float, int, tuple[float, float, float, float, float]] | None = None
+
+    for tp_h1 in positive_levels:
+        hit_h1 = arrays["high_h1"] > float(tp_h1)
+        after_h1 = ~hit_h1
+        h1_total = float(hit_h1.sum()) * float(tp_h1)
+        h1_hits = int(hit_h1.sum())
+
+        for tp_exit1_selected in positive_levels:
+            selected_h1 = after_h1 & arrays["exit1_selected"]
+            hit_selected_h2 = selected_h1 & (
+                arrays["high_h2"] > float(tp_exit1_selected)
+            )
+            for tp_exit1_no_selected in positive_levels:
+                no_selected_h1 = after_h1 & ~arrays["exit1_selected"]
+                hit_no_selected_h2 = no_selected_h1 & (
+                    arrays["high_h2"] > float(tp_exit1_no_selected)
+                )
+                hit_h2 = hit_selected_h2 | hit_no_selected_h2
+                after_h2 = after_h1 & ~hit_h2
+                h2_total = float(hit_selected_h2.sum()) * float(
+                    tp_exit1_selected
+                ) + float(hit_no_selected_h2.sum()) * float(tp_exit1_no_selected)
+                h2_hits = int(hit_h2.sum())
+
+                exit2_selected = after_h2 & arrays["exit2_selected"]
+                exit2_no_selected = after_h2 & ~arrays["exit2_selected"]
+                selected_total, selected_hits, tp_exit2_selected = (
+                    _best_score_band_exit2_option(exit2_selected, arrays, levels)
+                )
+                no_total, no_hits, tp_exit2_no_selected = _best_score_band_exit2_option(
+                    exit2_no_selected, arrays, levels
+                )
+                total = h1_total + h2_total + selected_total + no_total
+                hit_count = h1_hits + h2_hits + selected_hits + no_hits
+                combo = (
+                    float(tp_h1),
+                    float(tp_exit1_selected),
+                    float(tp_exit1_no_selected),
+                    float(tp_exit2_selected),
+                    float(tp_exit2_no_selected),
+                )
+                candidate = (total, hit_count, combo)
+                if best is None or _score_band_candidate_key(
+                    candidate
+                ) > _score_band_candidate_key(best):
+                    best = candidate
+    return best[2] if best is not None else None
+
+
+def _best_score_band_exit2_option(
+    mask: np.ndarray,
+    arrays: dict[str, np.ndarray],
+    levels: list[float],
+) -> tuple[float, int, float]:
+    options: list[tuple[float, int, float]] = []
+    favorable = arrays["max_high_h3_plus"][mask]
+    close_final = arrays["close_final"][mask]
+    for level in levels:
+        hit = favorable > float(level)
+        total = float(np.where(hit, float(level), close_final).sum())
+        options.append((total, int(hit.sum()), float(level)))
+    return max(options, key=lambda item: (item[0], item[1], -item[2]))
+
+
+def _score_band_level_hit(
+    favorable: np.ndarray,
+    adverse: np.ndarray,
+    level: float,
+) -> np.ndarray:
+    threshold = float(level)
+    return favorable > threshold if threshold >= 0.0 else adverse < threshold
+
+
+def _score_band_candidate_key(
+    candidate: tuple[float, int, tuple[float, float, float, float, float]],
+) -> tuple[float, int, tuple[float, float, float, float, float]]:
+    total, hit_count, combo = candidate
+    return (total, hit_count, tuple(-value for value in combo))
+
+
+def _score_band_strategy_arrays(frame: pd.DataFrame) -> dict[str, np.ndarray]:
+    return {
+        "high_h1": frame["high_h1"].to_numpy(dtype=float),
+        "high_h2": frame["high_h2"].to_numpy(dtype=float),
+        "adverse_h1": frame["adverse_h1"].to_numpy(dtype=float),
+        "adverse_h2": frame["adverse_h2"].to_numpy(dtype=float),
+        "max_high_h3_plus": frame["max_high_h3_plus"].to_numpy(dtype=float),
+        "min_adverse_h3_plus": frame["min_adverse_h3_plus"].to_numpy(dtype=float),
+        "close_h2": frame["close_h2"].to_numpy(dtype=float),
+        "close_final": frame["close_final"].to_numpy(dtype=float),
+        "exit1_selected": frame["exit1_selected"].to_numpy(dtype=bool),
+        "exit2_selected": frame["exit2_selected"].to_numpy(dtype=bool),
+    }
+
+
+def _simulate_score_band_staged_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame(columns=[*frame.columns, "realized", "outcome"])
+    result = frame.copy()
+    tp_h1 = pd.to_numeric(result["tp_h1"], errors="coerce")
+    tp_after_h1 = pd.to_numeric(result["tp_exit1_no_selected"], errors="coerce").where(
+        ~result["exit1_selected"],
+        pd.to_numeric(result["tp_exit1_selected"], errors="coerce"),
+    )
+    tp_after_h2 = pd.to_numeric(result["tp_exit2_no_selected"], errors="coerce").where(
+        ~result["exit2_selected"],
+        pd.to_numeric(result["tp_exit2_selected"], errors="coerce"),
+    )
+    outcome = pd.Series("close_h5", index=result.index, dtype=object)
+    realized = pd.to_numeric(result["close_final"], errors="coerce").copy()
+
+    hit_h1 = result["high_h1"] > tp_h1
+    realized.loc[hit_h1] = tp_h1.loc[hit_h1]
+    outcome.loc[hit_h1] = "tp_h1"
+
+    after_h1 = ~hit_h1
+    hit_h2 = after_h1 & (result["high_h2"] > tp_after_h1)
+    hit_h2_exit1_selected = hit_h2 & result["exit1_selected"]
+    hit_h2_exit1_no_selected = hit_h2 & ~result["exit1_selected"]
+    realized.loc[hit_h2] = tp_after_h1.loc[hit_h2]
+    outcome.loc[hit_h2_exit1_selected] = "tp_h2_e1_selected"
+    outcome.loc[hit_h2_exit1_no_selected] = "tp_h2_e1_no_selected"
+
+    after_h2 = after_h1 & ~hit_h2
+    exit2_selected = after_h2 & result["exit2_selected"]
+    exit2_no_selected = after_h2 & ~result["exit2_selected"]
+    hit_after_h2 = result["max_high_h3_plus"] > tp_after_h2
+    hit_h3_h5_selected = exit2_selected & hit_after_h2
+    hit_h3_h5_no_selected = exit2_no_selected & hit_after_h2
+    realized.loc[hit_h3_h5_selected] = tp_after_h2.loc[hit_h3_h5_selected]
+    realized.loc[hit_h3_h5_no_selected] = tp_after_h2.loc[hit_h3_h5_no_selected]
+    outcome.loc[hit_h3_h5_selected] = "tp_h3_h5_e2_selected"
+    outcome.loc[hit_h3_h5_no_selected] = "tp_h3_h5_e2_no_selected"
+
+    result["active_tp_after_h1"] = tp_after_h1
+    result["active_tp_after_h2"] = tp_after_h2
+    result["realized"] = realized
+    result["outcome"] = outcome
+    return result
+
+
+def _score_band_series_hit(
+    favorable: pd.Series,
+    adverse: pd.Series,
+    level: pd.Series,
+) -> pd.Series:
+    return ((level >= 0.0) & (favorable > level)) | ((level < 0.0) & (adverse < level))
+
+
+def _score_band_strategy_metrics(
+    detailed: pd.DataFrame,
+    split: str,
+    band_start: float,
+    band_end: float,
+    tp_combo: tuple[float, float, float, float, float] | None,
+) -> dict[str, Any]:
+    n = int(len(detailed))
+    outcome = detailed.get("outcome", pd.Series(dtype=object))
+    hit_count = int(outcome.astype(str).str.startswith("tp_").sum())
+    gross_mean = (
+        float(pd.to_numeric(detailed["realized"], errors="coerce").mean())
+        if n
+        else float("nan")
+    )
+    is_all = not np.isfinite(band_start)
+    return {
+        "split": split,
+        "score_band": (
+            "ALL top 0-30%"
+            if is_all
+            else f"top {float(band_start):.0%}-{float(band_end):.0%}"
+        ),
+        "band_start": band_start,
+        "band_end": band_end,
+        "tp_h1": tp_combo[0] if tp_combo is not None else float("nan"),
+        "tp_exit1_selected": tp_combo[1] if tp_combo is not None else float("nan"),
+        "tp_exit1_no_selected": tp_combo[2] if tp_combo is not None else float("nan"),
+        "tp_exit2_selected": tp_combo[3] if tp_combo is not None else float("nan"),
+        "tp_exit2_no_selected": tp_combo[4] if tp_combo is not None else float("nan"),
+        "trades": n,
+        "hit_h1": int((outcome == "tp_h1").sum()),
+        "hit_h2_exit1_selected": int((outcome == "tp_h2_e1_selected").sum()),
+        "hit_h2_exit1_no_selected": int((outcome == "tp_h2_e1_no_selected").sum()),
+        "hit_h3_h5_exit2_selected": int((outcome == "tp_h3_h5_e2_selected").sum()),
+        "hit_h3_h5_exit2_no_selected": int(
+            (outcome == "tp_h3_h5_e2_no_selected").sum()
+        ),
+        "close_h5": int((outcome == "close_h5").sum()),
+        "hit_rate": hit_count / n if n else 0.0,
+        "gross_mean": gross_mean,
+        "e_net": gross_mean - float(config.TRADE_COST) if n else float("nan"),
+    }
 
 
 def _optimize_dynamic_tp(
@@ -1175,7 +1769,11 @@ def _top_dynamic_tp_candidates(
 
         combined: list[tuple[float, int, tuple[float, ...]]] = []
         for exit1_total, exit1_hits, tp_exit1 in exit1_options:
-            for downstream_total, downstream_hits, downstream_combo in downstream_options:
+            for (
+                downstream_total,
+                downstream_hits,
+                downstream_combo,
+            ) in downstream_options:
                 combined.append(
                     (
                         h1_total + exit1_total + downstream_total,
@@ -1260,9 +1858,7 @@ def _simulate_dynamic_tp_arrays(
     hit |= hit_exit2
 
     exit2_no_selected = after_h2 & ~arrays["exit2_selected"]
-    hit_exit2_no = exit2_no_selected & (
-        arrays["max_high_h3_plus"] > tp_exit2_no
-    )
+    hit_exit2_no = exit2_no_selected & (arrays["max_high_h3_plus"] > tp_exit2_no)
     realized[hit_exit2_no] = tp_exit2_no
     hit |= hit_exit2_no
 
@@ -1314,6 +1910,8 @@ def _empty_tp_sweep_rows(
             "miss_count": 0,
             "miss_return_mean": float("nan"),
             "close_h2_return_mean": float("nan"),
+            "two_sided_count": float("nan"),
+            "two_sided_rate": float("nan"),
         }
         for threshold in thresholds
     ]
@@ -1345,6 +1943,7 @@ def _tp_sweep_rows(
     min_h: int = 2,
     max_h: int | None = None,
     label_direction: str = config.LABEL_DIRECTION,
+    include_two_sided_move: bool = False,
 ) -> list[dict[str, Any]]:
     selected_path = path_returns.reindex(selected_base_index)
     hit_cols = _future_hit_columns(
@@ -1353,13 +1952,25 @@ def _tp_sweep_rows(
         max_h=max_h,
         label_direction=label_direction,
     )
-    selected_path = selected_path.dropna(subset=hit_cols) if hit_cols else selected_path.iloc[0:0]
+    selected_path = (
+        selected_path.dropna(subset=hit_cols) if hit_cols else selected_path.iloc[0:0]
+    )
     total = int(len(selected_path))
     if total == 0 or not hit_cols:
         return _empty_tp_sweep_rows(split, thresholds, group=group)
 
     hit_values = selected_path[hit_cols].apply(pd.to_numeric, errors="coerce")
-    close_col = f"close_h{_max_h_from_hit_columns(hit_cols, label_direction=label_direction)}"
+    high_cols = _future_price_columns(selected_path, "high", min_h=min_h, max_h=max_h)
+    low_cols = _future_price_columns(selected_path, "low", min_h=min_h, max_h=max_h)
+    high_values = selected_path[high_cols].apply(pd.to_numeric, errors="coerce")
+    low_values = selected_path[low_cols].apply(pd.to_numeric, errors="coerce")
+    if config.canonical_label_direction(label_direction) == "short":
+        # Path returns are direction-normalized; restore raw price returns.
+        high_values = -high_values
+        low_values = -low_values
+    close_col = (
+        f"close_h{_max_h_from_hit_columns(hit_cols, label_direction=label_direction)}"
+    )
     close_values = (
         pd.to_numeric(selected_path[close_col], errors="coerce")
         if close_col in selected_path.columns
@@ -1380,7 +1991,22 @@ def _tp_sweep_rows(
         miss = ~hit
         miss_count = int(miss.sum())
         miss_close = close_values[miss & close_values.notna()]
-        miss_return_mean = float(miss_close.mean()) if not miss_close.empty else float("nan")
+        miss_return_mean = (
+            float(miss_close.mean()) if not miss_close.empty else float("nan")
+        )
+        two_sided_count: int | float = float("nan")
+        two_sided_rate = float("nan")
+        if (
+            include_two_sided_move
+            and float(threshold) >= 0.0
+            and high_cols
+            and low_cols
+        ):
+            two_sided = (high_values > float(threshold)).any(axis=1) & (
+                low_values < -float(threshold)
+            ).any(axis=1)
+            two_sided_count = int(two_sided.sum())
+            two_sided_rate = two_sided_count / total if total else 0.0
         rows.append(
             {
                 "split": split,
@@ -1392,17 +2018,27 @@ def _tp_sweep_rows(
                 "miss_count": miss_count,
                 "miss_return_mean": miss_return_mean,
                 "close_h2_return_mean": close_h2_return_mean,
+                "two_sided_count": two_sided_count,
+                "two_sided_rate": two_sided_rate,
             }
         )
     return rows
 
 
 def _hit_price_prefix(label_direction: str = config.LABEL_DIRECTION) -> str:
-    return "low" if config.canonical_label_direction(label_direction) == "short" else "high"
+    return (
+        "low"
+        if config.canonical_label_direction(label_direction) == "short"
+        else "high"
+    )
 
 
 def _adverse_price_prefix(label_direction: str = config.LABEL_DIRECTION) -> str:
-    return "high" if config.canonical_label_direction(label_direction) == "short" else "low"
+    return (
+        "high"
+        if config.canonical_label_direction(label_direction) == "short"
+        else "low"
+    )
 
 
 def _future_hit_columns(
@@ -1411,8 +2047,22 @@ def _future_hit_columns(
     max_h: int | None = None,
     label_direction: str = config.LABEL_DIRECTION,
 ) -> list[str]:
+    return _future_price_columns(
+        frame,
+        _hit_price_prefix(label_direction),
+        min_h=min_h,
+        max_h=max_h,
+    )
+
+
+def _future_price_columns(
+    frame: pd.DataFrame,
+    price_prefix: str,
+    min_h: int,
+    max_h: int | None = None,
+) -> list[str]:
     columns: list[tuple[int, str]] = []
-    prefix = f"{_hit_price_prefix(label_direction)}_h"
+    prefix = f"{price_prefix}_h"
     min_h = max(int(min_h), 1)
     max_h_value = int(max_h) if max_h is not None else None
     for column in frame.columns:
@@ -1450,6 +2100,7 @@ def _plot_summary(
     summary: pd.DataFrame,
     tp_sweep: pd.DataFrame,
     tp_optimization: pd.DataFrame,
+    score_band_strategy: pd.DataFrame,
     chart_path: Path,
     base_label: str,
     exit1_label: str,
@@ -1458,22 +2109,28 @@ def _plot_summary(
     tp_threshold: float,
     label_direction: str,
 ) -> None:
-    fig, (
-        ax_p1_summary,
-        ax_p1_base,
-        ax_p1_no_h1,
-        ax_p1_selected,
-        ax_p1_no_selected,
-        ax_p1_no_selected_h2,
-        ax_p2_summary,
-        ax_p2_base,
-        ax_p2_selected,
-        ax_p2_no_selected,
-        ax_tp_optimization,
+    (
+        fig,
+        (
+            ax_p1_summary,
+            ax_p1_base,
+            ax_p1_no_h1,
+            ax_p1_selected,
+            ax_p1_no_selected,
+            ax_p1_no_selected_h2,
+            ax_p2_summary,
+            ax_p2_base,
+            ax_p2_selected,
+            ax_p2_no_selected,
+            ax_tp_optimization,
+            ax_base_fraction_bands,
+            ax_base_fraction_low_h1,
+            ax_score_band_strategy,
+        ),
     ) = plt.subplots(
-        11,
+        14,
         1,
-        figsize=(17.5, 27.5),
+        figsize=(17.5, 39.5),
         gridspec_kw={
             "height_ratios": [
                 1.25,
@@ -1487,6 +2144,9 @@ def _plot_summary(
                 1.35,
                 1.35,
                 1.50,
+                3.10,
+                3.10,
+                2.20,
             ]
         },
         constrained_layout=True,
@@ -1577,6 +2237,39 @@ def _plot_summary(
         ),
         font_size=6.8,
     )
+    _draw_table(
+        ax_base_fraction_bands,
+        _fraction_band_sweep_table(tp_sweep),
+        title=(
+            "Base signal score bands: TP hitrate in H1-H5 | "
+            "disjoint 5% bands to top 50% | member Val cutoffs applied to Test"
+        ),
+        font_size=5.8,
+    )
+    _draw_table(
+        ax_base_fraction_low_h1,
+        _fraction_band_sweep_table(
+            tp_sweep,
+            group_name="base_fraction_band_low_h1",
+        ),
+        title=(
+            "Base signal score bands: low H1 below -level / band signals | "
+            "candidate Buy Limit fill rate below open H1"
+        ),
+        font_size=5.8,
+    )
+    _draw_table(
+        ax_score_band_strategy,
+        _score_band_strategy_table(score_band_strategy),
+        title=(
+            "Val-optimized score-band staged strategy | TP/exit grid "
+            f"{SCORE_BAND_TP_OPT_START:.2%}..{SCORE_BAND_TP_OPT_END:.2%} "
+            f"step={SCORE_BAND_TP_OPT_STEP:.2%} | Val TP applied unchanged to Test | "
+            "joint positive TP H1/E1-selected/E1-no-selected + "
+            "TP E2-selected/E2-no-selected | all H3-H5 misses -> close H5"
+        ),
+        font_size=6.4,
+    )
     fig.savefig(chart_path, dpi=170)
     plt.close(fig)
 
@@ -1604,7 +2297,9 @@ def _part1_summary_table(summary: pd.DataFrame) -> pd.DataFrame:
                 ),
                 "e_after_h1 selected": exit1_selected,
                 "e_after_h1 no selected": exit1_no_selected,
-                "exit_h1_top_fraction": _format_pct(float(row.get("exit1_top_fraction", 0.0))),
+                "exit_h1_top_fraction": _format_pct(
+                    float(row.get("exit1_top_fraction", 0.0))
+                ),
                 "TP_threshold": _format_pct(float(row.get("tp_threshold", 0.0))),
             }
         )
@@ -1633,7 +2328,9 @@ def _part2_summary_table(summary: pd.DataFrame) -> pd.DataFrame:
                 "base_e_after_h1_no_selected_no_H2": no_h2,
                 "e_after_h2 selected": exit2_selected,
                 "e_after_h2 no selected": exit2_no_selected,
-                "exit_h2_top_fraction": _format_pct(float(row.get("exit2_top_fraction", 0.0))),
+                "exit_h2_top_fraction": _format_pct(
+                    float(row.get("exit2_top_fraction", 0.0))
+                ),
                 "TP_threshold": _format_pct(float(row.get("tp_threshold", 0.0))),
             }
         )
@@ -1658,7 +2355,9 @@ def _sweep_table(
     group_name: str,
     include_close_h2: bool = False,
 ) -> pd.DataFrame:
-    columns = ["split"] + [_format_threshold_pct(threshold) for threshold in _tp_sweep_thresholds()]
+    columns = ["split"] + [
+        _format_threshold_pct(threshold) for threshold in _tp_sweep_thresholds()
+    ]
     if tp_sweep.empty or "group" not in tp_sweep.columns:
         return pd.DataFrame(columns=columns)
     subset = tp_sweep[tp_sweep["group"].astype(str) == str(group_name)]
@@ -1671,15 +2370,28 @@ def _sweep_table(
         n_value = pd.to_numeric(sorted_group["sample_count"], errors="coerce").max()
         n = int(n_value) if pd.notna(n_value) else 0
         hit_row: dict[str, str] = {"split": f"{split} hit n={n}"}
+        two_sided_row: dict[str, str] = {"split": f"{split} high>thr & low<-thr"}
         miss_return_row: dict[str, str] = {"split": f"{split} miss ret"}
+        has_two_sided = (
+            pd.to_numeric(
+                sorted_group.get("two_sided_rate"),
+                errors="coerce",
+            )
+            .notna()
+            .any()
+        )
         for _, item in sorted_group.iterrows():
             threshold_label = _format_threshold_pct(float(item["tp_threshold"]))
-            hit_row[threshold_label] = _format_pct(
-                float(item["hit_rate"])
-            )
+            hit_row[threshold_label] = _format_pct(float(item["hit_rate"]))
             miss_return = item.get("miss_return_mean", float("nan"))
             miss_return_row[threshold_label] = _format_signed_pct(miss_return)
+            two_sided_rate = item.get("two_sided_rate", float("nan"))
+            two_sided_row[threshold_label] = (
+                _format_pct(float(two_sided_rate)) if pd.notna(two_sided_rate) else ""
+            )
         rows.append(hit_row)
+        if has_two_sided:
+            rows.append(two_sided_row)
         rows.append(miss_return_row)
         if include_close_h2:
             close_h2 = pd.to_numeric(
@@ -1691,6 +2403,113 @@ def _sweep_table(
                 close_h2_row[columns[1]] = _format_signed_pct(float(close_h2.iloc[0]))
             rows.append(close_h2_row)
     return pd.DataFrame(rows, columns=columns).fillna("")
+
+
+def _fraction_band_sweep_table(
+    tp_sweep: pd.DataFrame,
+    group_name: str = "base_fraction_band",
+) -> pd.DataFrame:
+    columns = ["split / score band"] + [
+        _format_threshold_pct(threshold) for threshold in _tp_sweep_thresholds()
+    ]
+    required = {"group", "band_start", "band_end", "tp_threshold", "hit_rate"}
+    if tp_sweep.empty or not required.issubset(tp_sweep.columns):
+        return pd.DataFrame(columns=columns)
+    subset = tp_sweep[tp_sweep["group"].astype(str) == str(group_name)]
+    if subset.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows: list[dict[str, str]] = []
+    for (split, band_start, band_end), group in subset.groupby(
+        ["split", "band_start", "band_end"],
+        sort=False,
+        dropna=False,
+    ):
+        sorted_group = group.sort_values("tp_threshold")
+        n_value = pd.to_numeric(sorted_group["sample_count"], errors="coerce").max()
+        n = int(n_value) if pd.notna(n_value) else 0
+        row: dict[str, str] = {
+            "split / score band": (
+                f"{split} top {float(band_start):.0%}-{float(band_end):.0%} n={n}"
+            )
+        }
+        for _, item in sorted_group.iterrows():
+            hit_rate = item.get("hit_rate", float("nan"))
+            row[_format_threshold_pct(float(item["tp_threshold"]))] = (
+                _format_pct(float(hit_rate)) if pd.notna(hit_rate) else ""
+            )
+        rows.append(row)
+    return pd.DataFrame(rows, columns=columns).fillna("")
+
+
+def _score_band_strategy_table(results: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "split / score band",
+        "TP H1",
+        "TP E1 selected",
+        "TP E1 no-selected",
+        "TP E2 selected",
+        "TP E2 no-selected",
+        "n",
+        "hit H1",
+        "hit H2 E1 selected",
+        "hit H2 E1 no-selected",
+        "hit H3-H5 E2 selected",
+        "hit H3-H5 E2 no-selected",
+        "close H5",
+        "all TP hit",
+        "gross mean",
+        "E[net]",
+    ]
+    if results.empty:
+        return pd.DataFrame(columns=columns)
+    rows: list[dict[str, str]] = []
+    for _, row in results.iterrows():
+        n = int(row.get("trades", 0) or 0)
+        tp_h1 = row.get("tp_h1", float("nan"))
+        tp_exit1_selected = row.get("tp_exit1_selected", float("nan"))
+        tp_exit1_no_selected = row.get("tp_exit1_no_selected", float("nan"))
+        tp_exit2_selected = row.get("tp_exit2_selected", float("nan"))
+        tp_exit2_no_selected = row.get("tp_exit2_no_selected", float("nan"))
+        rows.append(
+            {
+                "split / score band": f"{row.get('split', '')} {row.get('score_band', '')}",
+                "TP H1": _format_optional_tp(tp_h1),
+                "TP E1 selected": _format_optional_tp(tp_exit1_selected),
+                "TP E1 no-selected": _format_optional_tp(tp_exit1_no_selected),
+                "TP E2 selected": _format_optional_tp(tp_exit2_selected),
+                "TP E2 no-selected": _format_optional_tp(tp_exit2_no_selected),
+                "n": str(n),
+                "hit H1": _count_fraction_cell(row.get("hit_h1"), n),
+                "hit H2 E1 selected": _count_fraction_cell(
+                    row.get("hit_h2_exit1_selected"), n
+                ),
+                "hit H2 E1 no-selected": _count_fraction_cell(
+                    row.get("hit_h2_exit1_no_selected"), n
+                ),
+                "hit H3-H5 E2 selected": _count_fraction_cell(
+                    row.get("hit_h3_h5_exit2_selected"), n
+                ),
+                "hit H3-H5 E2 no-selected": _count_fraction_cell(
+                    row.get("hit_h3_h5_exit2_no_selected"), n
+                ),
+                "close H5": _count_fraction_cell(row.get("close_h5"), n),
+                "all TP hit": _format_pct(float(row.get("hit_rate", 0.0))),
+                "gross mean": _format_signed_pct(row.get("gross_mean")),
+                "E[net]": _format_signed_pct(row.get("e_net")),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _format_optional_tp(value: Any) -> str:
+    return _format_pct(float(value)) if pd.notna(value) else "varies"
+
+
+def _count_fraction_cell(value: Any, denominator: int) -> str:
+    count = int(value or 0)
+    fraction = count / denominator if denominator else 0.0
+    return f"{count} ({fraction:.1%})"
 
 
 def _dynamic_tp_table(results: pd.DataFrame) -> pd.DataFrame:
@@ -1716,13 +2535,9 @@ def _dynamic_tp_table(results: pd.DataFrame) -> pd.DataFrame:
             {
                 "rank": _count_cell(row.get("rank")),
                 "TP H1": _format_pct(float(row.get("tp_h1", 0.0))),
-                "TP E1 selected": _format_pct(
-                    float(row.get("tp_exit1_selected", 0.0))
-                ),
+                "TP E1 selected": _format_pct(float(row.get("tp_exit1_selected", 0.0))),
                 "TP H2": _format_pct(float(row.get("tp_h2", 0.0))),
-                "TP E2 selected": _format_pct(
-                    float(row.get("tp_exit2_selected", 0.0))
-                ),
+                "TP E2 selected": _format_pct(float(row.get("tp_exit2_selected", 0.0))),
                 "TP E2 no-selected": _format_pct(
                     float(row.get("tp_exit2_no_selected", 0.0))
                 ),
@@ -1883,8 +2698,12 @@ def _parse_spec(
     archive_text, rank_text, mode_text, threshold_text = parts[:4]
     mode_text = config.canonical_label_mode(mode_text)
     if require_top_fraction and len(parts) < 5:
-        raise ValueError("Exit spec must include TOP_FRACTION or use a top-fraction CLI option.")
-    top_fraction = float(parts[4]) if len(parts) == 5 and parts[4] else float(default_top_fraction)
+        raise ValueError(
+            "Exit spec must include TOP_FRACTION or use a top-fraction CLI option."
+        )
+    top_fraction = (
+        float(parts[4]) if len(parts) == 5 and parts[4] else float(default_top_fraction)
+    )
     if len(parts) == 6:
         top_fraction = float(parts[4]) if parts[4] else float(default_top_fraction)
     direction = _archive_label_direction(
@@ -2020,12 +2839,15 @@ def main() -> None:
         "--label-direction",
         default=None,
         help=(
-            "Override direction for every model spec. Long uses high as TP; "
-            "Short uses low as TP. Default: read each archive metadata; old "
-            "archives without label_direction are treated as Long."
+            "Common strategy evaluation direction. Long uses high as TP; Short "
+            "uses low as TP. This does not override model training directions: "
+            "each model uses its own spec/archive direction. Required when model "
+            "specs mix Long and Short."
         ),
     )
-    parser.add_argument("--data", default=str(config.DATA_PATH), help="Crypto OHLCV CSV path.")
+    parser.add_argument(
+        "--data", default=str(config.DATA_PATH), help="Crypto OHLCV CSV path."
+    )
     parser.add_argument(
         "--out-dir",
         default=str(DEFAULT_OUT_DIR),
@@ -2110,6 +2932,8 @@ def main() -> None:
                 {
                     "csv": str(result.csv_path),
                     "tp_sweep_csv": str(result.tp_sweep_csv_path),
+                    "dynamic_tp_csv": str(result.tp_optimization_csv_path),
+                    "score_band_strategy_csv": str(result.score_band_strategy_csv_path),
                     "chart": str(result.chart_path),
                 }
                 for result in results

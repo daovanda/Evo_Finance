@@ -34,7 +34,9 @@ def load_ohlcv(path: str | Path = config.DATA_PATH) -> pd.DataFrame:
         raise ValueError(f"Missing date column: {config.DATE_COLUMN!r}")
 
     df[config.DATE_COLUMN] = pd.to_datetime(df[config.DATE_COLUMN])
-    df = df.sort_values(config.DATE_COLUMN).drop_duplicates(config.DATE_COLUMN, keep="last")
+    df = df.sort_values(config.DATE_COLUMN).drop_duplicates(
+        config.DATE_COLUMN, keep="last"
+    )
     df = df.set_index(config.DATE_COLUMN)
     df.index.name = "date"
 
@@ -88,9 +90,15 @@ def add_binary_labels(
     future_return_h stores the executable strategy payoff used by fitness:
     threshold on a TP hit, otherwise the close return at the final horizon.
     The safe_path_mfe mode uses its explicit first-hit/path-safety label.
+    For payoff, label=1 additionally requires the full H1..H adverse path to
+    stay strictly above config.PAYOFF_ADVERSE_FLOOR. Its future_return remains
+    the executable TP-or-final-close payoff used by fitness.
     For adverse_floor, label=1 means the full future path stays above the
     directional adverse floor, while future_return_h is zero because this
     mode is optimized as a classification filter rather than a payoff model.
+    For high_exit, label=1 means the favorable extreme of the exact H candle
+    exceeds the threshold. Its future_return_h is zero because this mode is
+    also optimized only as a classification filter.
     """
     labeled = df.sort_index().copy()
     selected_mode = config.canonical_label_mode(label_mode)
@@ -110,7 +118,9 @@ def add_binary_labels(
             labeled[f"label_h{h}"] = explicit_label
             continue
 
-        future_return = _call_label_return_fn(label_return_fn, labeled, h, selected_direction)
+        future_return = _call_label_return_fn(
+            label_return_fn, labeled, h, selected_direction
+        )
         if selected_mode == "adverse_floor":
             if float(label_threshold) <= 0.0:
                 raise ValueError(
@@ -119,7 +129,24 @@ def add_binary_labels(
                 )
             complete = future_return.notna()
             adverse_floor = -float(label_threshold)
-            explicit_label = future_return.gt(adverse_floor).astype("float64").where(complete)
+            explicit_label = (
+                future_return.gt(adverse_floor).astype("float64").where(complete)
+            )
+            labeled[f"future_return_h{h}"] = pd.Series(
+                0.0,
+                index=labeled.index,
+                dtype="float64",
+            ).where(complete)
+            labeled[f"label_h{h}"] = explicit_label
+            continue
+
+        if selected_mode == "high_exit":
+            complete = future_return.notna()
+            explicit_label = (
+                future_return.gt(float(label_threshold))
+                .astype("float64")
+                .where(complete)
+            )
             labeled[f"future_return_h{h}"] = pd.Series(
                 0.0,
                 index=labeled.index,
@@ -144,8 +171,24 @@ def add_binary_labels(
             labeled[f"label_h{h}"] = hit_tp.astype("float").where(complete)
             continue
 
+        if selected_mode == "payoff":
+            adverse_return = config.adverse_floor_future_return(
+                labeled,
+                h,
+                direction=selected_direction,
+            )
+            complete = future_return.notna() & adverse_return.notna()
+            explicit_label = future_return.gt(
+                float(label_threshold)
+            ) & adverse_return.gt(float(config.PAYOFF_ADVERSE_FLOOR))
+            labeled[f"future_return_h{h}"] = future_return.where(complete)
+            labeled[f"label_h{h}"] = explicit_label.astype("float64").where(complete)
+            continue
+
         if selected_mode == "exit_after_h1":
-            h1_price = labeled["low"] if selected_direction == "short" else labeled["high"]
+            h1_price = (
+                labeled["low"] if selected_direction == "short" else labeled["high"]
+            )
             h1_return = config.directional_price_return(
                 h1_price,
                 labeled["open"],
@@ -154,7 +197,9 @@ def add_binary_labels(
             future_return = future_return.mask(h1_return >= float(label_threshold))
         elif selected_mode == "exit_after_h2":
             entry_open = labeled["open"].shift(1)
-            hit_price = labeled["low"] if selected_direction == "short" else labeled["high"]
+            hit_price = (
+                labeled["low"] if selected_direction == "short" else labeled["high"]
+            )
             h1_return = config.directional_price_return(
                 hit_price.shift(1),
                 entry_open,
@@ -170,7 +215,9 @@ def add_binary_labels(
             )
             future_return = future_return.mask(hit_h1_or_h2)
         labeled[f"future_return_h{h}"] = future_return
-        labeled[f"label_h{h}"] = (future_return > float(label_threshold)).astype("float")
+        labeled[f"label_h{h}"] = (future_return > float(label_threshold)).astype(
+            "float"
+        )
         labeled.loc[future_return.isna(), f"label_h{h}"] = np.nan
     return labeled
 
