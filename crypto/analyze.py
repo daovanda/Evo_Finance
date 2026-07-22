@@ -2296,7 +2296,8 @@ def main() -> None:
         default=None,
         help=(
             "Long or Short. An explicit value overrides archive metadata. "
-            "Archives created before direction metadata are treated as Long."
+            "Archives created before direction metadata are treated as Long. "
+            "This option is ignored by the direction-neutral two_sided_tp mode."
         ),
     )
     parser.add_argument(

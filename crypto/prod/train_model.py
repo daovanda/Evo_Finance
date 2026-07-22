@@ -544,6 +544,7 @@ def _config_snapshot(
         "horizons": list(config.HOLDING_HORIZONS),
         "label_mode": label_mode,
         "label_direction": label_direction,
+        "direction_neutral": config.is_direction_neutral_label_mode(label_mode),
         "label_threshold": float(label_threshold),
         "payoff_tp": float(config.PAYOFF_TP),
         "payoff_adverse_floor": float(config.PAYOFF_ADVERSE_FLOOR),
@@ -752,7 +753,8 @@ def main() -> None:
             "SAFE_ADVERSE_FLOOR for safe_path_mfe. For safe_path_mfe this is "
             "the stop-first adverse low/high floor; TP is config.TP_SAFE_PATH. "
             "For adverse_floor use a positive distance such as 0.003. For "
-            "high_exit this is the directional threshold of the exact H candle."
+            "high_exit this is the directional threshold of the exact H candle. "
+            "For two_sided_tp it is the positive absolute TP on both sides."
         ),
     )
     args = parser.parse_args()

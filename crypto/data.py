@@ -99,6 +99,9 @@ def add_binary_labels(
     For high_exit, label=1 means the favorable extreme of the exact H candle
     exceeds the threshold. Its future_return_h is zero because this mode is
     also optimized only as a classification filter.
+    For two_sided_tp, label=1 means both the Long and Short TP are reached;
+    future_return_h is the combined gross payoff of the two positions. Label
+    direction is ignored for this direction-neutral mode.
     """
     labeled = df.sort_index().copy()
     selected_mode = config.canonical_label_mode(label_mode)
@@ -107,6 +110,16 @@ def add_binary_labels(
     label_threshold = config.default_label_threshold(selected_mode, threshold)
     for h in horizons:
         h = int(h)
+        if selected_mode == "two_sided_tp":
+            future_return, explicit_label = config.two_sided_tp_outcome(
+                labeled,
+                h,
+                threshold=float(label_threshold),
+            )
+            labeled[f"future_return_h{h}"] = future_return
+            labeled[f"label_h{h}"] = explicit_label
+            continue
+
         if selected_mode == "safe_path_mfe":
             future_return, explicit_label = config.safe_path_mfe_outcome(
                 labeled,

@@ -383,6 +383,66 @@ def payoff_future_return(
     return payoff.where(mfe.notna() & close_return.notna())
 
 
+def two_sided_tp_outcome(
+    df: Any,
+    horizon: int,
+    threshold: float,
+) -> tuple[pd.Series, pd.Series]:
+    """Gross payoff and label for simultaneous Long and Short positions.
+
+    Both positions use ``open(t+1)`` as entry and the same absolute TP. The
+    position that does not hit TP is closed at ``close(t+h)``. If neither side
+    hits, the two close returns cancel, so the combined gross payoff is zero.
+    Direction is deliberately absent because this strategy trades both sides.
+    """
+    h = int(horizon)
+    tp = float(threshold)
+    if h < 1:
+        raise ValueError("horizon must be positive for two_sided_tp.")
+    if not isfinite(tp) or tp <= 0.0:
+        raise ValueError("two_sided_tp label_threshold must be finite and positive.")
+
+    entry_open = df["open"].shift(-1)
+    future_highs = pd.concat(
+        [df["high"].shift(-offset) for offset in range(1, h + 1)],
+        axis=1,
+    )
+    future_lows = pd.concat(
+        [df["low"].shift(-offset) for offset in range(1, h + 1)],
+        axis=1,
+    )
+    max_high_return = future_highs.max(axis=1, skipna=False).div(entry_open) - 1.0
+    min_low_return = future_lows.min(axis=1, skipna=False).div(entry_open) - 1.0
+    close_return = df["close"].shift(-h).div(entry_open) - 1.0
+    complete = (
+        entry_open.notna()
+        & max_high_return.notna()
+        & min_low_return.notna()
+        & close_return.notna()
+    )
+
+    up_hit = max_high_return.gt(tp)
+    down_hit = min_low_return.lt(-tp)
+    both_hit = up_hit & down_hit
+    payoff = pd.Series(0.0, index=df.index, dtype="float64")
+    payoff = payoff.mask(up_hit & ~down_hit, tp - close_return)
+    payoff = payoff.mask(~up_hit & down_hit, tp + close_return)
+    payoff = payoff.mask(both_hit, 2.0 * tp).where(complete)
+    label = both_hit.astype("float64").where(complete)
+    return payoff, label
+
+
+def two_sided_tp_future_return(
+    df: Any,
+    horizon: int,
+    direction: str | None = None,
+) -> Any:
+    """Default-threshold return adapter for the label-mode registry."""
+    del direction
+    payoff, _ = two_sided_tp_outcome(df, horizon, float(LABEL_THRESHOLD))
+    return payoff
+
+
 LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
     "close_exit": close_exit_future_return,
     "high_exit": high_exit_future_return,
@@ -391,6 +451,7 @@ LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
     "adverse_floor": adverse_floor_future_return,
     "safe_path_mfe": safe_path_mfe_future_return,
     "payoff": payoff_future_return,
+    "two_sided_tp": two_sided_tp_future_return,
     "exit_after_h1": exit_after_h1_future_return,
     "exit_after_h2": exit_after_h2_future_return,
 }
@@ -415,9 +476,15 @@ PRECISION_ONLY_LABEL_MODES: frozenset[str] = frozenset(
     {"adverse_floor", "high_exit"}
 )
 
+DIRECTION_NEUTRAL_LABEL_MODES: frozenset[str] = frozenset({"two_sided_tp"})
+
 
 def is_precision_only_label_mode(mode: str | None = None) -> bool:
     return canonical_label_mode(mode) in PRECISION_ONLY_LABEL_MODES
+
+
+def is_direction_neutral_label_mode(mode: str | None = None) -> bool:
+    return canonical_label_mode(mode) in DIRECTION_NEUTRAL_LABEL_MODES
 
 
 def get_label_return_fn(mode: str | None = None) -> Callable[[Any, int], Any]:

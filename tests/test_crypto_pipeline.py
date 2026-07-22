@@ -1,4 +1,3 @@
-import itertools
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -17,16 +16,16 @@ from crypto.backtest import (
     _dynamic_tp_arrays,
     _draw_table,
     _fraction_band_sweep_table,
-    _optimize_score_band_tp_combo,
+    _fraction_band_two_sided_table,
     _parse_spec,
-    _score_band_strategy_metrics,
+    _score_band_fixed_h5_metrics,
     _score_band_strategy_table,
-    _score_band_tp_optimization_levels,
-    _simulate_score_band_staged_frame,
+    _simulate_score_band_fixed_h5_frame,
     _simulate_dynamic_tp_arrays,
     _summarize_split,
     _sweep_table,
     _tp_sweep_rows,
+    _two_sided_sweep_thresholds,
     _train_spec_bundle,
 )
 import matplotlib.pyplot as plt
@@ -48,13 +47,6 @@ from crypto.fitness import (
 
 
 class CryptoPipelineTests(unittest.TestCase):
-    def test_score_band_grid_covers_stop_and_profit_range(self):
-        levels = _score_band_tp_optimization_levels()
-
-        self.assertEqual(len(levels), 29)
-        self.assertAlmostEqual(levels[0], -0.007)
-        self.assertAlmostEqual(levels[-1], 0.007)
-
     def test_backtest_base_fraction_bands_are_disjoint(self):
         idx = pd.date_range("2024-01-01", periods=100, freq="15min")
         pred = pd.Series(np.linspace(1.0, 0.01, len(idx)), index=idx)
@@ -96,6 +88,12 @@ class CryptoPipelineTests(unittest.TestCase):
         )
         self.assertEqual(len(low_h1_rendered), 20)
         self.assertTrue((low_h1_rendered["0.10%"] == "100.00%").all())
+        two_sided_rendered = _fraction_band_two_sided_table(raw)
+        self.assertEqual(len(_two_sided_sweep_thresholds()), 20)
+        self.assertEqual(len(two_sided_rendered), 20)
+        self.assertTrue((two_sided_rendered["0.10%"] == "100.00%").all())
+        self.assertTrue((two_sided_rendered["0.15%"] == "0.00%").all())
+        self.assertIn("1.00%", two_sided_rendered.columns)
 
         short_path = path_returns.copy()
         short_path[[f"high_h{h}" for h in range(1, 6)]] *= -1.0
@@ -263,160 +261,110 @@ class CryptoPipelineTests(unittest.TestCase):
         self.assertEqual(metrics["hit_rate"], 1.0)
         self.assertEqual(metrics["n_trades"], 5.0)
 
-    def test_score_band_staged_strategy_routes_h1_h2_exit2_and_h5(self):
+    def test_score_band_fixed_strategy_routes_h1_through_h5_and_close_h5(self):
         frame = pd.DataFrame(
             {
-                "high_h1": [0.005, 0.0, 0.0, 0.0, 0.0, 0.0],
-                "high_h2": [0.0, 0.004, 0.002, 0.0, 0.0, 0.0],
-                "adverse_h1": [0.0] * 6,
-                "adverse_h2": [0.0] * 6,
-                "decision_h2": [0.0] * 6,
-                "decision_h3": [0.0] * 6,
-                "max_high_h3_plus": [0.0, 0.0, 0.0, 0.004, 0.004, 0.0],
-                "min_adverse_h3_plus": [0.0] * 6,
-                "close_h2": [-0.01, -0.01, -0.01, -0.002, -0.003, -0.004],
-                "close_final": [-0.02, -0.02, -0.02, -0.02, -0.005, -0.006],
-                "exit1_selected": [True, True, False, True, True, False],
-                "exit2_selected": [True, True, True, True, False, True],
-                "tp_h1": [0.0045, 0.003, 0.0025, 0.003, 0.003, 0.002],
-                "tp_exit1_selected": [0.003] * 6,
-                "tp_exit1_no_selected": [0.001] * 6,
-                "tp_exit2_selected": [0.003] * 6,
-                "tp_exit2_no_selected": [0.003] * 6,
+                "high_h1": [0.007, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "high_h2": [0.0, 0.007, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "high_h3": [0.0, 0.0, 0.007, 0.0, 0.0, 0.0, 0.0],
+                "high_h4": [0.0, 0.0, 0.0, 0.007, 0.0, 0.0, 0.0],
+                "open_h5": [0.0, 0.0, 0.0, 0.0, -0.001, -0.003, -0.003],
+                "high_h5": [0.0, 0.0, 0.0, 0.0, 0.0, -0.002, -0.0021],
+                "adverse_h1": [0.0] * 7,
+                "adverse_h2": [0.0] * 7,
+                "adverse_h3": [0.0] * 7,
+                "adverse_h4": [0.0] * 7,
+                "adverse_h5": [0.0] * 7,
+                "close_h5": [-0.01, -0.01, -0.01, -0.01, -0.01, -0.01, -0.006],
             }
         )
 
-        detailed = _simulate_score_band_staged_frame(frame)
+        with patch("crypto.backtest.SCORE_BAND_CUTLOSS", -0.008):
+            detailed = _simulate_score_band_fixed_h5_frame(frame)
 
         self.assertEqual(
             detailed["outcome"].tolist(),
             [
                 "tp_h1",
-                "tp_h2_e1_selected",
-                "tp_h2_e1_no_selected",
-                "tp_h3_h5_e2_selected",
-                "tp_h3_h5_e2_no_selected",
+                "tp_h2",
+                "tp_h3",
+                "tp_h4",
+                "open_h5",
+                "tp_h5",
                 "close_h5",
             ],
         )
         self.assertTrue(
             np.allclose(
                 detailed["realized"].to_numpy(),
-                [0.0045, 0.003, 0.001, 0.003, 0.003, -0.006],
+                [0.007, 0.007, 0.007, 0.007, -0.001, -0.002, -0.006],
             )
         )
 
-        metrics = _score_band_strategy_metrics(
+        metrics = _score_band_fixed_h5_metrics(
             detailed,
             split="val",
             band_start=0.0,
             band_end=0.05,
-            tp_combo=(0.0045, 0.003, 0.001, 0.003, 0.003),
         )
-        self.assertEqual(metrics["trades"], 6)
+        self.assertEqual(metrics["trades"], 7)
         self.assertEqual(metrics["hit_h1"], 1)
-        self.assertEqual(metrics["hit_h2_exit1_selected"], 1)
-        self.assertEqual(metrics["hit_h2_exit1_no_selected"], 1)
-        self.assertEqual(metrics["hit_h3_h5_exit2_selected"], 1)
-        self.assertEqual(metrics["hit_h3_h5_exit2_no_selected"], 1)
+        self.assertEqual(metrics["hit_h2"], 1)
+        self.assertEqual(metrics["hit_h3"], 1)
+        self.assertEqual(metrics["hit_h4"], 1)
+        self.assertEqual(metrics["hit_open_h5"], 1)
+        self.assertEqual(metrics["hit_h5"], 1)
+        self.assertEqual(metrics["cutloss"], 0)
         self.assertEqual(metrics["close_h5"], 1)
         self.assertAlmostEqual(
             metrics["e_net"],
-            np.mean([0.0045, 0.003, 0.001, 0.003, 0.003, -0.006]) - config.TRADE_COST,
+            np.mean([0.007, 0.007, 0.007, 0.007, -0.001, -0.002, -0.006])
+            - config.TRADE_COST,
         )
         rendered = _score_band_strategy_table(pd.DataFrame([metrics]))
-        self.assertEqual(rendered.iloc[0]["hit H2 E1 selected"], "1 (16.7%)")
-        self.assertEqual(rendered.iloc[0]["hit H2 E1 no-selected"], "1 (16.7%)")
+        self.assertEqual(rendered.iloc[0]["hit H1"], "1 (14.3%) | +0.70%")
+        self.assertEqual(rendered.iloc[0]["hit H2"], "1 (14.3%) | +0.70%")
+        self.assertEqual(rendered.iloc[0]["hit H3"], "1 (14.3%) | +0.70%")
+        self.assertEqual(rendered.iloc[0]["hit H4"], "1 (14.3%) | +0.70%")
+        self.assertEqual(rendered.iloc[0]["hit open H5"], "1 (14.3%) | -0.10%")
+        self.assertEqual(rendered.iloc[0]["hit H5"], "1 (14.3%) | -0.20%")
+        self.assertEqual(rendered.iloc[0]["cutloss"], "0 (0.0%) | n/a")
+        self.assertEqual(rendered.iloc[0]["close H5"], "1 (14.3%) | -0.60%")
 
-    def test_score_band_tp_is_optimized_on_val_e_net(self):
+    def test_score_band_cutloss_wins_same_candle_tp_ties(self):
         frame = pd.DataFrame(
             {
-                "high_h1": [0.003, 0.0, 0.0, 0.0],
-                "high_h2": [0.0, 0.003, 0.003, 0.0],
-                "adverse_h1": [0.0] * 4,
-                "adverse_h2": [0.0] * 4,
-                "decision_h2": [0.0] * 4,
-                "decision_h3": [0.0] * 4,
-                "max_high_h3_plus": [0.0, 0.0, 0.0, 0.003],
-                "min_adverse_h3_plus": [0.0] * 4,
-                "close_h2": [-0.01, -0.01, -0.004, -0.005],
-                "close_final": [-0.01, -0.01, -0.01, -0.006],
-                "exit1_selected": [True, True, False, False],
-                "exit2_selected": [True, True, False, True],
-            }
-        )
-        levels = [-0.002, 0.002, 0.004]
-
-        selected = _optimize_score_band_tp_combo(frame, levels)
-
-        brute_force: list[tuple[float, int, tuple[float, ...]]] = []
-        positive_levels = [level for level in levels if level > 0.0]
-        for combo in itertools.product(
-            positive_levels,
-            positive_levels,
-            positive_levels,
-            levels,
-            levels,
-        ):
-            candidate = frame.copy()
-            for column, value in zip(
-                [
-                    "tp_h1",
-                    "tp_exit1_selected",
-                    "tp_exit1_no_selected",
-                    "tp_exit2_selected",
-                    "tp_exit2_no_selected",
-                ],
-                combo,
-                strict=True,
-            ):
-                candidate[column] = value
-            detailed = _simulate_score_band_staged_frame(candidate)
-            hit_count = int(detailed["outcome"].str.startswith("tp_").sum())
-            brute_force.append(
-                (float(detailed["realized"].sum()), hit_count, tuple(combo))
-            )
-        expected = max(
-            brute_force,
-            key=lambda item: (
-                item[0],
-                item[1],
-                tuple(-value for value in item[2]),
-            ),
-        )[2]
-
-        self.assertEqual(selected, expected)
-        self.assertGreater(selected[0], 0.0)
-        self.assertGreater(selected[1], 0.0)
-        self.assertGreater(selected[2], 0.0)
-
-    def test_score_band_negative_exit2_tp_uses_favorable_path(self):
-        frame = pd.DataFrame(
-            {
-                "high_h1": [0.0, 0.0],
+                "high_h1": [0.007, 0.0],
                 "high_h2": [0.0, 0.0],
-                "adverse_h1": [0.0, 0.0],
+                "high_h3": [0.0, 0.0],
+                "high_h4": [0.0, 0.0],
+                "open_h5": [0.0, -0.003],
+                "high_h5": [0.0, -0.002],
+                "adverse_h1": [-0.008, 0.0],
                 "adverse_h2": [0.0, 0.0],
-                "max_high_h3_plus": [-0.0006, -0.0004],
-                "min_adverse_h3_plus": [-0.0006, -0.0001],
-                "close_h2": [-0.006, -0.006],
-                "close_final": [-0.006, -0.006],
-                "exit1_selected": [True, True],
-                "exit2_selected": [False, False],
-                "tp_h1": [0.01, 0.01],
-                "tp_exit1_selected": [0.01, 0.01],
-                "tp_exit1_no_selected": [0.01, 0.01],
-                "tp_exit2_selected": [0.01, 0.01],
-                "tp_exit2_no_selected": [-0.0005, -0.0005],
+                "adverse_h3": [0.0, 0.0],
+                "adverse_h4": [0.0, 0.0],
+                "adverse_h5": [0.0, -0.008],
+                "close_h5": [0.0, 0.0],
             }
         )
 
-        detailed = _simulate_score_band_staged_frame(frame)
+        with patch("crypto.backtest.SCORE_BAND_CUTLOSS", -0.008):
+            detailed = _simulate_score_band_fixed_h5_frame(frame)
 
-        self.assertEqual(detailed.iloc[0]["outcome"], "close_h5")
-        self.assertAlmostEqual(float(detailed.iloc[0]["realized"]), -0.006)
-        self.assertEqual(detailed.iloc[1]["outcome"], "tp_h3_h5_e2_no_selected")
-        self.assertAlmostEqual(float(detailed.iloc[1]["realized"]), -0.0005)
+        self.assertEqual(detailed["outcome"].tolist(), ["cutloss_h1", "cutloss_h5"])
+        self.assertTrue(np.allclose(detailed["realized"], [-0.008, -0.008]))
+        metrics = _score_band_fixed_h5_metrics(
+            detailed,
+            split="val",
+            band_start=0.0,
+            band_end=0.05,
+        )
+        self.assertEqual(metrics["cutloss"], 2)
+        self.assertEqual(metrics["hit_h1"], 0)
+        self.assertEqual(metrics["hit_h5"], 0)
+        rendered = _score_band_strategy_table(pd.DataFrame([metrics]))
+        self.assertEqual(rendered.iloc[0]["cutloss"], "2 (100.0%) | -0.80%")
 
     def test_backtest_part1_counts_h1_low_drawdown_rates(self):
         idx = pd.date_range("2024-01-01", periods=8, freq="15min")
@@ -1076,6 +1024,80 @@ class CryptoPipelineTests(unittest.TestCase):
             config.LABEL_THRESHOLD,
         )
 
+    def test_two_sided_tp_payoff_covers_all_branches_and_ignores_direction(self):
+        idx = pd.date_range("2024-01-01", periods=5, freq="15min")
+        df = pd.DataFrame(
+            {
+                "open": [100.0] * 5,
+                # Rows 1..4 are the H1 candles for signal rows 0..3.
+                "high": [100.0, 101.0, 101.0, 100.2, 100.2],
+                "low": [100.0, 99.0, 99.8, 99.0, 99.8],
+                "close": [100.0, 100.0, 99.8, 100.2, 100.1],
+                "volume": [10.0] * 5,
+                "trade_count": [10] * 5,
+                "taker_buy_base_volume": [5.0] * 5,
+                "taker_buy_quote_volume": [500.0] * 5,
+            },
+            index=idx,
+        )
+
+        long_labeled = add_binary_labels(
+            df,
+            horizons=[1],
+            label_mode="two_sided_tp",
+            label_direction="Long",
+            threshold=0.005,
+        )
+        short_labeled = add_binary_labels(
+            df,
+            horizons=[1],
+            label_mode="two_sided_tp",
+            label_direction="Short",
+            threshold=0.005,
+        )
+
+        expected_return = pd.Series(
+            [0.01, 0.007, 0.007, 0.0, np.nan],
+            index=idx,
+            name="future_return_h1",
+        )
+        expected_label = pd.Series(
+            [1.0, 0.0, 0.0, 0.0, np.nan],
+            index=idx,
+            name="label_h1",
+        )
+        pd.testing.assert_series_equal(long_labeled["future_return_h1"], expected_return)
+        pd.testing.assert_series_equal(long_labeled["label_h1"], expected_label)
+        pd.testing.assert_series_equal(
+            short_labeled["future_return_h1"], long_labeled["future_return_h1"]
+        )
+        pd.testing.assert_series_equal(
+            short_labeled["label_h1"], long_labeled["label_h1"]
+        )
+
+    def test_two_sided_tp_requires_positive_threshold(self):
+        idx = pd.date_range("2024-01-01", periods=3, freq="15min")
+        df = pd.DataFrame(
+            {"open": [100.0] * 3, "high": [101.0] * 3,
+             "low": [99.0] * 3, "close": [100.0] * 3},
+            index=idx,
+        )
+        with self.assertRaisesRegex(ValueError, "finite and positive"):
+            add_binary_labels(
+                df,
+                horizons=[1],
+                label_mode="two_sided_tp",
+                threshold=0.0,
+            )
+
+    def test_two_sided_tp_is_registered_as_direction_neutral_payoff_mode(self):
+        self.assertIs(
+            config.get_label_return_fn("two_sided_tp"),
+            config.two_sided_tp_future_return,
+        )
+        self.assertTrue(config.is_direction_neutral_label_mode("two_sided_tp"))
+        self.assertFalse(config.is_precision_only_label_mode("two_sided_tp"))
+
     def test_crypto_archive_preserves_metadata_on_load(self):
         archive = CryptoArchive(
             metadata={"label_mode": "mfe", "label_threshold": 0.003}
@@ -1136,6 +1158,28 @@ class CryptoPipelineTests(unittest.TestCase):
                 label_direction="long",
                 label_threshold=0.003,
             )
+
+    def test_resume_metadata_ignores_direction_for_two_sided_tp(self):
+        archive = CryptoArchive(
+            metadata={
+                "horizons": [5],
+                "label_mode": "two_sided_tp",
+                "label_direction": "short",
+                "label_threshold": 0.004,
+                "fitness_horizon_mode": config.FITNESS_HORIZON_MODE,
+                "trade_top_fraction": config.TRADE_TOP_FRACTION,
+                "trade_cost": config.TRADE_COST,
+            }
+        )
+
+        _validate_resume_metadata(
+            archive=archive,
+            resume_path=Path("archive.json"),
+            horizons=[5],
+            label_mode="two_sided_tp",
+            label_direction="long",
+            label_threshold=0.004,
+        )
 
     def test_resume_metadata_mismatch_checks_safe_path_tp(self):
         old_tp = config.TP_SAFE_PATH

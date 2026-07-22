@@ -163,6 +163,22 @@ Luu y:
 - `--label-direction Long/Short` phai khop giua tien hoa, analyze, va train model production neu muon so sanh dung cung mot bai toan.
 - Neu `--label-mode payoff` va bo qua `--label-threshold`, threshold se la `TRADE_COST`; `PAYOFF_TP` chi quy dinh muc TP gross trong cong thuc payoff.
 - Neu `--label-mode safe_path_mfe`, `--label-threshold` la adverse low/high floor theo quy tac stop-first, con TP lay tu `TP_SAFE_PATH`.
+- `--label-mode two_sided_tp` mo phong dong thoi mot lenh Long va mot lenh Short tai `open(t+1)`. `--label-threshold` la TP tuyet doi cho ca hai phia; `--label-direction` bi bo qua. Label bang 1 chi khi ca high vuot `+threshold` va low vuot `-threshold` trong horizon. Gross `future_return` bang `2*threshold` neu ca hai cham; neu chi Long cham thi bang `threshold-close_return`; neu chi Short cham thi bang `threshold+close_return`; neu khong phia nao cham thi bang 0. Fitness tru `TRADE_COST` mot lan nhu cac mode payoff khac.
+
+Vi du tien hoa label hai chieu H5 voi TP 0.4%:
+
+```powershell
+python -m crypto.main `
+  --data data/crypto/BTCUSDT_15m.csv `
+  --budget 3600 `
+  --seed 1 `
+  --horizons 5 `
+  --label-mode two_sided_tp `
+  --label-threshold 0.004 `
+  --trade-top-fraction 0.10 `
+  --save crypto/results/crypto_btc_two_sided_tp_h5_tp04_top10_seed1_1h.json `
+  --checkpoint-every 0
+```
 - Neu archive duoc tien hoa bang mode/threshold A nhung analyze bang mode/threshold B thi chart la ket qua tai danh gia theo B, khong phai score goc trong archive.
 
 ### Final split

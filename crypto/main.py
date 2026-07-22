@@ -352,6 +352,7 @@ def _save_archive(
             "horizons": horizons,
             "label_mode": label_mode,
             "label_direction": label_direction,
+            "direction_neutral": config.is_direction_neutral_label_mode(label_mode),
             "label_threshold": label_threshold,
             "payoff_tp": config.PAYOFF_TP,
             "payoff_adverse_floor": config.PAYOFF_ADVERSE_FLOOR,
@@ -408,7 +409,6 @@ def _validate_resume_metadata(
             [int(h) for h in horizons],
         ),
         ("label_mode", archive_label_mode, label_mode),
-        ("label_direction", archive_label_direction, label_direction),
         ("label_threshold", metadata.get("label_threshold"), float(label_threshold)),
         (
             "fitness_horizon_mode",
@@ -422,6 +422,11 @@ def _validate_resume_metadata(
         ),
         ("trade_cost", metadata.get("trade_cost"), float(config.TRADE_COST)),
     ]
+    if not (
+        config.is_direction_neutral_label_mode(label_mode)
+        and config.is_direction_neutral_label_mode(archive_label_mode)
+    ):
+        checks.append(("label_direction", archive_label_direction, label_direction))
     if label_mode == "payoff" and archive_label_mode == "payoff":
         checks.append(("payoff_tp", metadata.get("payoff_tp"), float(config.PAYOFF_TP)))
         checks.append(
@@ -532,7 +537,8 @@ def main() -> None:
             "TP is config.TP_SAFE_PATH. For adverse_floor use a positive "
             "distance, for example 0.003 means the path must stay above -0.003. "
             "For high_exit this is the directional return threshold of the "
-            "exact H candle high (Long) or low (Short)."
+            "exact H candle high (Long) or low (Short). For two_sided_tp it "
+            "is the positive absolute TP used on both sides."
         ),
     )
     parser.add_argument(
@@ -550,7 +556,8 @@ def main() -> None:
         default=config.LABEL_DIRECTION,
         help=(
             "Label direction. Long means price up is favorable; Short means "
-            f"price down is favorable. Default: {config.LABEL_DIRECTION}."
+            "price down is favorable. It is ignored by two_sided_tp. "
+            f"Default: {config.LABEL_DIRECTION}."
         ),
     )
     parser.add_argument(
