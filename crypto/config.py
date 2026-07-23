@@ -577,7 +577,7 @@ MAX_RETRY: int = 5
 # Fitness. RETURN_SCORE_SCALE normalizes mean trade return so that one metric
 # cannot dominate merely by being on a wider numerical scale.
 FITNESS_HORIZON_MODE: str = (
-    "mean"  # "mean" keeps old behavior; "ensemble" requires all H signals
+    "ensemble"  # "mean" keeps old behavior; "ensemble" requires all H signals
 )
 TRADE_TOP_FRACTION: float = 0.05
 

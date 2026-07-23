@@ -12,6 +12,7 @@ from crypto.backtest import (
     ModelSpec,
     SplitSignals,
     _base_fraction_band_tp_rows,
+    _apply_score_band_entry_filter,
     _backtest_name,
     _dynamic_tp_arrays,
     _draw_table,
@@ -21,11 +22,14 @@ from crypto.backtest import (
     _score_band_fixed_h5_metrics,
     _score_band_strategy_table,
     _simulate_score_band_fixed_h5_frame,
+    _simulate_two_sided_tp_frame,
     _simulate_dynamic_tp_arrays,
     _summarize_split,
     _sweep_table,
     _tp_sweep_rows,
     _two_sided_sweep_thresholds,
+    _two_sided_score_band_table,
+    _two_sided_tp_metrics,
     _train_spec_bundle,
 )
 import matplotlib.pyplot as plt
@@ -275,11 +279,31 @@ class CryptoPipelineTests(unittest.TestCase):
                 "adverse_h3": [0.0] * 7,
                 "adverse_h4": [0.0] * 7,
                 "adverse_h5": [0.0] * 7,
+                "close_h2": [-0.004, -0.003, -0.002, -0.001, 0.002, 0.003, 0.004],
                 "close_h5": [-0.01, -0.01, -0.01, -0.01, -0.01, -0.01, -0.006],
             }
         )
+        for horizon in range(1, 6):
+            frame[f"raw_low_h{horizon}"] = [
+                -0.003,
+                -0.003,
+                -0.0005,
+                -0.0005,
+                -0.0005,
+                -0.0005,
+                -0.003,
+            ]
+        frame.loc[frame.index[2], "raw_low_h3"] = -0.003
+        for horizon in range(1, 6):
+            frame.loc[frame.index[4], f"raw_low_h{horizon}"] = 0.002
+        frame["close_h3"] = [-0.004, -0.003, -0.002, -0.001, 0.002, 0.003, 0.004]
+        frame["close_h4"] = [-0.004, -0.003, -0.002, -0.001, 0.002, 0.003, 0.004]
+        frame.loc[frame.index[4], "close_h5"] = 0.003
 
-        with patch("crypto.backtest.SCORE_BAND_CUTLOSS", -0.008):
+        with (
+            patch("crypto.backtest.SCORE_BAND_CUTLOSS", -0.008),
+            patch("crypto.backtest.SCORE_BAND_MAX_HIGH_BELOW_THRESHOLD", -1.0),
+        ):
             detailed = _simulate_score_band_fixed_h5_frame(frame)
 
         self.assertEqual(
@@ -301,13 +325,19 @@ class CryptoPipelineTests(unittest.TestCase):
             )
         )
 
-        metrics = _score_band_fixed_h5_metrics(
-            detailed,
-            split="val",
-            band_start=0.0,
-            band_end=0.05,
-        )
+        with patch("crypto.backtest.SCORE_BAND_MAX_HIGH_BELOW_THRESHOLD", 0.001):
+            metrics = _score_band_fixed_h5_metrics(
+                detailed,
+                split="val",
+                band_start=0.0,
+                band_end=0.05,
+                signals_before_filter=10,
+            )
+            rendered = _score_band_strategy_table(pd.DataFrame([metrics]))
+        self.assertEqual(metrics["signals_before_filter"], 10)
         self.assertEqual(metrics["trades"], 7)
+        self.assertEqual(rendered.iloc[0]["n"], "10")
+        self.assertEqual(rendered.iloc[0]["n_after_filter"], "7")
         self.assertEqual(metrics["hit_h1"], 1)
         self.assertEqual(metrics["hit_h2"], 1)
         self.assertEqual(metrics["hit_h3"], 1)
@@ -316,12 +346,39 @@ class CryptoPipelineTests(unittest.TestCase):
         self.assertEqual(metrics["hit_h5"], 1)
         self.assertEqual(metrics["cutloss"], 0)
         self.assertEqual(metrics["close_h5"], 1)
+        self.assertEqual(metrics["high_h1_below_threshold"], 6)
+        self.assertAlmostEqual(
+            metrics["high_h1_below_threshold_rate"], 6 / 7
+        )
+        self.assertAlmostEqual(
+            metrics["high_h1_below_threshold_high_h2_mean"],
+            0.007 / 6,
+        )
+        self.assertAlmostEqual(
+            metrics["high_h1_below_threshold_close_h2_mean"],
+            0.0005,
+        )
+        self.assertAlmostEqual(
+            metrics["high_h1_below_threshold_high_h3_mean"],
+            0.007 / 6,
+        )
+        self.assertAlmostEqual(
+            metrics["high_h1_below_threshold_close_h3_mean"],
+            0.0005,
+        )
+        self.assertAlmostEqual(
+            metrics["high_h1_below_threshold_high_h4_mean"],
+            0.007 / 6,
+        )
+        self.assertAlmostEqual(
+            metrics["high_h1_below_threshold_close_h4_mean"],
+            0.0005,
+        )
         self.assertAlmostEqual(
             metrics["e_net"],
             np.mean([0.007, 0.007, 0.007, 0.007, -0.001, -0.002, -0.006])
             - config.TRADE_COST,
         )
-        rendered = _score_band_strategy_table(pd.DataFrame([metrics]))
         self.assertEqual(rendered.iloc[0]["hit H1"], "1 (14.3%) | +0.70%")
         self.assertEqual(rendered.iloc[0]["hit H2"], "1 (14.3%) | +0.70%")
         self.assertEqual(rendered.iloc[0]["hit H3"], "1 (14.3%) | +0.70%")
@@ -330,6 +387,138 @@ class CryptoPipelineTests(unittest.TestCase):
         self.assertEqual(rendered.iloc[0]["hit H5"], "1 (14.3%) | -0.20%")
         self.assertEqual(rendered.iloc[0]["cutloss"], "0 (0.0%) | n/a")
         self.assertEqual(rendered.iloc[0]["close H5"], "1 (14.3%) | -0.60%")
+        self.assertEqual(
+            rendered.iloc[0]["weak H1 TP H2-H4"],
+            "0 (0.0%) | n/a",
+        )
+        self.assertEqual(
+            rendered.iloc[0]["high H1<0.10% / all"],
+            "6 (85.7%)",
+        )
+        self.assertEqual(
+            rendered.iloc[0]["high H1<0.10% mean high H2 | mean close H2"],
+            "+0.12% | +0.05%",
+        )
+        self.assertEqual(
+            rendered.iloc[0]["high H1<0.10% mean high H3 | mean close H3"],
+            "+0.12% | +0.05%",
+        )
+        self.assertEqual(
+            rendered.iloc[0]["high H1<0.10% mean high H4 | mean close H4"],
+            "+0.12% | +0.05%",
+        )
+
+    def test_score_band_weak_h1_reprices_tp_for_h2_through_h4(self):
+        frame = pd.DataFrame(
+            {
+                "high_h1": [0.001, 0.001, 0.001, 0.003],
+                "high_h2": [-0.001, -0.002, -0.002, 0.007],
+                "high_h3": [-0.002, -0.001, -0.002, 0.0],
+                "high_h4": [-0.002, -0.002, -0.002, 0.0],
+                "open_h5": [-0.003, -0.003, -0.003, -0.003],
+                "high_h5": [-0.002, -0.002, -0.002, -0.002],
+                "adverse_h1": [0.0] * 4,
+                "adverse_h2": [0.0] * 4,
+                "adverse_h3": [0.0] * 4,
+                "adverse_h4": [0.0] * 4,
+                "adverse_h5": [0.0] * 4,
+                "close_h5": [-0.004] * 4,
+            }
+        )
+
+        with (
+            patch("crypto.backtest.SCORE_BAND_MAX_HIGH_BELOW_THRESHOLD", 0.002),
+            patch("crypto.backtest.SCORE_BAND_WEAK_H1_TP_H2_H4", -0.001),
+            patch("crypto.backtest.SCORE_BAND_CUTLOSS", -1.0),
+        ):
+            detailed = _simulate_score_band_fixed_h5_frame(frame)
+
+        self.assertEqual(
+            detailed["outcome"].tolist(),
+            ["weak_tp_h2", "weak_tp_h3", "tp_h5", "tp_h2"],
+        )
+        self.assertTrue(
+            np.allclose(detailed["realized"], [-0.001, -0.001, -0.002, 0.007])
+        )
+        metrics = _score_band_fixed_h5_metrics(
+            detailed,
+            split="val",
+            band_start=0.0,
+            band_end=0.05,
+        )
+        self.assertEqual(metrics["weak_h1_tp_h2_h4"], 2)
+        self.assertEqual(metrics["hit_h2"], 2)
+        self.assertEqual(metrics["hit_h3"], 1)
+
+    def test_score_band_entry_filter_uses_only_h0_low(self):
+        frame = pd.DataFrame(
+            {
+                "entry_filter_low_h0": [-0.001, -0.003, -0.002],
+                "marker": ["pass", "below", "equal"],
+            }
+        )
+
+        with patch("crypto.backtest.SCORE_BAND_ENTRY_MIN_LOW_THRESHOLD", -0.002):
+            filtered = _apply_score_band_entry_filter(frame)
+
+        self.assertEqual(filtered["marker"].tolist(), ["pass"])
+
+    def test_two_sided_score_band_settles_each_leg_independently(self):
+        idx = pd.date_range("2024-01-01", periods=4, freq="15min")
+        frame = pd.DataFrame(index=idx)
+        for horizon in range(1, 6):
+            frame[f"high_h{horizon}"] = [0.004, 0.004, 0.001, 0.001]
+            frame[f"low_h{horizon}"] = [-0.004, -0.001, -0.004, -0.001]
+        frame["close_h5"] = [0.001, -0.002, 0.002, -0.001]
+
+        detailed = _simulate_two_sided_tp_frame(
+            frame,
+            tp_long=0.003,
+            tp_short=0.002,
+        )
+
+        self.assertEqual(detailed["long_hit"].tolist(), [True, True, False, False])
+        self.assertEqual(detailed["short_hit"].tolist(), [True, False, True, False])
+        self.assertTrue(
+            np.allclose(detailed["gross_return"], [0.005, 0.005, 0.004, 0.0])
+        )
+        metrics = _two_sided_tp_metrics(
+            detailed,
+            split="val",
+            band_start=0.0,
+            band_end=0.05,
+        )
+        self.assertEqual(metrics["both_hit"], 1)
+        self.assertEqual(metrics["long_only"], 1)
+        self.assertEqual(metrics["short_only"], 1)
+        self.assertEqual(metrics["neither_hit"], 1)
+        self.assertAlmostEqual(metrics["gross_mean"], 0.0035)
+        self.assertAlmostEqual(metrics["e_net"], 0.0035 - config.TRADE_COST)
+
+        rendered = _two_sided_score_band_table(pd.DataFrame([metrics]))
+        self.assertEqual(rendered.iloc[0]["both TP"], "1 (25.0%)")
+        self.assertEqual(rendered.iloc[0]["gross mean"], "+0.35%")
+
+    def test_two_sided_score_band_uses_h15_and_closes_unfilled_leg_at_h15(self):
+        frame = pd.DataFrame(index=pd.RangeIndex(2))
+        for horizon in range(1, 16):
+            frame[f"high_h{horizon}"] = 0.0
+            frame[f"low_h{horizon}"] = 0.0
+        frame.loc[0, "high_h15"] = 0.004
+        frame.loc[1, "low_h15"] = -0.003
+        frame["close_h15"] = [-0.001, 0.002]
+
+        detailed = _simulate_two_sided_tp_frame(
+            frame,
+            tp_long=0.003,
+            tp_short=0.002,
+            exit_horizon=15,
+        )
+
+        self.assertEqual(detailed["long_hit"].tolist(), [True, False])
+        self.assertEqual(detailed["short_hit"].tolist(), [False, True])
+        self.assertTrue(np.allclose(detailed["long_return"], [0.003, 0.002]))
+        self.assertTrue(np.allclose(detailed["short_return"], [0.001, 0.002]))
 
     def test_score_band_cutloss_wins_same_candle_tp_ties(self):
         frame = pd.DataFrame(
@@ -349,7 +538,10 @@ class CryptoPipelineTests(unittest.TestCase):
             }
         )
 
-        with patch("crypto.backtest.SCORE_BAND_CUTLOSS", -0.008):
+        with (
+            patch("crypto.backtest.SCORE_BAND_CUTLOSS", -0.008),
+            patch("crypto.backtest.SCORE_BAND_MAX_HIGH_BELOW_THRESHOLD", -1.0),
+        ):
             detailed = _simulate_score_band_fixed_h5_frame(frame)
 
         self.assertEqual(detailed["outcome"].tolist(), ["cutloss_h1", "cutloss_h5"])

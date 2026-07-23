@@ -102,6 +102,7 @@ TP_SWEEP_END: float = 0.007
 TP_SWEEP_STEP: float = 0.0005
 BASE_FRACTION_BAND_STEP: float = 0.05
 BASE_FRACTION_BAND_MAX: float = 0.50
+BASE_SIGNAL_ANALYSIS_HORIZON: int = 15
 SCORE_BAND_RANGES: list[tuple[float, float]] = [
     (0.00, 0.05),
     (0.05, 0.10),
@@ -112,7 +113,12 @@ SCORE_BAND_RANGES: list[tuple[float, float]] = [
 ]
 SCORE_BAND_TP_H1_H4: float = 0.007
 SCORE_BAND_TP_H5: float = -0.002
-SCORE_BAND_CUTLOSS: float = -0.0005
+SCORE_BAND_CUTLOSS: float = -0.5
+SCORE_BAND_ENTRY_MIN_LOW_THRESHOLD: float = -0.5
+SCORE_BAND_MAX_HIGH_BELOW_THRESHOLD: float = -0.5
+SCORE_BAND_WEAK_H1_TP_H2_H4: float = -0.003
+SCORE_BAND_TWO_SIDED_TP_LONG: float = 0.007
+SCORE_BAND_TWO_SIDED_TP_SHORT: float = 0.007
 TWO_SIDED_SWEEP_START: float = 0.0005
 TWO_SIDED_SWEEP_END: float = 0.0100
 TWO_SIDED_SWEEP_STEP: float = 0.0005
@@ -160,6 +166,7 @@ class BacktestResult:
     tp_sweep_csv_path: Path
     tp_optimization_csv_path: Path
     score_band_strategy_csv_path: Path
+    two_sided_score_band_csv_path: Path
     chart_path: Path
 
 
@@ -210,25 +217,39 @@ def run_backtest(
     )
     logger.info("Loading crypto data from %s", data_path)
     raw_df = load_ohlcv(data_path)
-    base_horizons = _normalize_horizons(
+    default_base_horizons = _normalize_horizons(
         config.HOLDING_HORIZONS, "config.HOLDING_HORIZONS"
     )
+    base_horizons_by_spec = [
+        _archive_horizons(
+            spec.archive_path,
+            fallback=default_base_horizons,
+            label=f"base[{index}]",
+        )
+        for index, spec in enumerate(base_specs, start=1)
+    ]
     exit1_horizons = _archive_horizons(
         exit1_spec.archive_path,
-        fallback=base_horizons,
+        fallback=default_base_horizons,
         label="exit1",
     )
     exit2_horizons = _archive_horizons(
         exit2_spec.archive_path,
-        fallback=base_horizons,
+        fallback=default_base_horizons,
         label="exit2",
     )
-    all_horizons = sorted(set(base_horizons + exit1_horizons + exit2_horizons))
+    all_horizons = sorted(
+        {
+            *[h for horizons in base_horizons_by_spec for h in horizons],
+            *exit1_horizons,
+            *exit2_horizons,
+        }
+    )
     horizon = max(5, int(max(all_horizons)))
     purge_bars = config.purge_bars_for_horizons([*all_horizons, horizon])
     logger.info(
         "Backtest horizons: base=%s | exit1=%s | exit2=%s | path_horizon=h%d",
-        base_horizons,
+        base_horizons_by_spec,
         exit1_horizons,
         exit2_horizons,
         horizon,
@@ -256,7 +277,12 @@ def run_backtest(
     )
 
     base_bundles: list[BundleSignals] = []
-    for spec, entry in zip(base_specs, entries[: len(base_specs)], strict=True):
+    for spec, entry, base_horizons in zip(
+        base_specs,
+        entries[: len(base_specs)],
+        base_horizons_by_spec,
+        strict=True,
+    ):
         bundle = _train_spec_bundle(
             spec=spec,
             entry=entry,
@@ -302,6 +328,11 @@ def run_backtest(
     )
     path_returns = path_by_horizon[horizon]
     entry_open = pd.to_numeric(raw_df["open"], errors="coerce").shift(-1)
+    entry_filter_open_h0 = pd.to_numeric(raw_df["open"], errors="coerce")
+    raw_low = pd.to_numeric(raw_df["low"], errors="coerce")
+    path_returns["entry_filter_low_h0"] = (
+        raw_low.div(entry_filter_open_h0) - 1.0
+    )
     open_h5 = pd.to_numeric(raw_df["open"], errors="coerce").shift(-5)
     path_returns["open_h5"] = config.directional_price_return(
         open_h5,
@@ -380,6 +411,13 @@ def run_backtest(
         raw_index=pd.DatetimeIndex(raw_df.index),
         label_direction=label_direction,
     )
+    two_sided_score_band = _score_band_two_sided_tp_strategy(
+        base_bundles=base_bundles,
+        selection=base_ensemble,
+        raw_path_returns=raw_price_path_returns,
+        tp_long=SCORE_BAND_TWO_SIDED_TP_LONG,
+        tp_short=SCORE_BAND_TWO_SIDED_TP_SHORT,
+    )
     run_name = _backtest_name(
         base_specs,
         exit1_spec,
@@ -392,16 +430,26 @@ def run_backtest(
     tp_sweep_csv_path = out_path / f"{run_name}_tp_sweep.csv"
     tp_optimization_csv_path = out_path / f"{run_name}_dynamic_tp_top5.csv"
     score_band_strategy_csv_path = out_path / f"{run_name}_score_band_fixed_h5.csv"
+    two_sided_score_band_csv_path = (
+        out_path
+        / (
+            f"{run_name}_score_band_two_sided_"
+            f"tpl_{_threshold_filename_token(SCORE_BAND_TWO_SIDED_TP_LONG)}_"
+            f"tps_{_threshold_filename_token(SCORE_BAND_TWO_SIDED_TP_SHORT)}.csv"
+        )
+    )
     chart_path = out_path / f"{run_name}.png"
     summary.to_csv(csv_path, index=False)
     tp_sweep.to_csv(tp_sweep_csv_path, index=False)
     tp_optimization.to_csv(tp_optimization_csv_path, index=False)
     score_band_strategy.to_csv(score_band_strategy_csv_path, index=False)
+    two_sided_score_band.to_csv(two_sided_score_band_csv_path, index=False)
     _plot_summary(
         summary=summary,
         tp_sweep=tp_sweep,
         tp_optimization=tp_optimization,
         score_band_strategy=score_band_strategy,
+        two_sided_score_band=two_sided_score_band,
         chart_path=chart_path,
         base_label=base_bundle.label,
         exit1_label=exit1_bundle.label,
@@ -414,6 +462,7 @@ def run_backtest(
     logger.info("Saved TP sweep: %s", tp_sweep_csv_path)
     logger.info("Saved dynamic TP top %d: %s", TP_OPT_TOP_K, tp_optimization_csv_path)
     logger.info("Saved fixed score-band H1/H2/H5 strategy: %s", score_band_strategy_csv_path)
+    logger.info("Saved two-sided score-band strategy: %s", two_sided_score_band_csv_path)
     logger.info("Saved chart: %s", chart_path)
     return BacktestResult(
         summary=summary,
@@ -423,6 +472,7 @@ def run_backtest(
         tp_sweep_csv_path=tp_sweep_csv_path,
         tp_optimization_csv_path=tp_optimization_csv_path,
         score_band_strategy_csv_path=score_band_strategy_csv_path,
+        two_sided_score_band_csv_path=two_sided_score_band_csv_path,
         chart_path=chart_path,
     )
 
@@ -880,12 +930,12 @@ def _base_fraction_band_tp_rows(
             )
             two_sided_rows = _tp_sweep_rows(
                 split=split_name,
-                group="base_fraction_band_two_sided_h1_h5",
+                group="base_fraction_band_two_sided_h1_h15",
                 selected_base_index=band_selected,
                 path_returns=raw_path_returns,
                 thresholds=_two_sided_sweep_thresholds(),
                 min_h=1,
-                max_h=5,
+                max_h=BASE_SIGNAL_ANALYSIS_HORIZON,
                 label_direction="long",
                 include_two_sided_move=True,
             )
@@ -1301,6 +1351,15 @@ def _dynamic_tp_strategy_frame(
     frame["high_h3"] = pd.to_numeric(base_path[f"{hit_prefix}_h3"], errors="coerce")
     frame["high_h4"] = pd.to_numeric(base_path[f"{hit_prefix}_h4"], errors="coerce")
     frame["high_h5"] = pd.to_numeric(base_path[f"{hit_prefix}_h5"], errors="coerce")
+    if "entry_filter_low_h0" in base_path.columns:
+        frame["entry_filter_low_h0"] = pd.to_numeric(
+            base_path["entry_filter_low_h0"], errors="coerce"
+        )
+    for horizon in range(1, 6):
+        raw_low = pd.to_numeric(base_path[f"low_h{horizon}"], errors="coerce")
+        if config.canonical_label_direction(label_direction) == "short":
+            raw_low = -raw_low
+        frame[f"raw_low_h{horizon}"] = raw_low
     frame["open_h5"] = pd.to_numeric(base_path["open_h5"], errors="coerce")
     adverse_prefix = _adverse_price_prefix(label_direction)
     frame["adverse_h1"] = pd.to_numeric(
@@ -1332,6 +1391,8 @@ def _dynamic_tp_strategy_frame(
         skipna=False,
     )
     frame["close_h2"] = pd.to_numeric(base_path["close_h2"], errors="coerce")
+    frame["close_h3"] = pd.to_numeric(base_path["close_h3"], errors="coerce")
+    frame["close_h4"] = pd.to_numeric(base_path["close_h4"], errors="coerce")
     frame["close_h5"] = pd.to_numeric(base_path["close_h5"], errors="coerce")
     frame["close_final"] = pd.to_numeric(base_path[close_col], errors="coerce")
 
@@ -1374,11 +1435,13 @@ def _score_band_fixed_h5_strategy(
         "score_band",
         "band_start",
         "band_end",
+        "signals_before_filter",
         "trades",
         "hit_h1",
         "hit_h2",
         "hit_h3",
         "hit_h4",
+        "weak_h1_tp_h2_h4",
         "hit_open_h5",
         "hit_h5",
         "cutloss",
@@ -1387,10 +1450,19 @@ def _score_band_fixed_h5_strategy(
         "hit_h2_return_mean",
         "hit_h3_return_mean",
         "hit_h4_return_mean",
+        "weak_h1_tp_h2_h4_return_mean",
         "hit_open_h5_return_mean",
         "hit_h5_return_mean",
         "cutloss_return_mean",
         "close_h5_return_mean",
+        "high_h1_below_threshold",
+        "high_h1_below_threshold_rate",
+        "high_h1_below_threshold_high_h2_mean",
+        "high_h1_below_threshold_close_h2_mean",
+        "high_h1_below_threshold_high_h3_mean",
+        "high_h1_below_threshold_close_h3_mean",
+        "high_h1_below_threshold_high_h4_mean",
+        "high_h1_below_threshold_close_h4_mean",
         "gross_mean",
         "e_net",
     ]
@@ -1405,6 +1477,7 @@ def _score_band_fixed_h5_strategy(
         exit1_split = exit1_bundle.val if split_name == "val" else exit1_bundle.test
         exit2_split = exit2_bundle.val if split_name == "val" else exit2_bundle.test
         detailed_frames: list[pd.DataFrame] = []
+        signals_before_filter_total = 0
         for band_start, band_end, selected_index in split_bands:
             if not any(
                 np.isclose(band_start, configured_start)
@@ -1427,6 +1500,9 @@ def _score_band_fixed_h5_strategy(
                 raw_index=raw_index,
                 label_direction=label_direction,
             )
+            signals_before_filter = int(len(frame))
+            signals_before_filter_total += signals_before_filter
+            frame = _apply_score_band_entry_filter(frame)
             detailed = _simulate_score_band_fixed_h5_frame(frame)
             detailed_frames.append(detailed)
             rows.append(
@@ -1435,6 +1511,7 @@ def _score_band_fixed_h5_strategy(
                     split=split_name,
                     band_start=band_start,
                     band_end=band_end,
+                    signals_before_filter=signals_before_filter,
                 )
             )
         if detailed_frames:
@@ -1445,9 +1522,217 @@ def _score_band_fixed_h5_strategy(
                     split=split_name,
                     band_start=float("nan"),
                     band_end=float("nan"),
+                    signals_before_filter=signals_before_filter_total,
                 )
             )
     return pd.DataFrame(rows, columns=columns)
+
+
+def _apply_score_band_entry_filter(frame: pd.DataFrame) -> pd.DataFrame:
+    """Keep signals whose H0 low stays above the H0-open floor."""
+    column = "entry_filter_low_h0"
+    if frame.empty or column not in frame.columns:
+        return frame.copy()
+    low_h0_return = pd.to_numeric(frame[column], errors="coerce")
+    keep = low_h0_return.gt(float(SCORE_BAND_ENTRY_MIN_LOW_THRESHOLD))
+    return frame.loc[keep].copy()
+
+
+def _score_band_two_sided_tp_strategy(
+    base_bundles: list[BundleSignals],
+    selection: str,
+    raw_path_returns: pd.DataFrame,
+    tp_long: float = SCORE_BAND_TWO_SIDED_TP_LONG,
+    tp_short: float = SCORE_BAND_TWO_SIDED_TP_SHORT,
+) -> pd.DataFrame:
+    """Evaluate simultaneous Long/Short TP orders in disjoint score bands."""
+    columns = [
+        "split",
+        "score_band",
+        "band_start",
+        "band_end",
+        "trades",
+        "long_hit",
+        "short_hit",
+        "both_hit",
+        "long_only",
+        "short_only",
+        "neither_hit",
+        "long_return_mean",
+        "short_return_mean",
+        "gross_mean",
+        "e_net",
+    ]
+    bands_by_split = _base_fraction_band_indices(
+        base_bundles,
+        selection=selection,
+        max_fraction=BASE_FRACTION_BAND_MAX,
+    )
+    rows: list[dict[str, Any]] = []
+    available_horizons = [
+        horizon
+        for horizon in range(1, BASE_SIGNAL_ANALYSIS_HORIZON + 1)
+        if {
+            f"high_h{horizon}",
+            f"low_h{horizon}",
+            f"close_h{horizon}",
+        }.issubset(raw_path_returns.columns)
+    ]
+    exit_horizon = (
+        max(available_horizons)
+        if available_horizons
+        else BASE_SIGNAL_ANALYSIS_HORIZON
+    )
+    for split_name, split_bands in bands_by_split.items():
+        detailed_frames: list[pd.DataFrame] = []
+        for band_start, band_end, selected_index in split_bands:
+            frame = raw_path_returns.reindex(selected_index)
+            detailed = _simulate_two_sided_tp_frame(
+                frame,
+                tp_long=tp_long,
+                tp_short=tp_short,
+                exit_horizon=exit_horizon,
+            )
+            detailed_frames.append(detailed)
+            rows.append(
+                _two_sided_tp_metrics(
+                    detailed,
+                    split=split_name,
+                    band_start=band_start,
+                    band_end=band_end,
+                )
+            )
+        if detailed_frames:
+            rows.append(
+                _two_sided_tp_metrics(
+                    pd.concat(detailed_frames, axis=0),
+                    split=split_name,
+                    band_start=float("nan"),
+                    band_end=float("nan"),
+                )
+            )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _simulate_two_sided_tp_frame(
+    frame: pd.DataFrame,
+    tp_long: float = SCORE_BAND_TWO_SIDED_TP_LONG,
+    tp_short: float = SCORE_BAND_TWO_SIDED_TP_SHORT,
+    exit_horizon: int | None = None,
+) -> pd.DataFrame:
+    """Settle simultaneous Long and Short positions through exit_horizon.
+
+    A hit leg realizes its own TP. Unfilled legs exit at the final close.
+    """
+    long_threshold = float(tp_long)
+    short_threshold = float(tp_short)
+    if not np.isfinite(long_threshold) or long_threshold <= 0.0:
+        raise ValueError("two-sided Long TP must be finite and positive.")
+    if not np.isfinite(short_threshold) or short_threshold <= 0.0:
+        raise ValueError("two-sided Short TP must be finite and positive.")
+    if exit_horizon is None:
+        candidates = [
+            horizon
+            for horizon in range(1, BASE_SIGNAL_ANALYSIS_HORIZON + 1)
+            if {
+                f"high_h{horizon}",
+                f"low_h{horizon}",
+                f"close_h{horizon}",
+            }.issubset(frame.columns)
+        ]
+        exit_horizon = max(candidates) if candidates else 0
+    exit_horizon = int(exit_horizon)
+    if exit_horizon < 1:
+        return pd.DataFrame(
+            columns=[
+                *frame.columns,
+                "long_hit",
+                "short_hit",
+                "long_return",
+                "short_return",
+                "gross_return",
+            ]
+        )
+    required = [
+        *[f"high_h{horizon}" for horizon in range(1, exit_horizon + 1)],
+        *[f"low_h{horizon}" for horizon in range(1, exit_horizon + 1)],
+        f"close_h{exit_horizon}",
+    ]
+    if frame.empty or not set(required).issubset(frame.columns):
+        return pd.DataFrame(
+            columns=[*frame.columns, "long_hit", "short_hit", "long_return", "short_return", "gross_return"]
+        )
+    result = frame.replace([np.inf, -np.inf], np.nan).dropna(subset=required).copy()
+    if result.empty:
+        result["long_hit"] = pd.Series(dtype=bool)
+        result["short_hit"] = pd.Series(dtype=bool)
+        result["long_return"] = pd.Series(dtype=float)
+        result["short_return"] = pd.Series(dtype=float)
+        result["gross_return"] = pd.Series(dtype=float)
+        return result
+
+    max_high = result[
+        [f"high_h{horizon}" for horizon in range(1, exit_horizon + 1)]
+    ].max(axis=1)
+    min_low = result[
+        [f"low_h{horizon}" for horizon in range(1, exit_horizon + 1)]
+    ].min(axis=1)
+    close_final = pd.to_numeric(
+        result[f"close_h{exit_horizon}"], errors="coerce"
+    )
+    long_hit = max_high >= long_threshold
+    short_hit = min_low <= -short_threshold
+    result["long_hit"] = long_hit
+    result["short_hit"] = short_hit
+    result["long_return"] = close_final.where(~long_hit, long_threshold)
+    result["short_return"] = (-close_final).where(~short_hit, short_threshold)
+    result["gross_return"] = result["long_return"] + result["short_return"]
+    return result
+
+
+def _two_sided_tp_metrics(
+    detailed: pd.DataFrame,
+    split: str,
+    band_start: float,
+    band_end: float,
+) -> dict[str, Any]:
+    n = int(len(detailed))
+    long_hit = detailed.get("long_hit", pd.Series(False, index=detailed.index)).astype(bool)
+    short_hit = detailed.get("short_hit", pd.Series(False, index=detailed.index)).astype(bool)
+    gross = pd.to_numeric(detailed.get("gross_return"), errors="coerce")
+    long_return = pd.to_numeric(detailed.get("long_return"), errors="coerce")
+    short_return = pd.to_numeric(detailed.get("short_return"), errors="coerce")
+    gross_mean = float(gross.mean()) if n and not gross.empty else float("nan")
+    is_all = not np.isfinite(band_start)
+    return {
+        "split": split,
+        "score_band": (
+            "ALL top 0-50%"
+            if is_all
+            else f"top {float(band_start):.0%}-{float(band_end):.0%}"
+        ),
+        "band_start": band_start,
+        "band_end": band_end,
+        "trades": n,
+        "long_hit": int(long_hit.sum()),
+        "short_hit": int(short_hit.sum()),
+        "both_hit": int((long_hit & short_hit).sum()),
+        "long_only": int((long_hit & ~short_hit).sum()),
+        "short_only": int((~long_hit & short_hit).sum()),
+        "neither_hit": int((~long_hit & ~short_hit).sum()),
+        "long_return_mean": (
+            float(long_return.mean()) if n and not long_return.empty else float("nan")
+        ),
+        "short_return_mean": (
+            float(short_return.mean()) if n and not short_return.empty else float("nan")
+        ),
+        "gross_mean": gross_mean,
+        "e_net": (
+            gross_mean - float(config.TRADE_COST)
+            if np.isfinite(gross_mean)
+            else float("nan")
+        ),
+    }
 
 
 def _simulate_score_band_fixed_h5_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -1459,21 +1744,49 @@ def _simulate_score_band_fixed_h5_frame(frame: pd.DataFrame) -> pd.DataFrame:
     realized = pd.to_numeric(result["close_h5"], errors="coerce").copy()
 
     active = pd.Series(True, index=result.index, dtype=bool)
-    for horizon in range(1, 5):
+
+    cutloss_h1 = active & (result["adverse_h1"] <= float(SCORE_BAND_CUTLOSS))
+    realized.loc[cutloss_h1] = float(SCORE_BAND_CUTLOSS)
+    outcome.loc[cutloss_h1] = "cutloss_h1"
+    hit_tp_h1 = (
+        active
+        & ~cutloss_h1
+        & (result["high_h1"] >= float(SCORE_BAND_TP_H1_H4))
+    )
+    realized.loc[hit_tp_h1] = float(SCORE_BAND_TP_H1_H4)
+    outcome.loc[hit_tp_h1] = "tp_h1"
+    active &= ~(cutloss_h1 | hit_tp_h1)
+
+    weak_h1 = active & (
+        result["high_h1"] < float(SCORE_BAND_MAX_HIGH_BELOW_THRESHOLD)
+    )
+    result["weak_h1_branch"] = weak_h1
+
+    for horizon in range(2, 5):
         cutloss = active & (
             result[f"adverse_h{horizon}"] <= float(SCORE_BAND_CUTLOSS)
         )
         realized.loc[cutloss] = float(SCORE_BAND_CUTLOSS)
         outcome.loc[cutloss] = f"cutloss_h{horizon}"
 
-        hit_tp = (
+        weak_hit_tp = (
             active
+            & weak_h1
+            & ~cutloss
+            & (result[f"high_h{horizon}"] >= float(SCORE_BAND_WEAK_H1_TP_H2_H4))
+        )
+        realized.loc[weak_hit_tp] = float(SCORE_BAND_WEAK_H1_TP_H2_H4)
+        outcome.loc[weak_hit_tp] = f"weak_tp_h{horizon}"
+
+        regular_hit_tp = (
+            active
+            & ~weak_h1
             & ~cutloss
             & (result[f"high_h{horizon}"] >= float(SCORE_BAND_TP_H1_H4))
         )
-        realized.loc[hit_tp] = float(SCORE_BAND_TP_H1_H4)
-        outcome.loc[hit_tp] = f"tp_h{horizon}"
-        active &= ~(cutloss | hit_tp)
+        realized.loc[regular_hit_tp] = float(SCORE_BAND_TP_H1_H4)
+        outcome.loc[regular_hit_tp] = f"tp_h{horizon}"
+        active &= ~(cutloss | weak_hit_tp | regular_hit_tp)
 
     gap_cutloss_h5 = active & (result["open_h5"] <= float(SCORE_BAND_CUTLOSS))
     realized.loc[gap_cutloss_h5] = float(SCORE_BAND_CUTLOSS)
@@ -1504,8 +1817,12 @@ def _score_band_fixed_h5_metrics(
     split: str,
     band_start: float,
     band_end: float,
+    signals_before_filter: int | None = None,
 ) -> dict[str, Any]:
     n = int(len(detailed))
+    n_before_filter = (
+        n if signals_before_filter is None else int(signals_before_filter)
+    )
     outcome = detailed.get("outcome", pd.Series(dtype=object))
     realized = pd.to_numeric(detailed.get("realized"), errors="coerce")
 
@@ -1513,11 +1830,44 @@ def _score_band_fixed_h5_metrics(
         values = realized[outcome == branch].dropna()
         return float(values.mean()) if not values.empty else float("nan")
 
+    def outcome_return_mean(mask: pd.Series) -> float:
+        values = realized[mask].dropna()
+        return float(values.mean()) if not values.empty else float("nan")
+
+    tp_masks = {
+        horizon: outcome.isin([f"tp_h{horizon}", f"weak_tp_h{horizon}"])
+        for horizon in range(1, 5)
+    }
+    weak_tp_mask = outcome.astype(str).str.startswith("weak_tp_h")
+
     gross_mean = (
         float(realized.mean())
         if n
         else float("nan")
     )
+    followup_means: dict[str, float] = {}
+    if "high_h1" in detailed.columns:
+        high_h1 = pd.to_numeric(detailed["high_h1"], errors="coerce")
+        high_h1_below = high_h1.lt(float(SCORE_BAND_MAX_HIGH_BELOW_THRESHOLD))
+        high_h1_below_count = int(high_h1_below.sum())
+        for horizon in (2, 3, 4):
+            for price_name in ("high", "close"):
+                column = f"{price_name}_h{horizon}"
+                source = detailed.get(
+                    column,
+                    pd.Series(np.nan, index=detailed.index, dtype=float),
+                )
+                values = pd.to_numeric(
+                    source.loc[high_h1_below], errors="coerce"
+                ).dropna()
+                followup_means[column] = (
+                    float(values.mean()) if not values.empty else float("nan")
+                )
+    else:
+        high_h1_below_count = 0
+        for horizon in (2, 3, 4):
+            followup_means[f"high_h{horizon}"] = float("nan")
+            followup_means[f"close_h{horizon}"] = float("nan")
     is_all = not np.isfinite(band_start)
     return {
         "split": split,
@@ -1528,19 +1878,22 @@ def _score_band_fixed_h5_metrics(
         ),
         "band_start": band_start,
         "band_end": band_end,
+        "signals_before_filter": n_before_filter,
         "trades": n,
-        "hit_h1": int((outcome == "tp_h1").sum()),
-        "hit_h2": int((outcome == "tp_h2").sum()),
-        "hit_h3": int((outcome == "tp_h3").sum()),
-        "hit_h4": int((outcome == "tp_h4").sum()),
+        "hit_h1": int(tp_masks[1].sum()),
+        "hit_h2": int(tp_masks[2].sum()),
+        "hit_h3": int(tp_masks[3].sum()),
+        "hit_h4": int(tp_masks[4].sum()),
+        "weak_h1_tp_h2_h4": int(weak_tp_mask.sum()),
         "hit_open_h5": int((outcome == "open_h5").sum()),
         "hit_h5": int((outcome == "tp_h5").sum()),
         "cutloss": int(outcome.astype(str).str.startswith("cutloss_").sum()),
         "close_h5": int((outcome == "close_h5").sum()),
-        "hit_h1_return_mean": branch_return_mean("tp_h1"),
-        "hit_h2_return_mean": branch_return_mean("tp_h2"),
-        "hit_h3_return_mean": branch_return_mean("tp_h3"),
-        "hit_h4_return_mean": branch_return_mean("tp_h4"),
+        "hit_h1_return_mean": outcome_return_mean(tp_masks[1]),
+        "hit_h2_return_mean": outcome_return_mean(tp_masks[2]),
+        "hit_h3_return_mean": outcome_return_mean(tp_masks[3]),
+        "hit_h4_return_mean": outcome_return_mean(tp_masks[4]),
+        "weak_h1_tp_h2_h4_return_mean": outcome_return_mean(weak_tp_mask),
         "hit_open_h5_return_mean": branch_return_mean("open_h5"),
         "hit_h5_return_mean": branch_return_mean("tp_h5"),
         "cutloss_return_mean": (
@@ -1549,6 +1902,16 @@ def _score_band_fixed_h5_metrics(
             else float("nan")
         ),
         "close_h5_return_mean": branch_return_mean("close_h5"),
+        "high_h1_below_threshold": high_h1_below_count,
+        "high_h1_below_threshold_rate": (
+            high_h1_below_count / n if n else 0.0
+        ),
+        "high_h1_below_threshold_high_h2_mean": followup_means["high_h2"],
+        "high_h1_below_threshold_close_h2_mean": followup_means["close_h2"],
+        "high_h1_below_threshold_high_h3_mean": followup_means["high_h3"],
+        "high_h1_below_threshold_close_h3_mean": followup_means["close_h3"],
+        "high_h1_below_threshold_high_h4_mean": followup_means["high_h4"],
+        "high_h1_below_threshold_close_h4_mean": followup_means["close_h4"],
         "gross_mean": gross_mean,
         "e_net": gross_mean - float(config.TRADE_COST) if n else float("nan"),
     }
@@ -2023,6 +2386,7 @@ def _plot_summary(
     tp_sweep: pd.DataFrame,
     tp_optimization: pd.DataFrame,
     score_band_strategy: pd.DataFrame,
+    two_sided_score_band: pd.DataFrame,
     chart_path: Path,
     base_label: str,
     exit1_label: str,
@@ -2048,12 +2412,13 @@ def _plot_summary(
             ax_base_fraction_bands,
             ax_base_fraction_low_h1,
             ax_base_fraction_two_sided,
+            ax_two_sided_score_band,
             ax_score_band_strategy,
         ),
     ) = plt.subplots(
-        15,
+        16,
         1,
-        figsize=(17.5, 43.0),
+        figsize=(17.5, 46.0),
         gridspec_kw={
             "height_ratios": [
                 1.25,
@@ -2070,6 +2435,7 @@ def _plot_summary(
                 3.10,
                 3.10,
                 3.10,
+                2.40,
                 2.20,
             ]
         },
@@ -2089,7 +2455,7 @@ def _plot_summary(
     _draw_table(
         ax_p1_base,
         _sweep_table(tp_sweep, group_name="p1_base_signal"),
-        title="base signal: TP hitrate in H1-H5 / total base signal",
+        title="base signal: TP hitrate in H1-H15 / total base signal",
         font_size=6.3,
     )
     _draw_table(
@@ -2165,7 +2531,7 @@ def _plot_summary(
         ax_base_fraction_bands,
         _fraction_band_sweep_table(tp_sweep),
         title=(
-            "Base signal score bands: TP hitrate in H1-H5 | "
+            "Base signal score bands: TP hitrate in H1-H15 | "
             "disjoint 5% bands to top 50% | member Val cutoffs applied to Test"
         ),
         font_size=5.8,
@@ -2186,22 +2552,37 @@ def _plot_summary(
         ax_base_fraction_two_sided,
         _fraction_band_two_sided_table(tp_sweep),
         title=(
-            "Base signal score bands: P(max high H1-H5 > +x AND "
-            "min low H1-H5 < -x) | x=0.05%..1.00% step=0.05% | "
+            "Base signal score bands: P(max high H1-H15 > +x AND "
+            "min low H1-H15 < -x) | x=0.05%..1.00% step=0.05% | "
             "raw price direction"
         ),
         font_size=5.2,
+    )
+    _draw_table(
+        ax_two_sided_score_band,
+        _two_sided_score_band_table(two_sided_score_band),
+        title=(
+            "Two-sided score-band strategy | open Long + Short together | "
+            f"TP Long=+{SCORE_BAND_TWO_SIDED_TP_LONG:.2%}, "
+            f"TP Short=-{SCORE_BAND_TWO_SIDED_TP_SHORT:.2%} | "
+            "unfilled legs exit at close H15 | E[net] subtracts TRADE_COST once"
+        ),
+        font_size=6.2,
     )
     _draw_table(
         ax_score_band_strategy,
         _score_band_strategy_table(score_band_strategy),
         title=(
             "Fixed score-band strategy | "
+            "entry filter low H0 / open H0 - 1 "
+            f"> {SCORE_BAND_ENTRY_MIN_LOW_THRESHOLD:.2%} | "
             f"TP H1-H4={SCORE_BAND_TP_H1_H4:.2%} | "
+            f"weak H1 TP H2-H4={SCORE_BAND_WEAK_H1_TP_H2_H4:.2%} | "
             f"TP H5={SCORE_BAND_TP_H5:.2%} | "
             f"cut-loss H1-H5={SCORE_BAND_CUTLOSS:.2%} (stop-first ties) | "
             "open H5 >= TP -> fill at open H5 | otherwise high H5 check | "
-            "H5 miss -> close H5"
+            "H5 miss -> close H5 | "
+            "high-H1 subset reports mean high/close H2-H4"
         ),
         font_size=6.4,
     )
@@ -2393,7 +2774,7 @@ def _fraction_band_two_sided_table(tp_sweep: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=columns)
     subset = tp_sweep[
         tp_sweep["group"].astype(str)
-        == "base_fraction_band_two_sided_h1_h5"
+        == "base_fraction_band_two_sided_h1_h15"
     ]
     if subset.empty:
         return pd.DataFrame(columns=columns)
@@ -2423,17 +2804,124 @@ def _fraction_band_two_sided_table(tp_sweep: pd.DataFrame) -> pd.DataFrame:
 
 
 def _score_band_strategy_table(results: pd.DataFrame) -> pd.DataFrame:
+    threshold_text = _format_threshold_pct(SCORE_BAND_MAX_HIGH_BELOW_THRESHOLD)
+    high_h1_below_label = (
+        f"high H1<{threshold_text} / all"
+    )
+    followup_labels = {
+        horizon: (
+            f"high H1<{threshold_text} "
+            f"mean high H{horizon} | mean close H{horizon}"
+        )
+        for horizon in (2, 3, 4)
+    }
     columns = [
         "split / score band",
         "n",
+        "n_after_filter",
         "hit H1",
         "hit H2",
         "hit H3",
         "hit H4",
+        "weak H1 TP H2-H4",
         "hit open H5",
         "hit H5",
         "cutloss",
         "close H5",
+        high_h1_below_label,
+        followup_labels[2],
+        followup_labels[3],
+        followup_labels[4],
+        "gross mean",
+        "E[net]",
+    ]
+    if results.empty:
+        return pd.DataFrame(columns=columns)
+    rows: list[dict[str, str]] = []
+    for _, row in results.iterrows():
+        n_after_filter = int(row.get("trades", 0) or 0)
+        n = int(row.get("signals_before_filter", n_after_filter) or 0)
+        rows.append(
+            {
+                "split / score band": f"{row.get('split', '')} {row.get('score_band', '')}",
+                "n": str(n),
+                "n_after_filter": str(n_after_filter),
+                "hit H1": _count_fraction_return_cell(
+                    row.get("hit_h1"),
+                    n_after_filter,
+                    row.get("hit_h1_return_mean"),
+                ),
+                "hit H2": _count_fraction_return_cell(
+                    row.get("hit_h2"),
+                    n_after_filter,
+                    row.get("hit_h2_return_mean"),
+                ),
+                "hit H3": _count_fraction_return_cell(
+                    row.get("hit_h3"),
+                    n_after_filter,
+                    row.get("hit_h3_return_mean"),
+                ),
+                "hit H4": _count_fraction_return_cell(
+                    row.get("hit_h4"),
+                    n_after_filter,
+                    row.get("hit_h4_return_mean"),
+                ),
+                "weak H1 TP H2-H4": _count_fraction_return_cell(
+                    row.get("weak_h1_tp_h2_h4"),
+                    n_after_filter,
+                    row.get("weak_h1_tp_h2_h4_return_mean"),
+                ),
+                "hit open H5": _count_fraction_return_cell(
+                    row.get("hit_open_h5"),
+                    n_after_filter,
+                    row.get("hit_open_h5_return_mean"),
+                ),
+                "hit H5": _count_fraction_return_cell(
+                    row.get("hit_h5"),
+                    n_after_filter,
+                    row.get("hit_h5_return_mean"),
+                ),
+                "cutloss": _count_fraction_return_cell(
+                    row.get("cutloss"),
+                    n_after_filter,
+                    row.get("cutloss_return_mean"),
+                ),
+                "close H5": _count_fraction_return_cell(
+                    row.get("close_h5"),
+                    n_after_filter,
+                    row.get("close_h5_return_mean"),
+                ),
+                high_h1_below_label: _count_fraction_cell(
+                    row.get("high_h1_below_threshold"),
+                    n_after_filter,
+                ),
+                **{
+                    followup_labels[horizon]: (
+                        f"{_format_signed_pct(row.get(f'high_h1_below_threshold_high_h{horizon}_mean')) or 'n/a'}"
+                        " | "
+                        f"{_format_signed_pct(row.get(f'high_h1_below_threshold_close_h{horizon}_mean')) or 'n/a'}"
+                    )
+                    for horizon in (2, 3, 4)
+                },
+                "gross mean": _format_signed_pct(row.get("gross_mean")),
+                "E[net]": _format_signed_pct(row.get("e_net")),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _two_sided_score_band_table(results: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "split / score band",
+        "n",
+        "Long TP",
+        "Short TP",
+        "both TP",
+        "Long only",
+        "Short only",
+        "neither",
+        "Long mean",
+        "Short mean",
         "gross mean",
         "E[net]",
     ]
@@ -2446,32 +2934,14 @@ def _score_band_strategy_table(results: pd.DataFrame) -> pd.DataFrame:
             {
                 "split / score band": f"{row.get('split', '')} {row.get('score_band', '')}",
                 "n": str(n),
-                "hit H1": _count_fraction_return_cell(
-                    row.get("hit_h1"), n, row.get("hit_h1_return_mean")
-                ),
-                "hit H2": _count_fraction_return_cell(
-                    row.get("hit_h2"), n, row.get("hit_h2_return_mean")
-                ),
-                "hit H3": _count_fraction_return_cell(
-                    row.get("hit_h3"), n, row.get("hit_h3_return_mean")
-                ),
-                "hit H4": _count_fraction_return_cell(
-                    row.get("hit_h4"), n, row.get("hit_h4_return_mean")
-                ),
-                "hit open H5": _count_fraction_return_cell(
-                    row.get("hit_open_h5"),
-                    n,
-                    row.get("hit_open_h5_return_mean"),
-                ),
-                "hit H5": _count_fraction_return_cell(
-                    row.get("hit_h5"), n, row.get("hit_h5_return_mean")
-                ),
-                "cutloss": _count_fraction_return_cell(
-                    row.get("cutloss"), n, row.get("cutloss_return_mean")
-                ),
-                "close H5": _count_fraction_return_cell(
-                    row.get("close_h5"), n, row.get("close_h5_return_mean")
-                ),
+                "Long TP": _count_fraction_cell(row.get("long_hit"), n),
+                "Short TP": _count_fraction_cell(row.get("short_hit"), n),
+                "both TP": _count_fraction_cell(row.get("both_hit"), n),
+                "Long only": _count_fraction_cell(row.get("long_only"), n),
+                "Short only": _count_fraction_cell(row.get("short_only"), n),
+                "neither": _count_fraction_cell(row.get("neither_hit"), n),
+                "Long mean": _format_signed_pct(row.get("long_return_mean")),
+                "Short mean": _format_signed_pct(row.get("short_return_mean")),
                 "gross mean": _format_signed_pct(row.get("gross_mean")),
                 "E[net]": _format_signed_pct(row.get("e_net")),
             }
@@ -2917,6 +3387,9 @@ def main() -> None:
                     "tp_sweep_csv": str(result.tp_sweep_csv_path),
                     "dynamic_tp_csv": str(result.tp_optimization_csv_path),
                     "score_band_strategy_csv": str(result.score_band_strategy_csv_path),
+                    "two_sided_score_band_csv": str(
+                        result.two_sided_score_band_csv_path
+                    ),
                     "chart": str(result.chart_path),
                 }
                 for result in results
