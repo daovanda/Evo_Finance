@@ -8,18 +8,28 @@ import pandas as pd
 
 from crypto import config
 from crypto.backtest import (
+    BASE_FRACTION_BAND_MAX,
+    BASE_FRACTION_BAND_STEP,
+    BASE_SIGNAL_HIGH_GROUP,
+    BASE_SIGNAL_LOW_GROUP,
     BundleSignals,
     ModelSpec,
     SplitSignals,
+    _base_fraction_band_indices,
     _base_fraction_band_tp_rows,
+    _base_overview,
     _apply_score_band_entry_filter,
     _backtest_name,
     _dynamic_tp_arrays,
     _draw_table,
     _fraction_band_sweep_table,
     _fraction_band_two_sided_table,
+    _overview_table,
+    _optimize_two_sided_tp_pair,
     _parse_spec,
+    _score_band_two_sided_tp_strategy,
     _score_band_fixed_h5_metrics,
+    _score_band_sweep_thresholds,
     _score_band_strategy_table,
     _simulate_score_band_fixed_h5_frame,
     _simulate_two_sided_tp_frame,
@@ -27,6 +37,8 @@ from crypto.backtest import (
     _summarize_split,
     _sweep_table,
     _tp_sweep_rows,
+    _two_sided_score_band_trade_path,
+    _two_sided_tp_grid,
     _two_sided_sweep_thresholds,
     _two_sided_score_band_table,
     _two_sided_tp_metrics,
@@ -48,9 +60,79 @@ from crypto.fitness import (
     _classification_trade_metrics,
     _internal_early_stop_split,
 )
+from crypto.prod.live_backend import (
+    SCORE_BAND_COUNT,
+    _prediction_score_band_index,
+    _score_band_name,
+    _score_band_percent_range,
+)
+from crypto.prod.train_model import SCORE_BAND_FRACTIONS, _score_band_cutoffs
 
 
 class CryptoPipelineTests(unittest.TestCase):
+    def test_prod_score_bands_cover_full_val_distribution(self):
+        pred = pd.Series(np.arange(1, 101, dtype=float))
+        cutoffs = _score_band_cutoffs(pred)
+
+        self.assertEqual(SCORE_BAND_COUNT, 20)
+        self.assertEqual(len(SCORE_BAND_FRACTIONS), 20)
+        self.assertAlmostEqual(SCORE_BAND_FRACTIONS[0], 0.05)
+        self.assertAlmostEqual(SCORE_BAND_FRACTIONS[-1], 1.0)
+        self.assertEqual(set(cutoffs), {f"q{index}" for index in range(1, 21)})
+        self.assertEqual(_prediction_score_band_index(100.0, cutoffs), 1)
+        self.assertEqual(_prediction_score_band_index(1.0, cutoffs), 20)
+        self.assertEqual(_prediction_score_band_index(0.0, cutoffs), 20)
+        self.assertEqual(_score_band_name(1), "Q1")
+        self.assertEqual(_score_band_name(20), "Q20")
+        self.assertEqual(_score_band_percent_range(1), "0%-5%")
+        self.assertEqual(_score_band_percent_range(20), "95%-100%")
+
+    def test_prod_score_band_rejects_legacy_six_cutoff_manifest(self):
+        legacy = {f"q{index}": float(7 - index) for index in range(1, 7)}
+        self.assertIsNone(_prediction_score_band_index(10.0, legacy))
+
+    def test_score_band_ands_horizon_top_sets_before_building_band(self):
+        idx = pd.date_range("2024-01-01", periods=1000, freq="15min")
+        pred_h1 = pd.Series(np.linspace(1.0, 0.0, len(idx)), index=idx)
+        pred_h2 = pd.Series(np.linspace(0.20, 0.0, len(idx)), index=idx)
+        pred_h2.iloc[:25] = np.linspace(1.0, 0.96, 25)
+        pred_h2.iloc[50:75] = np.linspace(0.95, 0.91, 25)
+
+        def horizon_split(split, pred):
+            data = pd.DataFrame({"label": 0.0, "pred": pred}, index=idx)
+            selected = data.nlargest(50, "pred").index
+            return SplitSignals(split, data, selected, float(pred.loc[selected].min()), 0.05)
+
+        val_h1 = horizon_split("val", pred_h1)
+        val_h2 = horizon_split("val", pred_h2)
+        test_h1 = horizon_split("test", pred_h1)
+        test_h2 = horizon_split("test", pred_h2)
+        expected = val_h1.selected_index.intersection(val_h2.selected_index)
+        combined_data = pd.DataFrame(
+            {
+                "label": 0.0,
+                "pred": pd.concat([pred_h1, pred_h2], axis=1).mean(axis=1),
+            },
+            index=idx,
+        )
+        bundle = BundleSignals(
+            label="h-ensemble",
+            val=SplitSignals("val", combined_data, expected, 0.0, 0.05),
+            test=SplitSignals("test", combined_data, expected, 0.0, 0.05),
+            val_horizons=(val_h1, val_h2),
+            test_horizons=(test_h1, test_h2),
+        )
+
+        bands = _base_fraction_band_indices(
+            [bundle],
+            selection="and",
+            max_fraction=0.05,
+        )
+
+        self.assertEqual(len(expected), 25)
+        self.assertTrue(bands["val"][0][2].equals(expected))
+        self.assertTrue(bands["test"][0][2].equals(expected))
+
     def test_backtest_base_fraction_bands_are_disjoint(self):
         idx = pd.date_range("2024-01-01", periods=100, freq="15min")
         pred = pd.Series(np.linspace(1.0, 0.01, len(idx)), index=idx)
@@ -59,61 +141,103 @@ class CryptoPipelineTests(unittest.TestCase):
         split_test = SplitSignals("test", data, idx[:20], 0.80, 0.20)
         bundle = BundleSignals("base", split_val, split_test)
         path_returns = pd.DataFrame(index=idx)
-        for horizon in range(1, 6):
-            path_returns[f"high_h{horizon}"] = 0.002
-            path_returns[f"low_h{horizon}"] = -0.0015
+        for horizon in range(1, 25):
+            path_returns[f"high_h{horizon}"] = 0.0
+            path_returns[f"low_h{horizon}"] = 0.0
             path_returns[f"close_h{horizon}"] = 0.0
+        path_returns["high_h24"] = 0.002
+        path_returns["low_h24"] = -0.0015
 
         rows = _base_fraction_band_tp_rows(
             base_bundles=[bundle],
             selection="and",
-            path_returns=path_returns,
+            raw_path_returns=path_returns,
             thresholds=[0.001],
-            label_direction="long",
         )
         raw = pd.DataFrame(rows)
+        band_count = int(
+            round(BASE_FRACTION_BAND_MAX / BASE_FRACTION_BAND_STEP)
+        )
 
         for split in ("val", "test"):
             split_rows = raw[
-                (raw["split"] == split) & (raw["group"] == "base_fraction_band")
+                (raw["split"] == split) & (raw["group"] == BASE_SIGNAL_HIGH_GROUP)
             ]
-            self.assertEqual(len(split_rows), 10)
-            self.assertEqual(int(split_rows["sample_count"].sum()), 50)
+            self.assertEqual(len(split_rows), band_count)
+            self.assertEqual(
+                int(split_rows["sample_count"].sum()),
+                int(round(BASE_FRACTION_BAND_MAX * len(idx))),
+            )
             self.assertTrue((split_rows["sample_count"] == 5).all())
             self.assertTrue((split_rows["hit_rate"] == 1.0).all())
 
-        rendered = _fraction_band_sweep_table(raw)
-        self.assertEqual(len(rendered), 20)
+        rendered = _fraction_band_sweep_table(
+            raw,
+            group_name=BASE_SIGNAL_HIGH_GROUP,
+            thresholds=[0.001],
+        )
+        self.assertEqual(len(rendered), band_count * 2)
         self.assertIn("val top 0%-5% n=5", rendered["split / score band"].tolist())
-        self.assertIn("test top 45%-50% n=5", rendered["split / score band"].tolist())
+        self.assertIn(
+            "test top 65%-70% n=5",
+            rendered["split / score band"].tolist(),
+        )
         low_h1_rendered = _fraction_band_sweep_table(
             raw,
-            group_name="base_fraction_band_low_h1",
+            group_name=BASE_SIGNAL_LOW_GROUP,
+            thresholds=[-0.001],
         )
-        self.assertEqual(len(low_h1_rendered), 20)
-        self.assertTrue((low_h1_rendered["0.10%"] == "100.00%").all())
+        self.assertEqual(len(low_h1_rendered), band_count * 2)
+        self.assertTrue((low_h1_rendered["-0.10%"] == "100.00%").all())
         two_sided_rendered = _fraction_band_two_sided_table(raw)
         self.assertEqual(len(_two_sided_sweep_thresholds()), 20)
-        self.assertEqual(len(two_sided_rendered), 20)
+        self.assertEqual(len(_score_band_sweep_thresholds()), 21)
+        self.assertEqual(_score_band_sweep_thresholds()[0], 0.0)
+        self.assertEqual(_score_band_sweep_thresholds()[-1], 0.01)
+        self.assertEqual(len(two_sided_rendered), band_count * 2)
         self.assertTrue((two_sided_rendered["0.10%"] == "100.00%").all())
         self.assertTrue((two_sided_rendered["0.15%"] == "0.00%").all())
         self.assertIn("1.00%", two_sided_rendered.columns)
 
-        short_path = path_returns.copy()
-        short_path[[f"high_h{h}" for h in range(1, 6)]] *= -1.0
-        short_path[[f"low_h{h}" for h in range(1, 6)]] *= -1.0
+        # Score-band excursion tables always use raw price geometry, even when
+        # the archive evaluation direction is Short.
         short_rows = _base_fraction_band_tp_rows(
             base_bundles=[bundle],
             selection="and",
-            path_returns=short_path,
+            raw_path_returns=path_returns,
             thresholds=[0.001],
-            label_direction="short",
         )
         short_low = _fraction_band_sweep_table(
             pd.DataFrame(short_rows),
-            group_name="base_fraction_band_low_h1",
+            group_name=BASE_SIGNAL_LOW_GROUP,
+            thresholds=[-0.001],
         )
-        self.assertTrue((short_low["0.10%"] == "100.00%").all())
+        self.assertTrue((short_low["-0.10%"] == "100.00%").all())
+
+        overview = _base_overview(bundle, path_returns, tp_threshold=0.004)
+        rendered_overview = _overview_table(overview)
+        self.assertEqual(
+            rendered_overview.columns.tolist(),
+            ["split", "base signal", "avg trades/day", "TP_threshold"],
+        )
+        self.assertEqual(rendered_overview["base signal"].tolist(), ["20", "20"])
+        self.assertEqual(rendered_overview["avg trades/day"].tolist(), ["10.00", "10.00"])
+
+        trade_path = _two_sided_score_band_trade_path(
+            base_bundle=bundle,
+            raw_path_returns=path_returns,
+            tp_long=0.003,
+            tp_short=0.002,
+        )
+        self.assertEqual(len(trade_path), 40)
+        for split in ("val", "test"):
+            split_path = trade_path[trade_path["split"] == split]
+            self.assertEqual(len(split_path), 20)
+            self.assertTrue(split_path.index.is_monotonic_increasing)
+            self.assertAlmostEqual(
+                float(split_path["cumulative_net_return"].iloc[-1]),
+                float(split_path["net_return"].sum()),
+            )
 
     def test_backtest_trains_each_spec_with_its_own_direction(self):
         idx = pd.date_range("2024-01-01", periods=3, freq="15min")
@@ -499,20 +623,171 @@ class CryptoPipelineTests(unittest.TestCase):
         self.assertEqual(rendered.iloc[0]["both TP"], "1 (25.0%)")
         self.assertEqual(rendered.iloc[0]["gross mean"], "+0.35%")
 
-    def test_two_sided_score_band_uses_h15_and_closes_unfilled_leg_at_h15(self):
+    def test_two_sided_tp_optimizer_includes_zero_and_both_maxima(self):
+        frame = pd.DataFrame(index=pd.RangeIndex(4))
+        for horizon in range(1, 25):
+            frame[f"high_h{horizon}"] = 0.005
+            frame[f"low_h{horizon}"] = -0.002
+        frame["close_h24"] = 0.0
+
+        long_grid = _two_sided_tp_grid(0.01)
+        short_grid = _two_sided_tp_grid(0.01)
+        selected = _optimize_two_sided_tp_pair(
+            frame,
+            max_tp_long=0.01,
+            max_tp_short=0.01,
+            exit_horizon=24,
+        )
+
+        self.assertEqual(long_grid[0], 0.0)
+        self.assertEqual(short_grid[0], 0.0)
+        self.assertAlmostEqual(long_grid[-1], 0.01)
+        self.assertAlmostEqual(short_grid[-1], 0.01)
+        self.assertAlmostEqual(selected[0], 0.005)
+        self.assertAlmostEqual(selected[1], 0.002)
+
+    def test_two_sided_score_band_applies_val_optimized_pair_to_test(self):
+        val_idx = pd.date_range("2024-01-01", periods=1000, freq="15min")
+        test_idx = pd.date_range("2025-01-01", periods=1000, freq="15min")
+        pred = np.linspace(1.0, 0.0, 1000)
+
+        def split(name, index):
+            data = pd.DataFrame({"label": 0.0, "pred": pred}, index=index)
+            return SplitSignals(name, data, index[:50], 0.95, 0.05)
+
+        bundle = BundleSignals("base", split("val", val_idx), split("test", test_idx))
+        path = pd.DataFrame(index=val_idx.append(test_idx))
+        for horizon in range(1, 25):
+            path[f"high_h{horizon}"] = 0.0
+            path[f"low_h{horizon}"] = 0.0
+            path.loc[val_idx, f"high_h{horizon}"] = 0.005
+            path.loc[val_idx, f"low_h{horizon}"] = -0.002
+            path.loc[test_idx, f"high_h{horizon}"] = 0.009
+            path.loc[test_idx, f"low_h{horizon}"] = -0.009
+            path[f"close_h{horizon}"] = 0.0
+
+        results = _score_band_two_sided_tp_strategy(
+            [bundle],
+            selection="and",
+            raw_path_returns=path,
+            tp_long=0.01,
+            tp_short=0.01,
+        )
+        val_first = results[
+            (results["split"] == "val") & (results["score_band"] == "top 0%-5%")
+        ].iloc[0]
+        test_first = results[
+            (results["split"] == "test") & (results["score_band"] == "top 0%-5%")
+        ].iloc[0]
+
+        self.assertAlmostEqual(val_first["tp_long"], 0.005)
+        self.assertAlmostEqual(val_first["tp_short"], 0.002)
+        self.assertAlmostEqual(test_first["tp_long"], 0.005)
+        self.assertAlmostEqual(test_first["tp_short"], 0.002)
+
+    def test_two_sided_score_band_can_use_fixed_configured_pair(self):
+        val_idx = pd.date_range("2024-01-01", periods=1000, freq="15min")
+        test_idx = pd.date_range("2025-01-01", periods=1000, freq="15min")
+        pred = np.linspace(1.0, 0.0, 1000)
+
+        def split(name, index):
+            data = pd.DataFrame({"label": 0.0, "pred": pred}, index=index)
+            return SplitSignals(name, data, index[:50], 0.95, 0.05)
+
+        bundle = BundleSignals("base", split("val", val_idx), split("test", test_idx))
+        path = pd.DataFrame(index=val_idx.append(test_idx))
+        for horizon in range(1, 25):
+            path[f"high_h{horizon}"] = 0.009
+            path[f"low_h{horizon}"] = -0.009
+            path[f"close_h{horizon}"] = 0.0
+
+        results = _score_band_two_sided_tp_strategy(
+            [bundle],
+            selection="and",
+            raw_path_returns=path,
+            tp_long=0.007,
+            tp_short=0.004,
+            optimize_tp=False,
+        )
+        band_rows = results.dropna(subset=["tp_long", "tp_short"])
+
+        self.assertTrue(np.allclose(band_rows["tp_long"], 0.007))
+        self.assertTrue(np.allclose(band_rows["tp_short"], 0.004))
+        trade_path = _two_sided_score_band_trade_path(
+            base_bundle=bundle,
+            raw_path_returns=path,
+            tp_long=0.007,
+            tp_short=0.004,
+            optimize_tp=False,
+        )
+        self.assertTrue(np.allclose(trade_path["tp_long"], 0.007))
+        self.assertTrue(np.allclose(trade_path["tp_short"], 0.004))
+
+    def test_two_sided_trade_path_uses_each_bands_val_optimized_pair(self):
+        val_idx = pd.date_range("2024-01-01", periods=1000, freq="15min")
+        test_idx = pd.date_range("2025-01-01", periods=1000, freq="15min")
+        pred = np.linspace(1.0, 0.0, 1000)
+
+        def split(name, index):
+            data = pd.DataFrame({"label": 0.0, "pred": pred}, index=index)
+            return SplitSignals(name, data, index[:100], 0.90, 0.10)
+
+        bundle = BundleSignals("base", split("val", val_idx), split("test", test_idx))
+        path = pd.DataFrame(index=val_idx.append(test_idx))
+        for horizon in range(1, 25):
+            path[f"high_h{horizon}"] = 0.0
+            path[f"low_h{horizon}"] = 0.0
+            path[f"close_h{horizon}"] = 0.0
+        for index in (val_idx, test_idx):
+            path.loc[index[:50], "high_h1"] = 0.005
+            path.loc[index[:50], "low_h1"] = -0.002
+            path.loc[index[50:100], "high_h1"] = 0.008
+            path.loc[index[50:100], "low_h1"] = -0.004
+
+        strategy = _score_band_two_sided_tp_strategy(
+            [bundle],
+            selection="and",
+            raw_path_returns=path,
+            tp_long=0.01,
+            tp_short=0.01,
+            optimize_tp=True,
+        )
+        trade_path = _two_sided_score_band_trade_path(
+            base_bundle=bundle,
+            raw_path_returns=path,
+            tp_long=0.01,
+            tp_short=0.01,
+            optimize_tp=True,
+            base_bundles=[bundle],
+            selection="and",
+            score_band_strategy=strategy,
+        )
+
+        for split_name in ("val", "test"):
+            split_path = trade_path[trade_path["split"] == split_name]
+            first = split_path[split_path["score_band"] == "top 0%-5%"]
+            second = split_path[split_path["score_band"] == "top 5%-10%"]
+            self.assertEqual(len(first), 50)
+            self.assertEqual(len(second), 50)
+            self.assertTrue(np.allclose(first["tp_long"], 0.005))
+            self.assertTrue(np.allclose(first["tp_short"], 0.002))
+            self.assertTrue(np.allclose(second["tp_long"], 0.008))
+            self.assertTrue(np.allclose(second["tp_short"], 0.004))
+
+    def test_two_sided_score_band_uses_h24_and_closes_unfilled_leg_at_h24(self):
         frame = pd.DataFrame(index=pd.RangeIndex(2))
-        for horizon in range(1, 16):
+        for horizon in range(1, 25):
             frame[f"high_h{horizon}"] = 0.0
             frame[f"low_h{horizon}"] = 0.0
-        frame.loc[0, "high_h15"] = 0.004
-        frame.loc[1, "low_h15"] = -0.003
-        frame["close_h15"] = [-0.001, 0.002]
+        frame.loc[0, "high_h24"] = 0.004
+        frame.loc[1, "low_h24"] = -0.003
+        frame["close_h24"] = [-0.001, 0.002]
 
         detailed = _simulate_two_sided_tp_frame(
             frame,
             tp_long=0.003,
             tp_short=0.002,
-            exit_horizon=15,
+            exit_horizon=24,
         )
 
         self.assertEqual(detailed["long_hit"].tolist(), [True, False])
@@ -921,6 +1196,125 @@ class CryptoPipelineTests(unittest.TestCase):
         )
         self.assertTrue(config.is_precision_only_label_mode("high_exit"))
         self.assertFalse(config.is_precision_only_label_mode("close_exit"))
+
+    def test_slope_slowdown_uses_high_and_aligns_expanded_window_to_t(self):
+        idx = pd.date_range("2024-01-01", periods=12, freq="15min")
+
+        def frame_with_high(high):
+            return pd.DataFrame(
+                {
+                    "open": [90.0] * len(high),
+                    "high": high,
+                    "low": [80.0] * len(high),
+                    # Flat close makes the test fail if close is used.
+                    "close": [90.0] * len(high),
+                    "volume": [10.0] * len(high),
+                    "trade_count": [10] * len(high),
+                    "taker_buy_base_volume": [5.0] * len(high),
+                    "taker_buy_quote_volume": [500.0] * len(high),
+                },
+                index=idx,
+            )
+
+        long_high = [100, 101, 102, 103, 104, 103, 101, 99, 100, 100, 100, 100]
+        short_high = [104, 103, 102, 101, 100, 101, 103, 105, 104, 104, 104, 104]
+
+        long_source = config.slope_slowdown_future_return(
+            frame_with_high(long_high),
+            horizon=3,
+            direction="Long",
+        )
+        short_source = config.slope_slowdown_future_return(
+            frame_with_high(short_high),
+            horizon=3,
+            direction="Short",
+        )
+
+        x5 = np.arange(5, dtype=float)
+        x8 = np.arange(8, dtype=float)
+        long_initial = np.expm1(np.polyfit(x5, np.log(long_high[:5]), 1)[0])
+        long_expanded = np.expm1(np.polyfit(x8, np.log(long_high[:8]), 1)[0])
+        short_initial = np.expm1(np.polyfit(x5, np.log(short_high[:5]), 1)[0])
+        short_expanded = np.expm1(np.polyfit(x8, np.log(short_high[:8]), 1)[0])
+
+        self.assertAlmostEqual(
+            long_source.iloc[4],
+            long_initial - long_expanded,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            short_source.iloc[4],
+            short_expanded - short_initial,
+            places=12,
+        )
+        self.assertGreater(long_source.iloc[4], 0.0003)
+        self.assertGreater(short_source.iloc[4], 0.0003)
+
+    def test_slope_slowdown_labels_both_directions_and_zeroes_fitness_return(self):
+        idx = pd.date_range("2024-01-01", periods=12, freq="15min")
+
+        def labeled(high, direction):
+            frame = pd.DataFrame(
+                {
+                    "open": [90.0] * len(high),
+                    "high": high,
+                    "low": [80.0] * len(high),
+                    "close": [90.0] * len(high),
+                    "volume": [10.0] * len(high),
+                    "trade_count": [10] * len(high),
+                    "taker_buy_base_volume": [5.0] * len(high),
+                    "taker_buy_quote_volume": [500.0] * len(high),
+                },
+                index=idx,
+            )
+            return add_binary_labels(
+                frame,
+                horizons=[3],
+                label_mode="slope_slowdown",
+                label_direction=direction,
+                threshold=0.0003,
+            )
+
+        long_labeled = labeled(
+            [100, 101, 102, 103, 104, 103, 101, 99, 100, 100, 100, 100],
+            "Long",
+        )
+        short_labeled = labeled(
+            [104, 103, 102, 101, 100, 101, 103, 105, 104, 104, 104, 104],
+            "Short",
+        )
+
+        self.assertEqual(long_labeled["label_h3"].iloc[4], 1.0)
+        self.assertEqual(short_labeled["label_h3"].iloc[4], 1.0)
+        # Complete future paths that fail the observable initial-slope gate
+        # are excluded, not supplied to the model as easy label-0 samples.
+        self.assertTrue(pd.isna(long_labeled["label_h3"].iloc[7]))
+        self.assertTrue(pd.isna(short_labeled["label_h3"].iloc[7]))
+        self.assertTrue(pd.isna(long_labeled["future_return_h3"].iloc[7]))
+        self.assertTrue(pd.isna(short_labeled["future_return_h3"].iloc[7]))
+        self.assertTrue((long_labeled["future_return_h3"].dropna() == 0.0).all())
+        self.assertTrue((short_labeled["future_return_h3"].dropna() == 0.0).all())
+        self.assertTrue(long_labeled["label_h3"].iloc[-3:].isna().all())
+        self.assertTrue(short_labeled["label_h3"].iloc[-3:].isna().all())
+        self.assertIs(
+            config.get_label_return_fn("slope_slowdown"),
+            config.slope_slowdown_future_return,
+        )
+        self.assertTrue(config.is_precision_only_label_mode("slope_slowdown"))
+        self.assertEqual(
+            config.default_label_threshold("slope_slowdown"),
+            config.SLOPE_SLOWDOWN_THRESHOLD,
+        )
+
+    def test_slope_slowdown_rejects_non_positive_threshold(self):
+        frame = _synthetic_crypto_frame(20)
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            add_binary_labels(
+                frame,
+                horizons=[3],
+                label_mode="slope_slowdown",
+                threshold=0.0,
+            )
 
     def test_precision_only_metrics_do_not_charge_trade_cost_on_zero_return(self):
         y = pd.Series([1, 0, 1, 0])
@@ -1372,6 +1766,59 @@ class CryptoPipelineTests(unittest.TestCase):
             label_direction="long",
             label_threshold=0.004,
         )
+
+    def test_resume_metadata_checks_slope_slowdown_definition(self):
+        archive = CryptoArchive(
+            metadata={
+                "horizons": [3],
+                "label_mode": "slope_slowdown",
+                "label_direction": "long",
+                "label_threshold": config.SLOPE_SLOWDOWN_THRESHOLD,
+                "slope_lookback": config.SLOPE_LOOKBACK + 1,
+                "slope_min_initial": config.SLOPE_MIN_INITIAL,
+                "slope_price_column": "high",
+                "slope_slowdown_rule": config.SLOPE_SLOWDOWN_RULE,
+                "fitness_horizon_mode": config.FITNESS_HORIZON_MODE,
+                "trade_top_fraction": config.TRADE_TOP_FRACTION,
+                "trade_cost": config.TRADE_COST,
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "slope_lookback"):
+            _validate_resume_metadata(
+                archive=archive,
+                resume_path=Path("slope.json"),
+                horizons=[3],
+                label_mode="slope_slowdown",
+                label_direction="long",
+                label_threshold=config.SLOPE_SLOWDOWN_THRESHOLD,
+            )
+
+    def test_resume_rejects_legacy_slope_slowdown_rule(self):
+        archive = CryptoArchive(
+            metadata={
+                "horizons": [3],
+                "label_mode": "slope_slowdown",
+                "label_direction": "long",
+                "label_threshold": config.SLOPE_SLOWDOWN_THRESHOLD,
+                "slope_lookback": config.SLOPE_LOOKBACK,
+                "slope_min_initial": config.SLOPE_MIN_INITIAL,
+                "slope_price_column": "high",
+                "fitness_horizon_mode": config.FITNESS_HORIZON_MODE,
+                "trade_top_fraction": config.TRADE_TOP_FRACTION,
+                "trade_cost": config.TRADE_COST,
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "incompatible slope_slowdown rule"):
+            _validate_resume_metadata(
+                archive=archive,
+                resume_path=Path("legacy_slope.json"),
+                horizons=[3],
+                label_mode="slope_slowdown",
+                label_direction="long",
+                label_threshold=config.SLOPE_SLOWDOWN_THRESHOLD,
+            )
 
     def test_resume_metadata_mismatch_checks_safe_path_tp(self):
         old_tp = config.TP_SAFE_PATH

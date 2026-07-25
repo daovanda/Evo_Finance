@@ -1029,3 +1029,92 @@ Chi xoa state khi chac chan khong con vi the/lenh treo:
 ```powershell
 Remove-Item crypto/prod/live/trade_state.json -ErrorAction SilentlyContinue
 ```
+
+## 17. Monitor tin hieu L/S/T, khong dat lenh
+
+Che do nay dung ba archive rank 1:
+
+- `L`: payoff Long.
+- `S`: payoff Short.
+- `T`: two-sided TP.
+
+Moi model Horizon hoc sau nguong tu tap Val: `Q1=top 5%`, `Q2=5-10%`,
+..., `Q20=95-100%`. Live ap dung nguyen cac nguong Val. Neu mot archive co
+nhieu Horizon, bucket cua archive la bucket yeu nhat trong cac Horizon
+(AND theo Horizon).
+
+### Train ba production bundle
+
+Chay tai thu muc goc du an. `train_model` tu doc cac Horizon
+`5,7,10,15,20,24` trong metadata cua tung archive.
+
+```bash
+python -m crypto.prod.train_model \
+  --archive crypto/results/crypto_btc_long_payoff_ensemble_h5_h7_h10_h15_h20_h24_tp04_thr02_top30_seed1_resume_seed2_10h.json \
+  --rank 1 \
+  --label-mode payoff \
+  --label-direction Long \
+  --label-threshold 0.002 \
+  --run-name signal_long_payoff_r1
+
+python -m crypto.prod.train_model \
+  --archive crypto/results/crypto_btc_short_payoff_ensemble_h5_h7_h10_h15_h20_h24_tp04_thr02_top30_seed1_18h.json \
+  --rank 1 \
+  --label-mode payoff \
+  --label-direction Short \
+  --label-threshold 0.002 \
+  --run-name signal_short_payoff_r1
+
+python -m crypto.prod.train_model \
+  --archive crypto/results/crypto_btc_two_sided_tp_ensemble_h5_h7_h10_h15_h20_h24_tp04_top05_seed1_18h_final.json \
+  --rank 1 \
+  --label-mode two_sided_tp \
+  --label-direction Long \
+  --label-threshold 0.004 \
+  --run-name signal_two_sided_r1
+```
+
+Kiem tra moi `manifest.json` co sau model Horizon va moi model co
+`val_score_band_cutoffs` tu `q1` den `q20`.
+
+### Chay monitor tren VM
+
+```bash
+cd ~/Evo_Finance
+source .venv/bin/activate
+
+python -m crypto.prod.live_backend \
+  --signal-monitor \
+  --long-model-dir crypto/prod/model/signal_long_payoff_r1 \
+  --short-model-dir crypto/prod/model/signal_short_payoff_r1 \
+  --two-sided-model-dir crypto/prod/model/signal_two_sided_r1 \
+  --data data/crypto/BTCUSDT_15m.csv \
+  --base-url https://data-api.binance.vision \
+  --force-ipv4 \
+  --out crypto/prod/live/latest_signal_monitor.json \
+  --loop \
+  --sleep-after-open 5 \
+  2>&1 | tee crypto/prod/live/signal_monitor.log
+```
+
+Backend se:
+
+1. Cap nhat nen Binance public.
+2. Build mot feature frame dung chung cho ba model.
+3. Tinh `L`, `S`, `T` theo bucket `Q1..Q20`.
+4. Ap decision flow theo dung thu tu.
+5. Ghi `latest_signal_monitor.json`.
+6. Gui Telegram gom `L`, `S`, `T`, final signal va entry price.
+
+Payload luon co:
+
+```json
+{
+  "monitor_only": true,
+  "execution_enabled": false,
+  "can_trade": false
+}
+```
+
+Khong chay `crypto.prod.trader` trong che do nay. Backend chi doc du lieu
+thi truong va gui tin hieu, khong can Binance API key va khong dat lenh.

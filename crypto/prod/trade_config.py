@@ -10,11 +10,16 @@ from pathlib import Path
 
 
 PREDICTION_PATH: Path = Path("crypto/prod/live/latest_prediction.json")
+SIGNAL_MONITOR_PATH: Path = Path("crypto/prod/live/latest_signal_monitor.json")
 TRADE_STATE_PATH: Path = Path("crypto/prod/live/trade_state.json")
 LIVE_NOTIFY_STATE_PATH: Path = Path("crypto/prod/live/live_notify_state.json")
+SIGNAL_MONITOR_NOTIFY_STATE_PATH: Path = Path(
+    "crypto/prod/live/signal_monitor_notify_state.json"
+)
 
 SYMBOL: str = "BTCUSDT"
 INTERVAL: str = "15m"
+EXNESS_ENTRY_PRICE_OFFSET: float = 55.0
 QUOTE_ORDER_QTY: float = 7.0
 TAKE_PROFIT_PCT: float = 0.0035
 SELL_QTY_SAFETY_FACTOR: float = 0.999

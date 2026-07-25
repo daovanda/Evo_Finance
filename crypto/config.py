@@ -7,6 +7,7 @@ from math import isfinite
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 
@@ -31,6 +32,11 @@ PAYOFF_ADVERSE_FLOOR: float = -999.0
 TP_SAFE_PATH: float = 0.003  # TP used by LABEL_MODE="safe_path_mfe"
 SAFE_ADVERSE_FLOOR: float = -0.0015  # stop-first low/high floor for safe_path_mfe
 SAFE_PATH_RULE: str = "adverse_stop_first_v1"
+SLOPE_LOOKBACK: int = 5
+SLOPE_SLOWDOWN_THRESHOLD: float = 0.0003  # 0.03% log-OLS slope per candle
+SLOPE_MIN_INITIAL: float = 0.0002  # 0.02% log-OLS slope per candle
+SLOPE_PRICE_COLUMN: str = "high"
+SLOPE_SLOWDOWN_RULE: str = "eligible_initial_slope_only_v2"
 
 
 LABEL_DIRECTION_ALIASES: dict[str, str] = {
@@ -108,6 +114,85 @@ def high_exit_future_return(
         else df["high"].shift(-h)
     )
     return directional_price_return(exit_price, entry_open, direction)
+
+
+def _rolling_log_ols_slope(price: pd.Series, window: int) -> pd.Series:
+    """OLS log-price slope converted to an approximate return per candle."""
+    width = int(window)
+    if width < 2:
+        raise ValueError("slope window must be at least 2.")
+
+    numeric = pd.to_numeric(price, errors="coerce").to_numpy(dtype="float64")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_price = np.log(numeric)
+
+    x = np.arange(width, dtype="float64")
+    centered_x = x - x.mean()
+    denominator = float(np.square(centered_x).sum())
+    result = np.full(len(log_price), np.nan, dtype="float64")
+    if len(log_price) < width:
+        return pd.Series(result, index=price.index, dtype="float64")
+
+    beta = np.convolve(log_price, centered_x[::-1], mode="valid") / denominator
+    finite_count = np.convolve(
+        np.isfinite(log_price).astype("int64"),
+        np.ones(width, dtype="int64"),
+        mode="valid",
+    )
+    beta[finite_count != width] = np.nan
+    result[width - 1 :] = np.expm1(beta)
+    return pd.Series(result, index=price.index, dtype="float64")
+
+
+def slope_slowdown_future_return(
+    df: Any,
+    horizon: int,
+    direction: str | None = None,
+) -> pd.Series:
+    """Directional slope-slowdown strength based only on candle highs.
+
+    At decision row t, the initial OLS slope uses high(t-lookback+1..t).
+    The expanded OLS slope uses high(t-lookback+1..t+h), so the future h
+    candles must be strong enough to change the trend fitted over the complete
+    path. Both slopes are fitted to log(high) and expressed as return per bar.
+
+    Long identifies a rising high-price trend that slows:
+        initial_slope > SLOPE_MIN_INITIAL
+        strength = initial_slope - expanded_slope
+
+    Short identifies a falling high-price trend that recovers:
+        initial_slope < -SLOPE_MIN_INITIAL
+        strength = expanded_slope - initial_slope
+
+    Rows without the required initial direction receive NaN and are excluded
+    from training/evaluation. This prevents the model from earning easy
+    discrimination by merely relearning the observable initial-slope gate.
+    The caller labels eligible rows where strength exceeds the active label
+    threshold.
+    """
+    h = int(horizon)
+    lookback = int(SLOPE_LOOKBACK)
+    if h < 1:
+        raise ValueError("horizon must be positive for slope_slowdown.")
+    if lookback < 2:
+        raise ValueError("SLOPE_LOOKBACK must be at least 2.")
+    if SLOPE_PRICE_COLUMN != "high":
+        raise ValueError("SLOPE_PRICE_COLUMN must remain 'high'.")
+
+    high = pd.to_numeric(df[SLOPE_PRICE_COLUMN], errors="coerce")
+    initial_slope = _rolling_log_ols_slope(high, lookback)
+    expanded_at_end = _rolling_log_ols_slope(high, lookback + h)
+    expanded_at_t = expanded_at_end.shift(-h)
+    complete = initial_slope.notna() & expanded_at_t.notna()
+
+    if canonical_label_direction(direction) == "short":
+        eligible = initial_slope.lt(-float(SLOPE_MIN_INITIAL))
+        strength = expanded_at_t - initial_slope
+    else:
+        eligible = initial_slope.gt(float(SLOPE_MIN_INITIAL))
+        strength = initial_slope - expanded_at_t
+
+    return strength.where(eligible & complete)
 
 
 def mfe_future_return(
@@ -446,6 +531,7 @@ def two_sided_tp_future_return(
 LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
     "close_exit": close_exit_future_return,
     "high_exit": high_exit_future_return,
+    "slope_slowdown": slope_slowdown_future_return,
     "close_path_mean": close_path_mean_future_return,
     "mfe": mfe_future_return,
     "adverse_floor": adverse_floor_future_return,
@@ -473,7 +559,7 @@ def canonical_label_mode(mode: str | None = None) -> str:
 
 
 PRECISION_ONLY_LABEL_MODES: frozenset[str] = frozenset(
-    {"adverse_floor", "high_exit"}
+    {"adverse_floor", "high_exit", "slope_slowdown"}
 )
 
 DIRECTION_NEUTRAL_LABEL_MODES: frozenset[str] = frozenset({"two_sided_tp"})
@@ -502,6 +588,8 @@ def default_label_threshold(
         return float(TRADE_COST)
     if selected_mode == "safe_path_mfe":
         return float(SAFE_ADVERSE_FLOOR)
+    if selected_mode == "slope_slowdown":
+        return float(SLOPE_SLOWDOWN_THRESHOLD)
     return float(LABEL_THRESHOLD)
 
 
@@ -645,6 +733,17 @@ def validate_config() -> None:
         raise ValueError("TP_SAFE_PATH must be finite and positive.")
     if not isfinite(float(SAFE_ADVERSE_FLOOR)):
         raise ValueError("SAFE_ADVERSE_FLOOR must be finite.")
+    if int(SLOPE_LOOKBACK) < 2:
+        raise ValueError("SLOPE_LOOKBACK must be at least 2.")
+    if (
+        not isfinite(float(SLOPE_SLOWDOWN_THRESHOLD))
+        or SLOPE_SLOWDOWN_THRESHOLD <= 0
+    ):
+        raise ValueError("SLOPE_SLOWDOWN_THRESHOLD must be finite and positive.")
+    if not isfinite(float(SLOPE_MIN_INITIAL)) or SLOPE_MIN_INITIAL < 0:
+        raise ValueError("SLOPE_MIN_INITIAL must be finite and non-negative.")
+    if SLOPE_PRICE_COLUMN != "high":
+        raise ValueError("SLOPE_PRICE_COLUMN must be 'high'.")
     if FEATURE_MIN < 1 or FEATURE_MAX < FEATURE_MIN:
         raise ValueError("Require 1 <= FEATURE_MIN <= FEATURE_MAX.")
     if EXPR_MAX_DEPTH < 1:

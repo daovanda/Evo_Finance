@@ -99,6 +99,11 @@ def add_binary_labels(
     For high_exit, label=1 means the favorable extreme of the exact H candle
     exceeds the threshold. Its future_return_h is zero because this mode is
     also optimized only as a classification filter.
+    For slope_slowdown, label=1 means the high-price OLS slope weakens by more
+    than the threshold in the selected direction. Rows that do not satisfy
+    the observable initial-slope gate are excluded as NaN rather than treated
+    as label 0. Its future_return_h is zero because slope change is not an
+    executable trading return.
     For two_sided_tp, label=1 means both the Long and Short TP are reached;
     future_return_h is the combined gross payoff of the two positions. Label
     direction is ignored for this direction-neutral mode.
@@ -153,7 +158,12 @@ def add_binary_labels(
             labeled[f"label_h{h}"] = explicit_label
             continue
 
-        if selected_mode == "high_exit":
+        if selected_mode in {"high_exit", "slope_slowdown"}:
+            if selected_mode == "slope_slowdown" and float(label_threshold) <= 0.0:
+                raise ValueError(
+                    "slope_slowdown label_threshold must be positive; "
+                    "for example 0.0003 means 0.03% slope change per candle."
+                )
             complete = future_return.notna()
             explicit_label = (
                 future_return.gt(float(label_threshold))

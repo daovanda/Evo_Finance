@@ -4,6 +4,11 @@
 
 # Bo qua toan bo thu muc ket qua chay
 results/
+!crypto/results/
+crypto/results/*
+!crypto/results/temp/
+crypto/results/temp/*
+!crypto/results/temp/plot_slope_slowdown.py
 
 # Secrets / local environment
 .env

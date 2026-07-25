@@ -3,6 +3,7 @@
 Examples:
     python -m crypto.prod.live_backend --model-dir crypto/prod/model/crypto_btc_seed1_12h
     python -m crypto.prod.live_backend --model-dir crypto/prod/model/crypto_btc_seed1_12h --loop
+    python -m crypto.prod.live_backend --signal-monitor --long-model-dir crypto/prod/model/long --short-model-dir crypto/prod/model/short --two-sided-model-dir crypto/prod/model/two_sided --loop
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import json
 import logging
 import os
 import re
+import socket
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -47,10 +49,13 @@ logger = logging.getLogger("crypto.prod.live_backend")
 
 
 DEFAULT_OUTPUT_PATH = Path("crypto/prod/live/latest_prediction.json")
+DEFAULT_MONITOR_OUTPUT_PATH = Path("crypto/prod/live/latest_signal_monitor.json")
 DEFAULT_CRAWL_LOOKBACK_DAYS = 1.0
 DEFAULT_LIVE_FEATURE_LOOKBACK_BARS = 5000
+SCORE_BAND_COUNT = 20
 _WINDOW_ARG_RE = re.compile(r",\s*(\d+)(?=\))")
 _WINDOW_SUFFIX_RE = re.compile(r"_(\d+)\b")
+_DEFAULT_GETADDRINFO = socket.getaddrinfo
 
 
 @dataclass(frozen=True)
@@ -58,6 +63,32 @@ class CurrentOpen:
     candle_time: pd.Timestamp
     open: float
     fetched_at: str
+
+
+def force_ipv4_networking() -> None:
+    """Force this process to resolve outbound hosts to IPv4 addresses."""
+    if socket.getaddrinfo is not _DEFAULT_GETADDRINFO:
+        return
+
+    def ipv4_getaddrinfo(
+        host: str,
+        port: int | str,
+        family: int = 0,
+        type: int = 0,
+        proto: int = 0,
+        flags: int = 0,
+    ) -> list[tuple[Any, ...]]:
+        return _DEFAULT_GETADDRINFO(
+            host,
+            port,
+            socket.AF_INET,
+            type,
+            proto,
+            flags,
+        )
+
+    socket.getaddrinfo = ipv4_getaddrinfo
+    logger.info("IPv4-only networking enabled for this process.")
 
 
 def run_once(
@@ -170,6 +201,128 @@ def run_once(
     return payload
 
 
+def run_signal_monitor_once(
+    long_model_dir: str | Path,
+    short_model_dir: str | Path,
+    two_sided_model_dir: str | Path,
+    data_path: str | Path = config.DATA_PATH,
+    output_path: str | Path = DEFAULT_MONITOR_OUTPUT_PATH,
+    symbol: str = DEFAULT_SYMBOL,
+    interval: str = DEFAULT_INTERVAL,
+    base_url: str = DEFAULT_BASE_URL,
+    crawl_lookback_days: float = DEFAULT_CRAWL_LOOKBACK_DAYS,
+    feature_lookback_bars: int = DEFAULT_LIVE_FEATURE_LOOKBACK_BARS,
+) -> dict[str, Any]:
+    """Run the three-model L/S/T monitor without enabling order execution."""
+    model_dirs = {
+        "L": Path(long_model_dir),
+        "S": Path(short_model_dir),
+        "T": Path(two_sided_model_dir),
+    }
+    manifests = {role: _load_manifest(path) for role, path in model_dirs.items()}
+
+    updated_df, update_info = refresh_local_ohlcv(
+        data_path=data_path,
+        symbol=symbol,
+        interval=interval,
+        base_url=base_url,
+        crawl_lookback_days=crawl_lookback_days,
+    )
+    if updated_df.empty:
+        raise ValueError("Cannot predict with empty OHLCV data.")
+
+    raw_df = load_ohlcv(data_path)
+    signal_time = pd.Timestamp(raw_df.index[-1])
+    logger.info("Signal monitor candle: %s", signal_time)
+
+    model_features: list[str] = []
+    for manifest in manifests.values():
+        for feature in _manifest_features(manifest):
+            if feature not in model_features:
+                model_features.append(feature)
+    required_windows = _required_windows(model_features)
+    feature_raw_df = _feature_tail(raw_df, feature_lookback_bars)
+    logger.info(
+        "Building shared signal-monitor feature tail: rows=%d/%d | windows=%s",
+        len(feature_raw_df),
+        len(raw_df),
+        required_windows,
+    )
+    feature_df = build_feature_frame(
+        feature_raw_df,
+        windows=required_windows,
+        quality_filter=False,
+    )
+    feature_space = CryptoFeatureSpace(feature_df, selectable_features(feature_df))
+
+    current_open = fetch_current_open(
+        symbol=symbol,
+        interval=interval,
+        base_url=base_url,
+    )
+    if pd.Timestamp(current_open.candle_time) <= signal_time:
+        raise ValueError(
+            "Invalid monitor entry candle: entry_candle_time must be greater than "
+            f"signal_time, got entry={current_open.candle_time}, signal={signal_time}."
+        )
+
+    states: dict[str, dict[str, Any]] = {}
+    for role in ("L", "S", "T"):
+        entry = _rank_one_manifest_entry(manifests[role], role)
+        state = _predict_entry(
+            entry=entry,
+            model_dir=model_dirs[role],
+            feature_space=feature_space,
+            signal_time=signal_time,
+        )
+        state["role"] = role
+        if state.get("score_band_index") is None:
+            raise ValueError(
+                f"{role} model manifest has no usable Val Q1..Q20 cutoffs. "
+                "Retrain it with the current crypto.prod.train_model."
+            )
+        states[role] = state
+
+    strategy_signal = _lst_strategy_signal(
+        int(states["L"]["score_band_index"]),
+        int(states["S"]["score_band_index"]),
+        int(states["T"]["score_band_index"]),
+    )
+    payload = {
+        "created_at": _utc_now_iso(),
+        "symbol": symbol.upper(),
+        "interval": interval,
+        "data_path": str(data_path),
+        "model_dirs": {role: str(path) for role, path in model_dirs.items()},
+        "signal_time": _ts_str(signal_time),
+        "entry_candle_time": _ts_str(current_open.candle_time),
+        "entry_open": current_open.open,
+        "entry_price_exness": (
+            current_open.open - float(trade_config.EXNESS_ENTRY_PRICE_OFFSET)
+        ),
+        "exness_price_offset": float(trade_config.EXNESS_ENTRY_PRICE_OFFSET),
+        "entry_open_fetched_at": current_open.fetched_at,
+        "monitor_only": True,
+        "execution_enabled": False,
+        "can_trade": False,
+        "status": "OK",
+        "error": None,
+        "strategy_signal": strategy_signal,
+        "model_states": states,
+        "entries": [states[role] for role in ("L", "S", "T")],
+        "feature_build": {
+            "rows_used": int(len(feature_raw_df)),
+            "total_rows": int(len(raw_df)),
+            "windows": required_windows,
+            "lookback_bars": int(feature_lookback_bars),
+        },
+        "data_update": update_info,
+    }
+    _write_payload(output_path, payload)
+    _notify_prediction_once(payload)
+    return payload
+
+
 def _error_payload(
     message: str,
     symbol: str,
@@ -210,7 +363,11 @@ def _notify_prediction_once(payload: dict[str, Any]) -> None:
     if not key:
         return
 
-    state_path = trade_config.LIVE_NOTIFY_STATE_PATH
+    state_path = (
+        trade_config.SIGNAL_MONITOR_NOTIFY_STATE_PATH
+        if payload.get("monitor_only")
+        else trade_config.LIVE_NOTIFY_STATE_PATH
+    )
     state = _load_notify_state(state_path)
     if state.get("last_key") == key:
         return
@@ -265,6 +422,8 @@ def _prediction_notify_key(payload: dict[str, Any]) -> str | None:
 
 
 def _prediction_telegram_message(payload: dict[str, Any]) -> str:
+    if payload.get("monitor_only"):
+        return _signal_monitor_telegram_message(payload)
     status = _decision_status(payload)
     lines = [
         f"Evo Crypto Prediction | {status}",
@@ -308,9 +467,37 @@ def _prediction_telegram_message(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _signal_monitor_telegram_message(payload: dict[str, Any]) -> str:
+    signal = str(payload.get("strategy_signal") or "NO_SIGNAL")
+    lines = [
+        f"Evo Crypto Signal Monitor | {signal}",
+        "Mode: MONITOR ONLY - KHONG DAT LENH",
+        f"Symbol: {payload.get('symbol')} {payload.get('interval')}",
+        f"Signal time: {payload.get('signal_time')}",
+        f"Entry candle: {payload.get('entry_candle_time')}",
+        f"Entry price: {_fmt_value(payload.get('entry_open'), 2)}",
+        f"Entry price Exness: {_fmt_value(payload.get('entry_price_exness'), 2)}",
+    ]
+    states = payload.get("model_states", {})
+    for role, name in (("L", "Long"), ("S", "Short"), ("T", "Two-sided")):
+        state = states.get(role, {}) if isinstance(states, dict) else {}
+        score_band = state.get("score_band") or "OUT"
+        score_range = state.get("score_band_range")
+        if score_range:
+            score_band = f"{score_band} ({score_range})"
+        lines.append(
+            f"{role} ({name}): {score_band}"
+        )
+    lines.append(f"Final signal: {signal}")
+    lines.append("Execution: disabled")
+    return "\n".join(lines)
+
+
 def _decision_status(payload: dict[str, Any]) -> str:
     if payload.get("status") == "ERROR" or payload.get("error"):
         return "ERROR"
+    if payload.get("monitor_only"):
+        return str(payload.get("strategy_signal") or "NO_SIGNAL")
     final_ensemble = payload.get("final_ensemble")
     if isinstance(final_ensemble, dict):
         signal = final_ensemble.get("ensemble_signal")
@@ -480,6 +667,47 @@ def loop(
             logger.exception("Live update failed.")
 
 
+def signal_monitor_loop(
+    long_model_dir: str | Path,
+    short_model_dir: str | Path,
+    two_sided_model_dir: str | Path,
+    data_path: str | Path = config.DATA_PATH,
+    output_path: str | Path = DEFAULT_MONITOR_OUTPUT_PATH,
+    symbol: str = DEFAULT_SYMBOL,
+    interval: str = DEFAULT_INTERVAL,
+    base_url: str = DEFAULT_BASE_URL,
+    sleep_after_open_sec: float = 5.0,
+    crawl_lookback_days: float = DEFAULT_CRAWL_LOOKBACK_DAYS,
+    feature_lookback_bars: int = DEFAULT_LIVE_FEATURE_LOOKBACK_BARS,
+) -> None:
+    logger.info(
+        "Starting monitor-only L/S/T loop for %s %s; order execution is disabled.",
+        symbol.upper(),
+        interval,
+    )
+    while True:
+        sleep_sec = _seconds_until_next_open(interval) + max(
+            float(sleep_after_open_sec), 0.0
+        )
+        logger.info("Sleeping %.1fs until next signal-monitor update.", sleep_sec)
+        time.sleep(sleep_sec)
+        try:
+            run_signal_monitor_once(
+                long_model_dir=long_model_dir,
+                short_model_dir=short_model_dir,
+                two_sided_model_dir=two_sided_model_dir,
+                data_path=data_path,
+                output_path=output_path,
+                symbol=symbol,
+                interval=interval,
+                base_url=base_url,
+                crawl_lookback_days=crawl_lookback_days,
+                feature_lookback_bars=feature_lookback_bars,
+            )
+        except Exception:
+            logger.exception("Signal-monitor update failed.")
+
+
 def _predict_entry(
     entry: dict[str, Any],
     model_dir: Path,
@@ -499,12 +727,18 @@ def _predict_entry(
         threshold = model_record.get("val_trade_threshold")
         threshold_value = float(threshold) if threshold is not None else None
         is_signal = pred >= threshold_value if threshold_value is not None else None
+        score_band_cutoffs = model_record.get("val_score_band_cutoffs")
+        score_band_index = _prediction_score_band_index(pred, score_band_cutoffs)
         predictions.append(
             {
                 "horizon": int(model_record.get("horizon")),
                 "pred": pred,
                 "threshold": threshold_value,
                 "is_signal": is_signal,
+                "score_band": _score_band_name(score_band_index),
+                "score_band_index": score_band_index,
+                "score_band_range": _score_band_percent_range(score_band_index),
+                "val_score_band_cutoffs": score_band_cutoffs,
                 "model_path": str(model_path),
             }
         )
@@ -517,6 +751,7 @@ def _predict_entry(
     label_direction = config.canonical_label_direction(
         entry.get("label_direction") or "long"
     )
+    score_band_index = _entry_score_band_index(predictions)
     return {
         "entry_id": entry.get("entry_id"),
         "rank": int(entry.get("rank", 0) or 0),
@@ -527,9 +762,117 @@ def _predict_entry(
         "score": entry.get("score"),
         "n_features": len(features),
         "ensemble_signal": ensemble_signal,
+        "score_band": _score_band_name(score_band_index),
+        "score_band_index": score_band_index,
+        "score_band_range": _score_band_percent_range(score_band_index),
         "pred_mean": float(np.mean([item["pred"] for item in predictions])) if predictions else None,
         "predictions": predictions,
     }
+
+
+def _prediction_score_band_index(
+    pred: float,
+    raw_cutoffs: Any,
+) -> int | None:
+    if not isinstance(raw_cutoffs, dict):
+        return None
+    cutoffs: list[float] = []
+    for band_index in range(1, SCORE_BAND_COUNT + 1):
+        raw_cutoff = raw_cutoffs.get(f"q{band_index}")
+        if raw_cutoff is None:
+            return None
+        cutoff = float(raw_cutoff)
+        if not np.isfinite(cutoff):
+            return None
+        cutoffs.append(cutoff)
+    for band_index, cutoff in enumerate(cutoffs, start=1):
+        if float(pred) >= cutoff:
+            return band_index
+    # A live score can fall below the minimum score observed in Val. It still
+    # belongs to the final 95%-100% bucket rather than an undefined OUT bucket.
+    return SCORE_BAND_COUNT
+
+
+def _entry_score_band_index(predictions: list[dict[str, Any]]) -> int | None:
+    if not predictions:
+        return None
+    bands = [item.get("score_band_index") for item in predictions]
+    if any(value is None for value in bands):
+        return None
+    # Horizon ensemble is AND at each cumulative fraction, so the weakest
+    # Horizon determines the individual's disjoint score band.
+    return max(int(value) for value in bands)
+
+
+def _score_band_name(score_band_index: int | None) -> str | None:
+    if score_band_index is None:
+        return None
+    if 1 <= int(score_band_index) <= SCORE_BAND_COUNT:
+        return f"Q{int(score_band_index)}"
+    return "OUT"
+
+
+def _score_band_percent_range(score_band_index: int | None) -> str | None:
+    if score_band_index is None or not 1 <= int(score_band_index) <= SCORE_BAND_COUNT:
+        return None
+    band_index = int(score_band_index)
+    start = (band_index - 1) * 5
+    end = band_index * 5
+    return f"{start}%-{end}%"
+
+
+def _rank_one_manifest_entry(
+    manifest: dict[str, Any],
+    role: str,
+) -> dict[str, Any]:
+    entries = [
+        dict(entry)
+        for entry in manifest.get("entries", [])
+        if isinstance(entry, dict)
+    ]
+    if not entries:
+        raise ValueError(f"{role} manifest has no entries.")
+    rank_one = [entry for entry in entries if int(entry.get("rank", 0) or 0) == 1]
+    return rank_one[0] if rank_one else min(
+        entries,
+        key=lambda entry: int(entry.get("rank", 10**9) or 10**9),
+    )
+
+
+def _lst_strategy_signal(long_band: int, short_band: int, two_sided_band: int) -> str:
+    """Apply the ordered q1..q4 L/S/T decision tree."""
+    L, S, T = int(long_band), int(short_band), int(two_sided_band)
+    if L == 1 and S == 1 and T == 1:
+        return "LONG_STRONG"
+
+    if L <= 4 and S <= 4 and T <= 4:
+        return "BOTH"
+
+    active = sum(value <= 4 for value in (L, S, T))
+    if active == 2:
+        if L <= 4 and S <= 4:
+            return "LONG"
+        if L <= 4 and T <= 4:
+            return "LONG"
+        if S <= 4 and T <= 4:
+            if S == 1 and T == 1:
+                return "LONG"
+            if S in {2, 3} and T in {2, 3}:
+                return "SHORT"
+            if S == 4 and T == 4:
+                return "BOTH_WEAK"
+            return "NO_SIGNAL"
+
+    if active == 1:
+        if L in {1, 2, 3}:
+            return "LONG"
+        if T == 1:
+            return "LONG"
+        if T == 2:
+            return "SHORT"
+        return "NO_SIGNAL"
+
+    return "NO_SIGNAL"
 
 
 def _predict_final_ensemble(
@@ -776,12 +1119,33 @@ def _json_safe(value: Any) -> Any:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-dir", required=True, help="Directory containing manifest.json.")
+    parser.add_argument(
+        "--model-dir",
+        default=None,
+        help="Single-model directory containing manifest.json (legacy prediction mode).",
+    )
+    parser.add_argument(
+        "--signal-monitor",
+        action="store_true",
+        help="Run the monitor-only three-model L/S/T decision flow.",
+    )
+    parser.add_argument("--long-model-dir", default=None)
+    parser.add_argument("--short-model-dir", default=None)
+    parser.add_argument("--two-sided-model-dir", default=None)
     parser.add_argument("--data", default=str(config.DATA_PATH), help="Local crypto CSV path.")
-    parser.add_argument("--out", default=str(DEFAULT_OUTPUT_PATH), help="Output JSON path.")
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="Output JSON path. Defaults depend on single-model/monitor mode.",
+    )
     parser.add_argument("--symbol", default=DEFAULT_SYMBOL)
     parser.add_argument("--interval", default=DEFAULT_INTERVAL)
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    parser.add_argument(
+        "--force-ipv4",
+        action="store_true",
+        help="Resolve outbound network connections using IPv4 only.",
+    )
     parser.add_argument("--loop", action="store_true", help="Run forever at each new candle.")
     parser.add_argument(
         "--crawl-lookback-days",
@@ -802,12 +1166,53 @@ def main() -> None:
         help="Seconds to wait after a new candle opens before refresh/predict.",
     )
     args = parser.parse_args()
+    if args.force_ipv4:
+        force_ipv4_networking()
 
+    if args.signal_monitor:
+        missing = [
+            name
+            for name, value in (
+                ("--long-model-dir", args.long_model_dir),
+                ("--short-model-dir", args.short_model_dir),
+                ("--two-sided-model-dir", args.two_sided_model_dir),
+            )
+            if not value
+        ]
+        if missing:
+            parser.error(
+                "--signal-monitor requires " + ", ".join(missing)
+            )
+        output_path = args.out or str(DEFAULT_MONITOR_OUTPUT_PATH)
+        monitor_kwargs = {
+            "long_model_dir": args.long_model_dir,
+            "short_model_dir": args.short_model_dir,
+            "two_sided_model_dir": args.two_sided_model_dir,
+            "data_path": args.data,
+            "output_path": output_path,
+            "symbol": args.symbol,
+            "interval": args.interval,
+            "base_url": args.base_url,
+            "crawl_lookback_days": args.crawl_lookback_days,
+            "feature_lookback_bars": args.feature_lookback_bars,
+        }
+        if args.loop:
+            signal_monitor_loop(
+                **monitor_kwargs,
+                sleep_after_open_sec=args.sleep_after_open,
+            )
+        else:
+            run_signal_monitor_once(**monitor_kwargs)
+        return
+
+    if not args.model_dir:
+        parser.error("--model-dir is required unless --signal-monitor is used.")
+    output_path = args.out or str(DEFAULT_OUTPUT_PATH)
     if args.loop:
         loop(
             model_dir=args.model_dir,
             data_path=args.data,
-            output_path=args.out,
+            output_path=output_path,
             symbol=args.symbol,
             interval=args.interval,
             base_url=args.base_url,
@@ -819,7 +1224,7 @@ def main() -> None:
         run_once(
             model_dir=args.model_dir,
             data_path=args.data,
-            output_path=args.out,
+            output_path=output_path,
             symbol=args.symbol,
             interval=args.interval,
             base_url=args.base_url,

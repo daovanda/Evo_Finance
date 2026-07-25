@@ -111,6 +111,11 @@ def run(
             "adverse_floor label_threshold must be positive; pass for example "
             "--label-threshold 0.003."
         )
+    if label_mode == "slope_slowdown" and float(label_threshold) <= 0.0:
+        raise ValueError(
+            "slope_slowdown label_threshold must be positive; pass for example "
+            "--label-threshold 0.0003."
+        )
     if trade_top_fraction is not None:
         trade_top_fraction = float(trade_top_fraction)
         if not np.isfinite(trade_top_fraction) or not 0.0 < trade_top_fraction <= 1.0:
@@ -363,6 +368,10 @@ def _save_archive(
                 else float(config.SAFE_ADVERSE_FLOOR)
             ),
             "safe_path_rule": config.SAFE_PATH_RULE,
+            "slope_lookback": config.SLOPE_LOOKBACK,
+            "slope_min_initial": config.SLOPE_MIN_INITIAL,
+            "slope_price_column": config.SLOPE_PRICE_COLUMN,
+            "slope_slowdown_rule": config.SLOPE_SLOWDOWN_RULE,
             "fitness_horizon_mode": config.FITNESS_HORIZON_MODE,
             "fitness": config.FITNESS_WEIGHTS,
             "trade_top_fraction": config.TRADE_TOP_FRACTION,
@@ -446,6 +455,34 @@ def _validate_resume_metadata(
             )
         checks.append(
             ("tp_safe_path", metadata.get("tp_safe_path"), float(config.TP_SAFE_PATH))
+        )
+    if label_mode == "slope_slowdown" and archive_label_mode == "slope_slowdown":
+        archive_rule = metadata.get("slope_slowdown_rule")
+        if archive_rule != config.SLOPE_SLOWDOWN_RULE:
+            raise ValueError(
+                "Resume archive uses an incompatible slope_slowdown rule. "
+                f"Archive={resume_path}, archive rule={archive_rule!r}, "
+                f"required rule={config.SLOPE_SLOWDOWN_RULE!r}. "
+                "Start a new archive."
+            )
+        checks.extend(
+            [
+                (
+                    "slope_lookback",
+                    metadata.get("slope_lookback"),
+                    int(config.SLOPE_LOOKBACK),
+                ),
+                (
+                    "slope_min_initial",
+                    metadata.get("slope_min_initial"),
+                    float(config.SLOPE_MIN_INITIAL),
+                ),
+                (
+                    "slope_price_column",
+                    metadata.get("slope_price_column"),
+                    config.SLOPE_PRICE_COLUMN,
+                ),
+            ]
         )
 
     mismatches: list[str] = []
@@ -537,8 +574,10 @@ def main() -> None:
             "TP is config.TP_SAFE_PATH. For adverse_floor use a positive "
             "distance, for example 0.003 means the path must stay above -0.003. "
             "For high_exit this is the directional return threshold of the "
-            "exact H candle high (Long) or low (Short). For two_sided_tp it "
-            "is the positive absolute TP used on both sides."
+            "exact H candle high (Long) or low (Short). For slope_slowdown "
+            "this is the minimum high-price OLS slope change per candle; its "
+            "mode default is config.SLOPE_SLOWDOWN_THRESHOLD. For "
+            "two_sided_tp it is the positive absolute TP used on both sides."
         ),
     )
     parser.add_argument(

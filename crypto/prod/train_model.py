@@ -33,6 +33,9 @@ logger = logging.getLogger("crypto.prod.train_model")
 
 
 DEFAULT_MODEL_DIR = Path("crypto/prod/model")
+SCORE_BAND_FRACTIONS: tuple[float, ...] = tuple(
+    step / 100.0 for step in range(5, 101, 5)
+)
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,7 @@ def train_from_archive(
     """Train one LightGBM model per selected individual and horizon."""
     config.validate_config()
     archive_path = Path(archive_path)
+    horizons = _archive_horizons(archive_path)
     selected_entries = _filter_entries(
         _load_archive_entries(archive_path), top=top, ranks=ranks
     )
@@ -79,13 +83,13 @@ def train_from_archive(
     label_threshold = config.default_label_threshold(label_mode, label_threshold)
     labeled_df = add_binary_labels(
         raw_df,
-        horizons=config.HOLDING_HORIZONS,
+        horizons=horizons,
         threshold=label_threshold,
         return_fn=config.get_label_return_fn(label_mode),
         label_mode=label_mode,
         label_direction=label_direction,
     )
-    purge_bars = config.purge_bars_for_horizons(config.HOLDING_HORIZONS)
+    purge_bars = config.purge_bars_for_horizons(horizons)
     train_df, val_df, test_df = split_labeled_by_dates(
         labeled_df,
         val_start=val_start,
@@ -120,6 +124,7 @@ def train_from_archive(
             label_mode=label_mode,
             label_direction=label_direction,
             label_threshold=float(label_threshold),
+            horizons=horizons,
         ),
         "entries": [],
     }
@@ -152,7 +157,7 @@ def train_from_archive(
             "features": features,
             "models": [],
         }
-        for horizon in config.HOLDING_HORIZONS:
+        for horizon in horizons:
             horizon = int(horizon)
             model_record = _train_one_horizon(
                 rank=rank,
@@ -379,6 +384,7 @@ def _train_one_horizon(
         else pd.Series(dtype=float)
     )
     val_trade_threshold = _top_prediction_threshold(val_pred)
+    val_score_band_cutoffs = _score_band_cutoffs(val_pred)
     model_name = (
         f"{_safe_name(entry_id)}_h{horizon}.txt"
         if entry_id
@@ -404,6 +410,8 @@ def _train_one_horizon(
         "train_base_rate": float(y_train.mean()),
         "val_base_rate": float(y_val.mean()) if len(y_val) else None,
         "val_trade_threshold": val_trade_threshold,
+        "val_score_band_cutoffs": val_score_band_cutoffs,
+        "score_band_fractions": list(SCORE_BAND_FRACTIONS),
         "trade_top_fraction": float(config.TRADE_TOP_FRACTION),
         "min_trades_per_split": int(config.MIN_TRADES_PER_SPLIT),
         "best_iteration": int(booster.best_iteration or config.LGBM_NUM_BOOST_ROUND),
@@ -424,6 +432,25 @@ def _top_prediction_threshold(pred: pd.Series) -> float | None:
         ),
     )
     return float(pred.nlargest(n_select).min())
+
+
+def _score_band_cutoffs(pred: pd.Series) -> dict[str, float | None]:
+    clean = (
+        pd.to_numeric(pred, errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
+    cutoffs: dict[str, float | None] = {}
+    for band_index, fraction in enumerate(SCORE_BAND_FRACTIONS, start=1):
+        if clean.empty:
+            cutoffs[f"q{band_index}"] = None
+            continue
+        n_select = min(
+            len(clean),
+            max(1, int(np.ceil(len(clean) * float(fraction) - 1e-12))),
+        )
+        cutoffs[f"q{band_index}"] = float(clean.nlargest(n_select).min())
+    return cutoffs
 
 
 def _train_booster(
@@ -470,6 +497,23 @@ def _load_archive_metadata(path: Path) -> dict[str, Any]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
     return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def _archive_horizons(path: Path) -> list[int]:
+    raw_horizons = _load_archive_metadata(path).get("horizons")
+    if not isinstance(raw_horizons, list) or not raw_horizons:
+        horizons = [int(value) for value in config.HOLDING_HORIZONS]
+        logger.warning(
+            "Archive %s has no metadata horizons; falling back to config: %s",
+            path,
+            horizons,
+        )
+        return horizons
+    horizons = sorted({int(value) for value in raw_horizons})
+    if not horizons or any(value < 1 for value in horizons):
+        raise ValueError(f"Archive has invalid metadata horizons: {raw_horizons!r}")
+    logger.info("Using archive metadata horizons: %s", horizons)
+    return horizons
 
 
 def _resolve_archive_label_direction(
@@ -539,9 +583,10 @@ def _config_snapshot(
     label_mode: str,
     label_direction: str,
     label_threshold: float,
+    horizons: list[int] | None = None,
 ) -> dict[str, Any]:
     return {
-        "horizons": list(config.HOLDING_HORIZONS),
+        "horizons": list(horizons or config.HOLDING_HORIZONS),
         "label_mode": label_mode,
         "label_direction": label_direction,
         "direction_neutral": config.is_direction_neutral_label_mode(label_mode),
