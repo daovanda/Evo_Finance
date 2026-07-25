@@ -609,34 +609,8 @@ WF_PURGE_BARS: int | None = None  # None => max(HOLDING_HORIZONS) + 1
 
 # Safe feature construction. All features are time-series/ratio normalized;
 # raw price/volume scale columns are intentionally not selectable.
-WINDOWS: list[int] = [
-    1,
-    2,
-    3,
-    4,
-    5,
-    7,
-    10,
-    14,
-    20,
-    30,
-    40,
-    50,
-    60,
-    80,
-    120,
-    160,
-    240,
-    320,
-    400,
-    480,
-    600,
-    800,
-    960,
-    1200,
-    1440,
-]
-# WINDOWS: list[int] = [3, 5, 10, 15, 30, 60, 120, 240, 480, 960, 1440]
+# WINDOWS: list[int] = [1,2,3,4,5,7,10,14,20,30,40,50,60,80,120,160,240,320,400,480,600,800,960,1200,1440,]
+WINDOWS: list[int] = [1,2,3,4,5,6]
 FEATURE_MIN_VALID_RATIO: float = 0.70
 FEATURE_MAX_DOMINANT_VALUE_RATIO: float = 0.985
 FEATURE_CORR_THRESHOLD: float = 0.70
