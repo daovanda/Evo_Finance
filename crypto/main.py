@@ -89,6 +89,7 @@ def run(
     label_threshold: float | None = None,
     label_mode: str = config.LABEL_MODE,
     label_direction: str = config.LABEL_DIRECTION,
+    exit_after_k: int | None = None,
     trade_top_fraction: float | None = None,
     val_start: str = config.VAL_START,
     test_start: str = config.TEST_START,
@@ -103,6 +104,9 @@ def run(
     horizons = [int(h) for h in horizons]
     label_mode = config.canonical_label_mode(label_mode)
     label_direction = config.canonical_label_direction(label_direction)
+    exit_after_k = config.resolve_exit_after_k(label_mode, exit_after_k)
+    if exit_after_k is not None:
+        config.EXIT_AFTER_K = int(exit_after_k)
     label_threshold = config.default_label_threshold(label_mode, label_threshold)
     if not np.isfinite(float(label_threshold)):
         raise ValueError("label_threshold must be finite.")
@@ -127,10 +131,12 @@ def run(
     rng = np.random.default_rng(seed)
 
     logger.info(
-        "Run labels: mode=%s | direction=%s | threshold=%g | trade_top_fraction=%.2f%%",
+        "Run labels: mode=%s | direction=%s | threshold=%g | "
+        "exit_after_k=%s | trade_top_fraction=%.2f%%",
         label_mode,
         label_direction,
         label_threshold,
+        exit_after_k,
         100.0 * float(config.TRADE_TOP_FRACTION),
     )
     logger.info("Loading crypto data from %s", data_path)
@@ -142,6 +148,7 @@ def run(
         return_fn=label_return_fn,
         label_mode=label_mode,
         label_direction=label_direction,
+        exit_after_k=exit_after_k,
     )
     train_df, val_df, test_df = split_labeled_by_dates(
         labeled_df,
@@ -214,6 +221,7 @@ def run(
             label_mode=label_mode,
             label_direction=label_direction,
             label_threshold=label_threshold,
+            exit_after_k=exit_after_k,
         )
 
     if archive.is_empty():
@@ -280,6 +288,7 @@ def run(
                     label_threshold,
                     label_mode,
                     label_direction,
+                    exit_after_k,
                 )
                 last_checkpoint = now
 
@@ -295,7 +304,13 @@ def run(
 
     if save_path is not None:
         _save_archive(
-            archive, save_path, horizons, label_threshold, label_mode, label_direction
+            archive,
+            save_path,
+            horizons,
+            label_threshold,
+            label_mode,
+            label_direction,
+            exit_after_k,
         )
         logger.info("Saved crypto archive to %s", save_path)
     if checkpoint_path is not None:
@@ -306,6 +321,7 @@ def run(
             label_threshold,
             label_mode,
             label_direction,
+            exit_after_k,
         )
     return archive
 
@@ -349,6 +365,7 @@ def _save_archive(
     label_threshold: float,
     label_mode: str,
     label_direction: str,
+    exit_after_k: int | None,
 ) -> None:
     archive.save(
         path,
@@ -357,6 +374,7 @@ def _save_archive(
             "horizons": horizons,
             "label_mode": label_mode,
             "label_direction": label_direction,
+            "exit_after_k": exit_after_k,
             "direction_neutral": config.is_direction_neutral_label_mode(label_mode),
             "label_threshold": label_threshold,
             "payoff_tp": config.PAYOFF_TP,
@@ -389,6 +407,7 @@ def _validate_resume_metadata(
     label_mode: str,
     label_direction: str,
     label_threshold: float,
+    exit_after_k: int | None = None,
 ) -> None:
     metadata = getattr(archive, "metadata", {}) or {}
     if not metadata:
@@ -411,13 +430,21 @@ def _validate_resume_metadata(
         if metadata_label_direction not in (None, "")
         else "long"
     )
+    archive_exit_after_k = config.resolve_exit_after_k(
+        metadata_label_mode or archive_label_mode,
+        metadata.get("exit_after_k"),
+    )
     checks: list[tuple[str, object, object]] = [
         (
             "horizons",
             [int(h) for h in metadata.get("horizons", [])],
             [int(h) for h in horizons],
         ),
-        ("label_mode", archive_label_mode, label_mode),
+        (
+            "label_mode",
+            archive_label_mode,
+            label_mode,
+        ),
         ("label_threshold", metadata.get("label_threshold"), float(label_threshold)),
         (
             "fitness_horizon_mode",
@@ -431,6 +458,8 @@ def _validate_resume_metadata(
         ),
         ("trade_cost", metadata.get("trade_cost"), float(config.TRADE_COST)),
     ]
+    if exit_after_k is not None or archive_exit_after_k is not None:
+        checks.append(("exit_after_k", archive_exit_after_k, exit_after_k))
     if not (
         config.is_direction_neutral_label_mode(label_mode)
         and config.is_direction_neutral_label_mode(archive_label_mode)
@@ -585,7 +614,6 @@ def main() -> None:
         default=config.LABEL_MODE,
         help=(
             f"Label mode. Allowed: {', '.join(sorted(config.LABEL_RETURN_FNS))}. "
-            "Aliases accepted: exit_all -> exit_after_h1, "
             "first_hit_safe_close/safe_close -> safe_path_mfe. "
             f"Default: {config.LABEL_MODE}."
         ),
@@ -597,6 +625,16 @@ def main() -> None:
             "Label direction. Long means price up is favorable; Short means "
             "price down is favorable. It is ignored by two_sided_tp. "
             f"Default: {config.LABEL_DIRECTION}."
+        ),
+    )
+    parser.add_argument(
+        "--exit-after-k",
+        type=int,
+        default=None,
+        help=(
+            "Decision candle k for --label-mode exit_after_k. "
+            f"Default: config.EXIT_AFTER_K={config.EXIT_AFTER_K}. "
+            "Requires 1 <= k < every holding horizon."
         ),
     )
     parser.add_argument(
@@ -632,6 +670,7 @@ def main() -> None:
         label_threshold=args.label_threshold,
         label_mode=args.label_mode,
         label_direction=args.label_direction,
+        exit_after_k=args.exit_after_k,
         trade_top_fraction=args.trade_top_fraction,
         val_start=args.val_start,
         test_start=args.test_start,

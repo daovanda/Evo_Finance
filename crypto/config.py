@@ -33,10 +33,13 @@ TP_SAFE_PATH: float = 0.003  # TP used by LABEL_MODE="safe_path_mfe"
 SAFE_ADVERSE_FLOOR: float = -0.0015  # stop-first low/high floor for safe_path_mfe
 SAFE_PATH_RULE: str = "adverse_stop_first_v1"
 SLOPE_LOOKBACK: int = 5
-SLOPE_SLOWDOWN_THRESHOLD: float = 0.0003  # 0.03% log-OLS slope per candle
-SLOPE_MIN_INITIAL: float = 0.0002  # 0.02% log-OLS slope per candle
+SLOPE_SLOWDOWN_THRESHOLD: float = 0.0002  # 0.03% log-OLS slope per candle
+SLOPE_MIN_INITIAL: float = 0.0001  # 0.02% log-OLS slope per candle
 SLOPE_PRICE_COLUMN: str = "high"
 SLOPE_SLOWDOWN_RULE: str = "eligible_initial_slope_only_v2"
+# Decision candle for LABEL_MODE="exit_after_k". For a base trade whose entry
+# is open H1, k=1 evaluates after H1 closes, k=2 after H2 closes, and so on.
+EXIT_AFTER_K: int = 1
 
 
 LABEL_DIRECTION_ALIASES: dict[str, str] = {
@@ -367,83 +370,85 @@ def close_path_mean_future_return(
     return directional_price_return(mean_future_close, entry_open, direction)
 
 
-def exit_after_h1_future_return(
+def exit_after_k_outcome(
     df: Any,
     horizon: int,
+    threshold: float,
     direction: str | None = None,
-) -> Any:
+    exit_after_k: int | None = None,
+) -> tuple[pd.Series, pd.Series]:
     """
-    Exit model evaluated after H1 has closed.
+    Executable TP-or-final-close payoff after decision candle Hk.
 
-    This mode is aligned to a row that is evaluated after the entry/H1 candle
-    has closed. The feature row may therefore use data <= close(t), while the
-    trade entry anchor remains open(t). H1 hits are filtered out in
-    crypto.data.add_binary_labels() using the active label threshold, because
-    in live trading this exit model is only evaluated when the take profit was
-    not reached during H1.
+    The row s used by the model represents base trade candle Hk. Features may
+    use data through close(s), while the original trade entry remains open H1:
 
-    future_return(t, h) = (max(high(t+1)..high(t+h-1)) - open(t)) / open(t)
+        entry = open(s-k+1)
+        label = remaining MFE over H(k+1)..Hh reaches threshold
+        payoff = threshold on a hit, otherwise close Hh versus entry
+
+    Earlier H1..Hk TP hits are excluded in crypto.data.add_binary_labels().
+    A useful exit decision requires 1 <= k < horizon.
     """
     h = int(horizon)
-    if h < 2:
-        return pd.Series(pd.NA, index=df.index, dtype="float64")
-    entry_open = df["open"]
+    k = int(EXIT_AFTER_K if exit_after_k is None else exit_after_k)
+    tp = float(threshold)
+    if k < 1:
+        raise ValueError("exit_after_k must be at least 1.")
+    if not isfinite(tp) or tp <= 0.0:
+        raise ValueError("exit_after_k label_threshold must be finite and positive.")
+    if h <= k:
+        empty = pd.Series(np.nan, index=df.index, dtype="float64")
+        return empty.copy(), empty
+
+    entry_open = df["open"].shift(k - 1)
     future_highs = pd.concat(
-        [df["high"].shift(-offset) for offset in range(1, h)],
+        [df["high"].shift(-offset) for offset in range(1, h - k + 1)],
         axis=1,
     )
     future_lows = pd.concat(
-        [df["low"].shift(-offset) for offset in range(1, h)],
+        [df["low"].shift(-offset) for offset in range(1, h - k + 1)],
         axis=1,
     )
+    final_close = df["close"].shift(-(h - k))
     if canonical_label_direction(direction) == "short":
-        min_low = future_lows.min(axis=1, skipna=False)
-        return directional_price_return(min_low, entry_open, direction)
-    max_high = future_highs.max(axis=1, skipna=False)
-    return directional_price_return(max_high, entry_open, direction)
+        favorable_price = future_lows.min(axis=1, skipna=False)
+    else:
+        favorable_price = future_highs.max(axis=1, skipna=False)
+
+    remaining_mfe = directional_price_return(
+        favorable_price,
+        entry_open,
+        direction,
+    )
+    close_return = directional_price_return(final_close, entry_open, direction)
+    complete = (
+        entry_open.notna()
+        & future_highs.notna().all(axis=1)
+        & future_lows.notna().all(axis=1)
+        & final_close.notna()
+    )
+    hit = remaining_mfe.ge(tp)
+    payoff = close_return.where(~hit, tp).where(complete)
+    label = hit.astype("float64").where(complete)
+    return payoff, label
 
 
-exit_all_future_return = exit_after_h1_future_return
-
-
-def exit_after_h2_future_return(
+def exit_after_k_future_return(
     df: Any,
     horizon: int,
     direction: str | None = None,
+    exit_after_k: int | None = None,
 ) -> Any:
-    """
-    Exit model evaluated after H2 has closed.
-
-    This mode is aligned to a row s that represents H2. The feature row may use
-    data <= close(s), while the original trade entry remains open(s-1), i.e.
-    open H1. H1/H2 hits are filtered out in crypto.data.add_binary_labels()
-    using the active label threshold.
-
-    For h=5:
-        entry = open(s-1)
-        future_return = (max(high(s+1), high(s+2), high(s+3)) - entry) / entry
-
-    In base-signal coordinates, this is:
-        base signal t, entry open(t+1), model row s=t+2,
-        label=1 if no H1/H2 hit and there is a hit in H3-H5.
-    """
-    h = int(horizon)
-    if h < 3:
-        return pd.Series(pd.NA, index=df.index, dtype="float64")
-    entry_open = df["open"].shift(1)
-    future_highs = pd.concat(
-        [df["high"].shift(-offset) for offset in range(1, h - 1)],
-        axis=1,
+    """Default-threshold payoff adapter for the label-mode registry."""
+    payoff, _ = exit_after_k_outcome(
+        df,
+        horizon,
+        threshold=float(LABEL_THRESHOLD),
+        direction=direction,
+        exit_after_k=exit_after_k,
     )
-    future_lows = pd.concat(
-        [df["low"].shift(-offset) for offset in range(1, h - 1)],
-        axis=1,
-    )
-    if canonical_label_direction(direction) == "short":
-        min_low = future_lows.min(axis=1, skipna=False)
-        return directional_price_return(min_low, entry_open, direction)
-    max_high = future_highs.max(axis=1, skipna=False)
-    return directional_price_return(max_high, entry_open, direction)
+    return payoff
 
 
 def payoff_future_return(
@@ -538,12 +543,10 @@ LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
     "safe_path_mfe": safe_path_mfe_future_return,
     "payoff": payoff_future_return,
     "two_sided_tp": two_sided_tp_future_return,
-    "exit_after_h1": exit_after_h1_future_return,
-    "exit_after_h2": exit_after_h2_future_return,
+    "exit_after_k": exit_after_k_future_return,
 }
 
 LABEL_MODE_ALIASES: dict[str, str] = {
-    "exit_all": "exit_after_h1",
     "first_hit_safe_close": "safe_path_mfe",
     "safe_close": "safe_path_mfe",
 }
@@ -556,6 +559,19 @@ def canonical_label_mode(mode: str | None = None) -> str:
         allowed = ", ".join(sorted([*LABEL_RETURN_FNS, *LABEL_MODE_ALIASES]))
         raise ValueError(f"Unknown LABEL_MODE={selected_mode!r}. Allowed: {allowed}.")
     return selected_mode
+
+
+def resolve_exit_after_k(
+    mode: str | None = None,
+    exit_after_k: int | None = None,
+) -> int | None:
+    """Resolve the decision candle for the generic exit_after_k mode."""
+    if canonical_label_mode(mode) != "exit_after_k":
+        return None
+    resolved = int(EXIT_AFTER_K if exit_after_k is None else exit_after_k)
+    if resolved < 1:
+        raise ValueError("exit_after_k must be at least 1.")
+    return resolved
 
 
 PRECISION_ONLY_LABEL_MODES: frozenset[str] = frozenset(
@@ -610,7 +626,8 @@ WF_PURGE_BARS: int | None = None  # None => max(HOLDING_HORIZONS) + 1
 # Safe feature construction. All features are time-series/ratio normalized;
 # raw price/volume scale columns are intentionally not selectable.
 # WINDOWS: list[int] = [1,2,3,4,5,7,10,14,20,30,40,50,60,80,120,160,240,320,400,480,600,800,960,1200,1440,]
-WINDOWS: list[int] = [1,2,3,4,5,6]
+# WINDOWS: list[int] = [1,2,3,4,5,6]
+WINDOWS: list[int] = [2,3,5]
 FEATURE_MIN_VALID_RATIO: float = 0.70
 FEATURE_MAX_DOMINANT_VALUE_RATIO: float = 0.985
 FEATURE_CORR_THRESHOLD: float = 0.70
@@ -718,6 +735,8 @@ def validate_config() -> None:
         raise ValueError("SLOPE_MIN_INITIAL must be finite and non-negative.")
     if SLOPE_PRICE_COLUMN != "high":
         raise ValueError("SLOPE_PRICE_COLUMN must be 'high'.")
+    if int(EXIT_AFTER_K) < 1:
+        raise ValueError("EXIT_AFTER_K must be at least 1.")
     if FEATURE_MIN < 1 or FEATURE_MAX < FEATURE_MIN:
         raise ValueError("Require 1 <= FEATURE_MIN <= FEATURE_MAX.")
     if EXPR_MAX_DEPTH < 1:

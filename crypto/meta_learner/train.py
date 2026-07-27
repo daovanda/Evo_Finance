@@ -122,9 +122,11 @@ def train_meta_learner(
     horizons: list[int] | tuple[int, ...] = tuple(config.HOLDING_HORIZONS),
     base_label_mode: str = config.LABEL_MODE,
     base_label_threshold: float | None = None,
+    base_exit_after_k: int | None = None,
     label_direction: str | None = None,
     meta_label_mode: str = "payoff",
     meta_label_threshold: float | None = None,
+    meta_exit_after_k: int | None = None,
     meta_exit_horizon: int | None = None,
     signals_only: bool = True,
     meta_valid_fraction: float = 0.2,
@@ -148,6 +150,15 @@ def train_meta_learner(
 
     base_label_mode = config.canonical_label_mode(base_label_mode)
     meta_label_mode = config.canonical_label_mode(meta_label_mode)
+    base_exit_after_k = _resolve_archive_exit_after_k(
+        archive_path,
+        base_label_mode,
+        base_exit_after_k,
+    )
+    meta_exit_after_k = config.resolve_exit_after_k(
+        meta_label_mode,
+        meta_exit_after_k,
+    )
     base_label_threshold = config.default_label_threshold(
         base_label_mode,
         base_label_threshold,
@@ -173,21 +184,20 @@ def train_meta_learner(
         threshold=base_label_threshold,
         label_mode=base_label_mode,
         label_direction=label_direction,
+        exit_after_k=base_exit_after_k,
     )
-    meta_return_fn = config.get_label_return_fn(meta_label_mode)
-    meta_return = meta_return_fn(
+    meta_labeled = add_binary_labels(
         raw_df,
-        meta_exit_horizon,
-        direction=label_direction,
+        horizons=[meta_exit_horizon],
+        threshold=meta_label_threshold,
+        label_mode=meta_label_mode,
+        label_direction=label_direction,
+        exit_after_k=meta_exit_after_k,
     )
+    meta_return = meta_labeled[f"future_return_h{meta_exit_horizon}"]
+    meta_label = meta_labeled[f"label_h{meta_exit_horizon}"]
     labeled_df[f"meta_future_return_h{meta_exit_horizon}"] = meta_return
-    labeled_df[f"meta_label_h{meta_exit_horizon}"] = (
-        meta_return > float(meta_label_threshold)
-    ).astype(float)
-    labeled_df.loc[
-        meta_return.isna(),
-        f"meta_label_h{meta_exit_horizon}",
-    ] = np.nan
+    labeled_df[f"meta_label_h{meta_exit_horizon}"] = meta_label
 
     purge_bars = config.purge_bars_for_horizons(
         list(dict.fromkeys([*horizons, meta_exit_horizon]))
@@ -308,6 +318,7 @@ def train_meta_learner(
         "chart_path": str(chart_path),
         "base": {
             "label_mode": base_label_mode,
+            "exit_after_k": base_exit_after_k,
             "label_direction": label_direction,
             "label_threshold": float(base_label_threshold),
             "horizons": horizons,
@@ -316,6 +327,7 @@ def train_meta_learner(
         },
         "meta": {
             "label_mode": meta_label_mode,
+            "exit_after_k": meta_exit_after_k,
             "label_direction": label_direction,
             "label_threshold": float(meta_label_threshold),
             "exit_horizon": int(meta_exit_horizon),
@@ -1192,6 +1204,27 @@ def _resolve_archive_label_direction(
     return config.canonical_label_direction(metadata.get("label_direction") or "long")
 
 
+def _resolve_archive_exit_after_k(
+    archive_path: str | Path,
+    label_mode: str,
+    explicit_k: int | None,
+) -> int | None:
+    requested_k = config.resolve_exit_after_k(label_mode, explicit_k)
+    if (
+        requested_k is None
+        or explicit_k is not None
+        or config.canonical_label_mode(label_mode) != "exit_after_k"
+    ):
+        return requested_k
+    payload = json.loads(Path(archive_path).read_text(encoding="utf-8"))
+    metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+    archived_k = config.resolve_exit_after_k(
+        metadata.get("label_mode"),
+        metadata.get("exit_after_k"),
+    )
+    return archived_k if archived_k is not None else requested_k
+
+
 def _ts_str(value: Any) -> str:
     if value is None:
         return ""
@@ -1236,7 +1269,6 @@ def main() -> None:
         help=(
             "Label mode used to retrain the archive individual per fold. "
             f"Allowed: {', '.join(sorted(config.LABEL_RETURN_FNS))}. "
-            "Alias accepted: exit_all -> exit_after_h1."
         ),
     )
     parser.add_argument(
@@ -1244,6 +1276,15 @@ def main() -> None:
         type=float,
         default=None,
         help="Base label threshold. Default follows config.default_label_threshold.",
+    )
+    parser.add_argument(
+        "--base-exit-after-k",
+        type=int,
+        default=None,
+        help=(
+            "Decision horizon k for base label mode exit_after_k. "
+            "Default: archive metadata, then crypto.config.EXIT_AFTER_K."
+        ),
     )
     parser.add_argument(
         "--label-direction",
@@ -1259,7 +1300,7 @@ def main() -> None:
         help=(
             "Label mode used for the meta learner target. "
             f"Allowed: {', '.join(sorted(config.LABEL_RETURN_FNS))}. "
-            "Alias accepted: exit_all -> exit_after_h1. Default: payoff."
+            "Default: payoff."
         ),
     )
     parser.add_argument(
@@ -1267,6 +1308,15 @@ def main() -> None:
         type=float,
         default=None,
         help="Meta label threshold. Default follows config.default_label_threshold.",
+    )
+    parser.add_argument(
+        "--meta-exit-after-k",
+        type=int,
+        default=None,
+        help=(
+            "Decision horizon k for meta label mode exit_after_k. "
+            "Default: crypto.config.EXIT_AFTER_K."
+        ),
     )
     parser.add_argument(
         "--meta-exit-horizon",
@@ -1310,9 +1360,11 @@ def main() -> None:
         horizons=args.horizons,
         base_label_mode=args.base_label_mode,
         base_label_threshold=args.base_label_threshold,
+        base_exit_after_k=args.base_exit_after_k,
         label_direction=args.label_direction,
         meta_label_mode=args.meta_label_mode,
         meta_label_threshold=args.meta_label_threshold,
+        meta_exit_after_k=args.meta_exit_after_k,
         meta_exit_horizon=args.meta_exit_horizon,
         signals_only=not args.all_predictions,
         meta_valid_fraction=args.meta_valid_fraction,

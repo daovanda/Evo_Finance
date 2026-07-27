@@ -130,6 +130,7 @@ class EnsembleIndividualSpec:
     label_mode: str | None = None
     label_threshold: float | None = None
     label_direction: str | None = None
+    exit_after_k: int | None = None
 
 
 def _resolve_spec_label_threshold(
@@ -155,6 +156,7 @@ def analyze(
     label_mode: str = config.LABEL_MODE,
     label_direction: str | None = None,
     label_threshold: float | None = None,
+    exit_after_k: int | None = None,
 ) -> list[Path]:
     entries = _filter_entries(_load_archive_entries(Path(archive_path)), top=top, ranks=ranks)
     output_path = Path(output_dir)
@@ -163,6 +165,11 @@ def analyze(
     logger.info("Loading crypto data from %s", data_path)
     raw_df = load_ohlcv(data_path)
     label_mode = config.canonical_label_mode(label_mode)
+    exit_after_k = _resolve_archive_exit_after_k(
+        Path(archive_path),
+        label_mode,
+        explicit_k=exit_after_k,
+    )
     label_direction = _resolve_archive_label_direction(
         Path(archive_path),
         explicit_direction=label_direction,
@@ -175,6 +182,7 @@ def analyze(
         return_fn=config.get_label_return_fn(label_mode),
         label_mode=label_mode,
         label_direction=label_direction,
+        exit_after_k=exit_after_k,
     )
     purge_bars = config.purge_bars_for_horizons(config.HOLDING_HORIZONS)
     train_df, val_df, test_df = split_labeled_by_dates(
@@ -209,6 +217,7 @@ def analyze(
         config.HOLDING_HORIZONS,
         label_mode=label_mode,
         label_direction=label_direction,
+        exit_after_k=exit_after_k,
     )
     mfe_threshold = _mfe_threshold_for_mode(label_mode, float(label_threshold))
 
@@ -268,6 +277,7 @@ def analyze_ensemble_individuals(
     label_mode: str = config.LABEL_MODE,
     label_direction: str | None = None,
     label_threshold: float | None = None,
+    exit_after_k: int | None = None,
 ) -> Path:
     if len(specs) < 2:
         raise ValueError("Need at least two --ensemble-individual specs.")
@@ -292,6 +302,7 @@ def analyze_ensemble_individuals(
     logger.info("Loading crypto data from %s", data_path)
     raw_df = load_ohlcv(data_path)
     label_mode = config.canonical_label_mode(label_mode)
+    exit_after_k = config.resolve_exit_after_k(label_mode, exit_after_k)
     label_threshold = config.default_label_threshold(label_mode, label_threshold)
     labeled_df = add_binary_labels(
         raw_df,
@@ -300,6 +311,7 @@ def analyze_ensemble_individuals(
         return_fn=config.get_label_return_fn(label_mode),
         label_mode=label_mode,
         label_direction=label_direction,
+        exit_after_k=exit_after_k,
     )
     purge_bars = config.purge_bars_for_horizons(config.HOLDING_HORIZONS)
     train_df, val_df, test_df = split_labeled_by_dates(
@@ -331,17 +343,18 @@ def analyze_ensemble_individuals(
     feature_pool = selectable_features(feature_df)
     feature_space = CryptoFeatureSpace(feature_df, feature_pool)
     return_context_cache: dict[
-        tuple[str, str],
+        tuple[str, str, int | None],
         tuple[dict[int, pd.Series], dict[int, pd.DataFrame], dict[int, pd.Series]],
     ] = {}
 
     def return_context_for(
         mode: str,
         direction: str,
+        decision_k: int | None,
     ) -> tuple[dict[int, pd.Series], dict[int, pd.DataFrame], dict[int, pd.Series]]:
         mode = config.canonical_label_mode(mode)
         direction = config.canonical_label_direction(direction)
-        cache_key = (mode, direction)
+        cache_key = (mode, direction, decision_k)
         cached = return_context_cache.get(cache_key)
         if cached is None:
             cached = _return_context_by_horizon(
@@ -349,6 +362,7 @@ def analyze_ensemble_individuals(
                 config.HOLDING_HORIZONS,
                 label_mode=mode,
                 label_direction=direction,
+                exit_after_k=decision_k,
             )
             return_context_cache[cache_key] = cached
         return cached
@@ -356,6 +370,7 @@ def analyze_ensemble_individuals(
     mfe_by_horizon, path_by_horizon, close_return_by_horizon = return_context_for(
         label_mode,
         label_direction,
+        exit_after_k,
     )
     exit_horizon = int(max(config.HOLDING_HORIZONS))
     reference_val = _reference_split_prediction(
@@ -387,6 +402,11 @@ def analyze_ensemble_individuals(
     ):
         individual = _entry_to_individual(entry)
         member_label_mode = config.canonical_label_mode(spec.label_mode or label_mode)
+        member_exit_after_k = _resolve_archive_exit_after_k(
+            spec.archive_path,
+            member_label_mode,
+            explicit_k=spec.exit_after_k,
+        )
         member_label_threshold = _resolve_spec_label_threshold(spec, float(label_threshold))
         member_mfe_threshold = _mfe_threshold_for_mode(
             member_label_mode,
@@ -396,6 +416,7 @@ def analyze_ensemble_individuals(
             member_label_mode == label_mode
             and member_label_direction == label_direction
             and member_label_threshold == float(label_threshold)
+            and member_exit_after_k == exit_after_k
         ):
             member_train_df, member_val_df, member_test_df = train_df, val_df, test_df
         else:
@@ -406,6 +427,7 @@ def analyze_ensemble_individuals(
                 return_fn=config.get_label_return_fn(member_label_mode),
                 label_mode=member_label_mode,
                 label_direction=member_label_direction,
+                exit_after_k=member_exit_after_k,
             )
             member_train_df, member_val_df, member_test_df = split_labeled_by_dates(
                 member_labeled_df,
@@ -425,7 +447,11 @@ def analyze_ensemble_individuals(
             len(individual.features),
         )
         member_mfe_by_horizon, member_path_by_horizon, member_close_by_horizon = (
-            return_context_for(member_label_mode, member_label_direction)
+            return_context_for(
+                member_label_mode,
+                member_label_direction,
+                member_exit_after_k,
+            )
         )
         horizon_results: list[HorizonAnalysis] = []
         for horizon in config.HOLDING_HORIZONS:
@@ -537,6 +563,27 @@ def _resolve_archive_label_direction(
     return config.canonical_label_direction(
         metadata_direction if metadata_direction not in (None, "") else "long"
     )
+
+
+def _resolve_archive_exit_after_k(
+    path: Path,
+    label_mode: str,
+    explicit_k: int | None = None,
+) -> int | None:
+    requested_k = config.resolve_exit_after_k(label_mode, explicit_k)
+    if (
+        requested_k is None
+        or explicit_k is not None
+        or config.canonical_label_mode(label_mode) != "exit_after_k"
+    ):
+        return requested_k
+    metadata = _load_archive_metadata(path)
+    archived_mode = metadata.get("label_mode")
+    archived_k = config.resolve_exit_after_k(
+        archived_mode,
+        metadata.get("exit_after_k"),
+    )
+    return archived_k if archived_k is not None else requested_k
 
 
 def _load_rank_entry(path: Path, rank: int) -> dict[str, Any]:
@@ -984,6 +1031,7 @@ def _return_context_by_horizon(
     horizons: list[int] | tuple[int, ...],
     label_mode: str,
     label_direction: str = config.LABEL_DIRECTION,
+    exit_after_k: int | None = None,
 ) -> tuple[dict[int, pd.Series], dict[int, pd.DataFrame], dict[int, pd.Series]]:
     return (
         {
@@ -992,6 +1040,7 @@ def _return_context_by_horizon(
                 int(horizon),
                 label_mode=label_mode,
                 label_direction=label_direction,
+                exit_after_k=exit_after_k,
             )
             for horizon in horizons
         },
@@ -1001,6 +1050,7 @@ def _return_context_by_horizon(
                 int(horizon),
                 label_mode=label_mode,
                 label_direction=label_direction,
+                exit_after_k=exit_after_k,
             )
             for horizon in horizons
         },
@@ -1010,6 +1060,7 @@ def _return_context_by_horizon(
                 int(horizon),
                 label_mode=label_mode,
                 label_direction=label_direction,
+                exit_after_k=exit_after_k,
             )
             for horizon in horizons
         },
@@ -1021,12 +1072,13 @@ def _max_high_return(
     horizon: int,
     label_mode: str = config.LABEL_MODE,
     label_direction: str = config.LABEL_DIRECTION,
+    exit_after_k: int | None = None,
 ) -> pd.Series:
     data = raw_df.sort_index()
-    entry = _entry_open_for_mode(data, label_mode)
+    entry = _entry_open_for_mode(data, label_mode, exit_after_k)
     high = pd.to_numeric(data["high"], errors="coerce")
     low = pd.to_numeric(data["low"], errors="coerce")
-    offsets = _future_offsets_for_mode(horizon, label_mode)
+    offsets = _future_offsets_for_mode(horizon, label_mode, exit_after_k)
     if config.canonical_label_direction(label_direction) == "short":
         min_low = pd.concat(
             [low.shift(-offset) for offset in offsets],
@@ -1053,14 +1105,18 @@ def _horizon_path_returns(
     horizon: int,
     label_mode: str = config.LABEL_MODE,
     label_direction: str = config.LABEL_DIRECTION,
+    exit_after_k: int | None = None,
 ) -> pd.DataFrame:
     data = raw_df.sort_index()
-    entry = _entry_open_for_mode(data, label_mode)
+    entry = _entry_open_for_mode(data, label_mode, exit_after_k)
     high = pd.to_numeric(data["high"], errors="coerce")
     low = pd.to_numeric(data["low"], errors="coerce")
     close = pd.to_numeric(data["close"], errors="coerce")
     columns: dict[str, pd.Series] = {}
-    for step, offset in enumerate(_future_offsets_for_mode(horizon, label_mode), start=1):
+    for step, offset in enumerate(
+        _future_offsets_for_mode(horizon, label_mode, exit_after_k),
+        start=1,
+    ):
         columns[f"high_h{step}"] = config.directional_price_return(
             high.shift(-offset),
             entry,
@@ -1084,10 +1140,11 @@ def _close_exit_return(
     horizon: int,
     label_mode: str = config.LABEL_MODE,
     label_direction: str = config.LABEL_DIRECTION,
+    exit_after_k: int | None = None,
 ) -> pd.Series:
     data = raw_df.sort_index()
-    entry = _entry_open_for_mode(data, label_mode)
-    close_offset = _close_offset_for_mode(horizon, label_mode)
+    entry = _entry_open_for_mode(data, label_mode, exit_after_k)
+    close_offset = _close_offset_for_mode(horizon, label_mode, exit_after_k)
     close = pd.to_numeric(data["close"], errors="coerce").shift(-close_offset)
     return config.directional_price_return(
         close,
@@ -1096,39 +1153,40 @@ def _close_exit_return(
     ).replace([np.inf, -np.inf], np.nan)
 
 
-def _entry_open_for_mode(data: pd.DataFrame, label_mode: str) -> pd.Series:
+def _entry_open_for_mode(
+    data: pd.DataFrame,
+    label_mode: str,
+    exit_after_k: int | None = None,
+) -> pd.Series:
     open_ = pd.to_numeric(data["open"], errors="coerce")
-    if _is_exit_after_h1_mode(label_mode):
-        return open_
-    if _is_exit_after_h2_mode(label_mode):
-        return open_.shift(1)
+    decision_k = config.resolve_exit_after_k(label_mode, exit_after_k)
+    if decision_k is not None:
+        return open_.shift(decision_k - 1)
     return open_.shift(-1)
 
 
-def _future_offsets_for_mode(horizon: int, label_mode: str) -> range:
+def _future_offsets_for_mode(
+    horizon: int,
+    label_mode: str,
+    exit_after_k: int | None = None,
+) -> range:
     h = int(horizon)
-    if _is_exit_after_h1_mode(label_mode):
-        return range(0, h)
-    if _is_exit_after_h2_mode(label_mode):
-        return range(-1, h - 1)
+    decision_k = config.resolve_exit_after_k(label_mode, exit_after_k)
+    if decision_k is not None:
+        return range(1 - decision_k, h - decision_k + 1)
     return range(1, h + 1)
 
 
-def _close_offset_for_mode(horizon: int, label_mode: str) -> int:
+def _close_offset_for_mode(
+    horizon: int,
+    label_mode: str,
+    exit_after_k: int | None = None,
+) -> int:
     h = int(horizon)
-    if _is_exit_after_h1_mode(label_mode):
-        return max(h - 1, 0)
-    if _is_exit_after_h2_mode(label_mode):
-        return max(h - 2, 0)
+    decision_k = config.resolve_exit_after_k(label_mode, exit_after_k)
+    if decision_k is not None:
+        return max(h - decision_k, 0)
     return h
-
-
-def _is_exit_after_h1_mode(label_mode: str) -> bool:
-    return config.canonical_label_mode(label_mode) == "exit_after_h1"
-
-
-def _is_exit_after_h2_mode(label_mode: str) -> bool:
-    return config.canonical_label_mode(label_mode) == "exit_after_h2"
 
 
 def _mfe_threshold_for_mode(label_mode: str, label_threshold: float) -> float:
@@ -2207,12 +2265,13 @@ def _parse_ensemble_specs(values: list[str] | None) -> list[EnsembleIndividualSp
         mode_text: str | None = None
         threshold_text: str | None = None
         direction_text: str | None = None
+        exit_after_k_text: str | None = None
         if "#" in value:
             parts = [part.strip() for part in value.split("#")]
-            if len(parts) not in {2, 3, 4, 5}:
+            if len(parts) not in {2, 3, 4, 5, 6}:
                 raise ValueError(
                     "Invalid --ensemble-individual spec. Use "
-                    "ARCHIVE#RANK[#MODE[#THRESHOLD[#DIRECTION]]], got: "
+                    "ARCHIVE#RANK[#MODE[#THRESHOLD[#DIRECTION[#EXIT_AFTER_K]]]], got: "
                     f"{raw_value!r}"
                 )
             path_text, rank_text = parts[0], parts[1]
@@ -2222,6 +2281,8 @@ def _parse_ensemble_specs(values: list[str] | None) -> list[EnsembleIndividualSp
                 threshold_text = parts[3]
             if len(parts) >= 5 and parts[4]:
                 direction_text = parts[4]
+            if len(parts) >= 6 and parts[5]:
+                exit_after_k_text = parts[5]
         elif ":" in value:
             path_text, rank_text = value.rsplit(":", 1)
         else:
@@ -2246,6 +2307,11 @@ def _parse_ensemble_specs(values: list[str] | None) -> list[EnsembleIndividualSp
                     float(threshold_text) if threshold_text is not None else None
                 ),
                 label_direction=direction_text,
+                exit_after_k=(
+                    int(exit_after_k_text)
+                    if exit_after_k_text is not None
+                    else None
+                ),
             )
         )
     return specs
@@ -2273,7 +2339,8 @@ def main() -> None:
         default=None,
         help=(
             "Build one chart that ensembles across individuals from one or more archives. "
-            "Each spec is ARCHIVE#RANK[#MODE[#THRESHOLD[#DIRECTION]]], for example "
+            "Each spec is ARCHIVE#RANK[#MODE[#THRESHOLD[#DIRECTION"
+            "[#EXIT_AFTER_K]]]], for example "
             "crypto/results/a.json#1#mfe#0.0035#long."
         ),
     )
@@ -2286,7 +2353,6 @@ def main() -> None:
         help=(
             "Label mode used when recalculating labels. "
             f"Allowed: {', '.join(sorted(config.LABEL_RETURN_FNS))}. "
-            "Aliases accepted: exit_all -> exit_after_h1, "
             "first_hit_safe_close/safe_close -> safe_path_mfe. "
             f"Default: {config.LABEL_MODE}."
         ),
@@ -2313,6 +2379,15 @@ def main() -> None:
             "high_exit this is the directional threshold of the exact H candle."
         ),
     )
+    parser.add_argument(
+        "--exit-after-k",
+        type=int,
+        default=None,
+        help=(
+            "Decision candle k for label-mode exit_after_k. By default it is "
+            "loaded from archive metadata, then falls back to config.EXIT_AFTER_K."
+        ),
+    )
     args = parser.parse_args()
 
     ensemble_specs = _parse_ensemble_specs(args.ensemble_individual)
@@ -2327,6 +2402,7 @@ def main() -> None:
             label_mode=args.label_mode,
             label_direction=args.label_direction,
             label_threshold=args.label_threshold,
+            exit_after_k=args.exit_after_k,
         )
         logger.info("Done. Saved ensemble chart: %s", chart)
         return
@@ -2346,6 +2422,7 @@ def main() -> None:
         label_mode=args.label_mode,
         label_direction=args.label_direction,
         label_threshold=args.label_threshold,
+        exit_after_k=args.exit_after_k,
     )
     logger.info("Done. Saved %d chart(s).", len(charts))
 

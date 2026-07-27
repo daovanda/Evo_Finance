@@ -78,6 +78,7 @@ def add_binary_labels(
     return_fn: Callable[[pd.DataFrame, int], pd.Series] | None = None,
     label_mode: str | None = None,
     label_direction: str | None = None,
+    exit_after_k: int | None = None,
 ) -> pd.DataFrame:
     """
     Add future_return_h{h} and label_h{h}.
@@ -107,12 +108,24 @@ def add_binary_labels(
     For two_sided_tp, label=1 means both the Long and Short TP are reached;
     future_return_h is the combined gross payoff of the two positions. Label
     direction is ignored for this direction-neutral mode.
+    For exit_after_k, rows whose TP was already reached in H1..Hk are
+    excluded. Label 1 means the remaining H(k+1)..Hh path reaches TP, while
+    future_return_h is the executable gross payoff: threshold on a TP hit or
+    the directional close Hh return on a miss.
     """
     labeled = df.sort_index().copy()
     selected_mode = config.canonical_label_mode(label_mode)
     selected_direction = config.canonical_label_direction(label_direction)
     label_return_fn = return_fn or config.get_label_return_fn(selected_mode)
     label_threshold = config.default_label_threshold(selected_mode, threshold)
+    decision_k = config.resolve_exit_after_k(label_mode, exit_after_k)
+    if decision_k is not None:
+        invalid_horizons = [int(h) for h in horizons if int(h) <= decision_k]
+        if invalid_horizons:
+            raise ValueError(
+                "exit_after_k must be smaller than every holding horizon; "
+                f"k={decision_k}, invalid horizons={invalid_horizons}."
+            )
     for h in horizons:
         h = int(h)
         if selected_mode == "two_sided_tp":
@@ -132,6 +145,34 @@ def add_binary_labels(
                 adverse_floor=float(label_threshold),
                 direction=selected_direction,
             )
+            labeled[f"future_return_h{h}"] = future_return
+            labeled[f"label_h{h}"] = explicit_label
+            continue
+
+        if decision_k is not None:
+            future_return, explicit_label = config.exit_after_k_outcome(
+                labeled,
+                h,
+                threshold=float(label_threshold),
+                direction=selected_direction,
+                exit_after_k=decision_k,
+            )
+            entry_open = labeled["open"].shift(decision_k - 1)
+            hit_price = (
+                labeled["low"]
+                if selected_direction == "short"
+                else labeled["high"]
+            )
+            prior_hit = pd.Series(False, index=labeled.index, dtype=bool)
+            for offset in range(decision_k - 1, -1, -1):
+                prior_return = config.directional_price_return(
+                    hit_price.shift(offset),
+                    entry_open,
+                    selected_direction,
+                )
+                prior_hit |= prior_return >= float(label_threshold)
+            future_return = future_return.mask(prior_hit)
+            explicit_label = explicit_label.mask(prior_hit)
             labeled[f"future_return_h{h}"] = future_return
             labeled[f"label_h{h}"] = explicit_label
             continue
@@ -208,35 +249,6 @@ def add_binary_labels(
             labeled[f"label_h{h}"] = explicit_label.astype("float64").where(complete)
             continue
 
-        if selected_mode == "exit_after_h1":
-            h1_price = (
-                labeled["low"] if selected_direction == "short" else labeled["high"]
-            )
-            h1_return = config.directional_price_return(
-                h1_price,
-                labeled["open"],
-                selected_direction,
-            )
-            future_return = future_return.mask(h1_return >= float(label_threshold))
-        elif selected_mode == "exit_after_h2":
-            entry_open = labeled["open"].shift(1)
-            hit_price = (
-                labeled["low"] if selected_direction == "short" else labeled["high"]
-            )
-            h1_return = config.directional_price_return(
-                hit_price.shift(1),
-                entry_open,
-                selected_direction,
-            )
-            h2_return = config.directional_price_return(
-                hit_price,
-                entry_open,
-                selected_direction,
-            )
-            hit_h1_or_h2 = (h1_return >= float(label_threshold)) | (
-                h2_return >= float(label_threshold)
-            )
-            future_return = future_return.mask(hit_h1_or_h2)
         labeled[f"future_return_h{h}"] = future_return
         labeled[f"label_h{h}"] = (future_return > float(label_threshold)).astype(
             "float"

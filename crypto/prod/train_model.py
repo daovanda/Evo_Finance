@@ -45,6 +45,7 @@ class EnsembleIndividualSpec:
     label_mode: str | None = None
     label_threshold: float | None = None
     label_direction: str | None = None
+    exit_after_k: int | None = None
 
 
 def train_from_archive(
@@ -60,6 +61,7 @@ def train_from_archive(
     label_mode: str = config.LABEL_MODE,
     label_direction: str | None = None,
     label_threshold: float | None = None,
+    exit_after_k: int | None = None,
 ) -> Path:
     """Train one LightGBM model per selected individual and horizon."""
     config.validate_config()
@@ -76,6 +78,11 @@ def train_from_archive(
     logger.info("Loading crypto data from %s", data_path)
     raw_df = load_ohlcv(data_path)
     label_mode = config.canonical_label_mode(label_mode)
+    exit_after_k = _resolve_archive_exit_after_k(
+        archive_path,
+        label_mode,
+        explicit_k=exit_after_k,
+    )
     label_direction = _resolve_archive_label_direction(
         archive_path,
         explicit_direction=label_direction,
@@ -88,6 +95,7 @@ def train_from_archive(
         return_fn=config.get_label_return_fn(label_mode),
         label_mode=label_mode,
         label_direction=label_direction,
+        exit_after_k=exit_after_k,
     )
     purge_bars = config.purge_bars_for_horizons(horizons)
     train_df, val_df, test_df = split_labeled_by_dates(
@@ -124,6 +132,7 @@ def train_from_archive(
             label_mode=label_mode,
             label_direction=label_direction,
             label_threshold=float(label_threshold),
+            exit_after_k=exit_after_k,
             horizons=horizons,
         ),
         "entries": [],
@@ -152,6 +161,7 @@ def train_from_archive(
             "label_mode": label_mode,
             "label_direction": label_direction,
             "label_threshold": float(label_threshold),
+            "exit_after_k": exit_after_k,
             "score": _json_safe(entry.get("score")),
             "generation": int(entry.get("generation", 0) or 0),
             "features": features,
@@ -191,6 +201,7 @@ def train_ensemble_from_specs(
     default_label_mode: str = config.LABEL_MODE,
     default_label_direction: str | None = None,
     default_label_threshold: float | None = None,
+    default_exit_after_k: int | None = None,
 ) -> Path:
     """Train one production model bundle from archive/rank specs."""
     if len(specs) < 1:
@@ -198,6 +209,10 @@ def train_ensemble_from_specs(
     config.validate_config()
     run_name = run_name or "crypto_ensemble"
     default_label_mode = config.canonical_label_mode(default_label_mode)
+    default_exit_after_k = config.resolve_exit_after_k(
+        default_label_mode,
+        default_exit_after_k,
+    )
     member_directions = [
         _resolve_archive_label_direction(
             spec.archive_path,
@@ -232,6 +247,7 @@ def train_ensemble_from_specs(
         return_fn=config.get_label_return_fn(default_label_mode),
         label_mode=default_label_mode,
         label_direction=default_label_direction,
+        exit_after_k=default_exit_after_k,
     )
     default_train_df, _, _ = split_labeled_by_dates(
         default_labeled_df,
@@ -259,6 +275,7 @@ def train_ensemble_from_specs(
             label_mode=default_label_mode,
             label_direction=default_label_direction,
             label_threshold=default_label_threshold,
+            exit_after_k=default_exit_after_k,
         ),
         "entries": [],
         "ensemble": {
@@ -269,13 +286,18 @@ def train_ensemble_from_specs(
     }
 
     label_cache: dict[
-        tuple[str, str, float],
+        tuple[str, str, float, int | None],
         tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
     ] = {}
     for spec, label_direction in zip(specs, member_directions, strict=True):
         label_mode = config.canonical_label_mode(spec.label_mode or default_label_mode)
+        exit_after_k = _resolve_archive_exit_after_k(
+            spec.archive_path,
+            label_mode,
+            explicit_k=spec.exit_after_k,
+        )
         label_threshold = _resolve_spec_label_threshold(spec, default_label_threshold)
-        cache_key = (label_mode, label_direction, label_threshold)
+        cache_key = (label_mode, label_direction, label_threshold, exit_after_k)
         if cache_key not in label_cache:
             labeled_df = add_binary_labels(
                 raw_df,
@@ -284,6 +306,7 @@ def train_ensemble_from_specs(
                 return_fn=config.get_label_return_fn(label_mode),
                 label_mode=label_mode,
                 label_direction=label_direction,
+                exit_after_k=exit_after_k,
             )
             label_cache[cache_key] = split_labeled_by_dates(
                 labeled_df,
@@ -318,6 +341,7 @@ def train_ensemble_from_specs(
             "label_mode": label_mode,
             "label_direction": label_direction,
             "label_threshold": label_threshold,
+            "exit_after_k": exit_after_k,
             "score": _json_safe(entry.get("score")),
             "generation": int(entry.get("generation", 0) or 0),
             "features": features,
@@ -528,6 +552,27 @@ def _resolve_archive_label_direction(
     )
 
 
+def _resolve_archive_exit_after_k(
+    path: Path,
+    label_mode: str,
+    explicit_k: int | None = None,
+) -> int | None:
+    requested_k = config.resolve_exit_after_k(label_mode, explicit_k)
+    if (
+        requested_k is None
+        or explicit_k is not None
+        or config.canonical_label_mode(label_mode) != "exit_after_k"
+    ):
+        return requested_k
+    metadata = _load_archive_metadata(path)
+    archived_mode = metadata.get("label_mode")
+    archived_k = config.resolve_exit_after_k(
+        archived_mode,
+        metadata.get("exit_after_k"),
+    )
+    return archived_k if archived_k is not None else requested_k
+
+
 def _load_rank_entry(path: Path, rank: int) -> dict[str, Any]:
     entries = _filter_entries(_load_archive_entries(path), top=None, ranks=[int(rank)])
     entry = dict(entries[0])
@@ -583,6 +628,7 @@ def _config_snapshot(
     label_mode: str,
     label_direction: str,
     label_threshold: float,
+    exit_after_k: int | None = None,
     horizons: list[int] | None = None,
 ) -> dict[str, Any]:
     return {
@@ -591,6 +637,7 @@ def _config_snapshot(
         "label_direction": label_direction,
         "direction_neutral": config.is_direction_neutral_label_mode(label_mode),
         "label_threshold": float(label_threshold),
+        "exit_after_k": exit_after_k,
         "payoff_tp": float(config.PAYOFF_TP),
         "payoff_adverse_floor": float(config.PAYOFF_ADVERSE_FLOOR),
         "tp_safe_path": float(config.TP_SAFE_PATH),
@@ -694,12 +741,14 @@ def _parse_ensemble_specs(values: list[str] | None) -> list[EnsembleIndividualSp
         mode_text: str | None = None
         threshold_text: str | None = None
         direction_text: str | None = None
+        exit_after_k_text: str | None = None
         if "#" in value:
             parts = [part.strip() for part in value.split("#")]
-            if len(parts) not in {2, 3, 4, 5}:
+            if len(parts) not in {2, 3, 4, 5, 6}:
                 raise ValueError(
                     "Invalid --ensemble-individual spec. Use "
-                    f"ARCHIVE#RANK[#MODE[#THRESHOLD[#DIRECTION]]], got: {raw_value!r}"
+                    "ARCHIVE#RANK[#MODE[#THRESHOLD[#DIRECTION[#EXIT_AFTER_K]]]], "
+                    f"got: {raw_value!r}"
                 )
             path_text, rank_text = parts[0], parts[1]
             if len(parts) >= 3 and parts[2]:
@@ -708,6 +757,8 @@ def _parse_ensemble_specs(values: list[str] | None) -> list[EnsembleIndividualSp
                 threshold_text = parts[3]
             if len(parts) >= 5 and parts[4]:
                 direction_text = parts[4]
+            if len(parts) >= 6 and parts[5]:
+                exit_after_k_text = parts[5]
         else:
             raise ValueError(
                 "Invalid --ensemble-individual spec. Use ARCHIVE#RANK[#MODE[#THRESHOLD]], "
@@ -726,6 +777,11 @@ def _parse_ensemble_specs(values: list[str] | None) -> list[EnsembleIndividualSp
                 if threshold_text is not None
                 else None,
                 label_direction=direction_text,
+                exit_after_k=(
+                    int(exit_after_k_text)
+                    if exit_after_k_text is not None
+                    else None
+                ),
             )
         )
     return specs
@@ -762,7 +818,7 @@ def main() -> None:
         default=None,
         help=(
             "Train a production ensemble bundle from specs "
-            "ARCHIVE#RANK[#MODE[#THRESHOLD[#DIRECTION]]]. Example: "
+            "ARCHIVE#RANK[#MODE[#THRESHOLD[#DIRECTION[#EXIT_AFTER_K]]]]. Example: "
             "crypto/results/a.json#1#mfe#0.003#long"
         ),
     )
@@ -775,7 +831,6 @@ def main() -> None:
         help=(
             "Label mode used when training production models. "
             f"Allowed: {', '.join(sorted(config.LABEL_RETURN_FNS))}. "
-            "Aliases accepted: exit_all -> exit_after_h1, "
             "first_hit_safe_close/safe_close -> safe_path_mfe. "
             f"Default: {config.LABEL_MODE}."
         ),
@@ -802,6 +857,15 @@ def main() -> None:
             "For two_sided_tp it is the positive absolute TP on both sides."
         ),
     )
+    parser.add_argument(
+        "--exit-after-k",
+        type=int,
+        default=None,
+        help=(
+            "Decision candle k for exit_after_k. Defaults to archive metadata, "
+            f"then config.EXIT_AFTER_K={config.EXIT_AFTER_K}."
+        ),
+    )
     args = parser.parse_args()
 
     specs = _parse_ensemble_specs(args.ensemble_individual)
@@ -817,6 +881,7 @@ def main() -> None:
             default_label_mode=args.label_mode,
             default_label_direction=args.label_direction,
             default_label_threshold=args.label_threshold,
+            default_exit_after_k=args.exit_after_k,
         )
     else:
         if not args.archive:
@@ -836,6 +901,7 @@ def main() -> None:
             label_mode=args.label_mode,
             label_direction=args.label_direction,
             label_threshold=args.label_threshold,
+            exit_after_k=args.exit_after_k,
         )
     logger.info("Done. Manifest: %s", manifest_path)
 

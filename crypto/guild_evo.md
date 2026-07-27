@@ -613,6 +613,72 @@ python -m crypto.analyze `
 
 thi moi member se dung chung `--label-mode mfe --label-threshold 0.003`.
 
+## Exit model tong quat sau Hk
+
+Dung `exit_after_k` khi model exit ra quyet dinh sau khi nen `Hk` da dong:
+
+```text
+entry = open H1
+features tai dong quyet dinh = du lieu den het Hk
+loai mau = TP da cham trong H1..Hk
+label = 1 neu TP cham trong H(k+1)..Hh
+future_return = TP neu label=1, nguoc lai la directional close Hh / entry
+```
+
+`future_return` la gross payoff duoc truyen vao fitness. MFE chi tao label,
+khong duoc truyen truc tiep lam loi nhuan, nen mot duong gia vuot xa TP van
+chi ghi nhan return bang dung muc TP.
+
+Vi du train model sau H3, du doan kha nang cham TP `0.4%` trong H4..H5:
+
+```powershell
+python -m crypto.main `
+  --data data/crypto/BTCUSDT_15m.csv `
+  --budget 3600 `
+  --seed 1 `
+  --horizons 5 `
+  --label-mode exit_after_k `
+  --exit-after-k 3 `
+  --label-direction Long `
+  --label-threshold 0.004 `
+  --trade-top-fraction 0.20 `
+  --save crypto/results/crypto_btc_exit_after_k3_h5_tp04_seed1_1h.json `
+  --checkpoint-every 0
+```
+
+Dieu kien bat buoc la `1 <= k < horizon`. Metadata archive se luu
+`exit_after_k`, nen analyze, backtest va train model production tu dong dung
+lai dung `k`.
+
+Analyze archive:
+
+```powershell
+python -m crypto.analyze `
+  --archive crypto/results/crypto_btc_exit_after_k3_h5_tp04_seed1_1h.json `
+  --rank 1 `
+  --label-mode exit_after_k `
+  --exit-after-k 3 `
+  --label-threshold 0.004
+```
+
+Voi ensemble, co the ghi `k` rieng cho tung member o truong cuoi:
+
+```text
+ARCHIVE#RANK#MODE#THRESHOLD#DIRECTION#EXIT_AFTER_K
+```
+
+Vi du:
+
+```powershell
+python -m crypto.analyze `
+  --ensemble-individual `
+    "crypto/results/exit_k1.json#1#exit_after_k#0.004#Long#1" `
+    "crypto/results/exit_k3.json#1#exit_after_k#0.004#Long#3" `
+  --label-mode exit_after_k `
+  --exit-after-k 3 `
+  --label-threshold 0.004
+```
+
 ## 12. Loi thuong gap
 
 ### `python: command not found` tren VM

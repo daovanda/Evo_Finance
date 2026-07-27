@@ -145,6 +145,7 @@ class ModelSpec:
     label_threshold: float
     top_fraction: float
     label_direction: str = "long"
+    exit_after_k: int | None = None
 
 
 @dataclass(frozen=True)
@@ -375,6 +376,7 @@ def _quality_train_index(
         return_fn=config.get_label_return_fn(spec.label_mode),
         label_mode=spec.label_mode,
         label_direction=spec.label_direction,
+        exit_after_k=spec.exit_after_k,
     )
     train_df, _, _ = split_labeled_by_dates(
         labeled,
@@ -433,6 +435,19 @@ def _archive_label_direction(
     return config.canonical_label_direction(
         metadata_direction if metadata_direction not in (None, "") else "long"
     )
+
+
+def _archive_exit_after_k(path: Path, label_mode: str) -> int | None:
+    default_k = config.resolve_exit_after_k(label_mode)
+    if default_k is None:
+        return None
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default_k
+    metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+    archived_k = metadata.get("exit_after_k") if isinstance(metadata, dict) else None
+    return config.resolve_exit_after_k(label_mode, archived_k)
 
 
 def _normalize_horizons(values: Any, label: str) -> list[int]:
@@ -496,12 +511,14 @@ def _train_spec_bundle(
 ) -> BundleSignals:
     label_direction = spec.label_direction
     logger.info(
-        "Training %s rank %d | mode=%s direction=%s threshold=%.6f top=%.2f%% | horizons=%s",
+        "Training %s rank %d | mode=%s direction=%s threshold=%.6f "
+        "exit_after_k=%s top=%.2f%% | horizons=%s",
         spec.archive_path,
         spec.rank,
         spec.label_mode,
         label_direction,
         spec.label_threshold,
+        spec.exit_after_k,
         spec.top_fraction * 100.0,
         horizons,
     )
@@ -513,6 +530,7 @@ def _train_spec_bundle(
         return_fn=config.get_label_return_fn(spec.label_mode),
         label_mode=spec.label_mode,
         label_direction=label_direction,
+        exit_after_k=spec.exit_after_k,
     )
     train_df, val_df, test_df = split_labeled_by_dates(
         labeled,
@@ -1256,7 +1274,7 @@ def _summarize_split(
     )
     exit1_selected_tp_rows = _tp_sweep_rows(
         split=split,
-        group="p1_exit_after_h1_selected",
+        group="p1_exit_k1_selected",
         selected_base_index=exit1_selected_base_index,
         path_returns=path_returns,
         thresholds=tp_sweep_thresholds,
@@ -1265,7 +1283,7 @@ def _summarize_split(
     )
     exit1_no_selected_tp_rows = _tp_sweep_rows(
         split=split,
-        group="p1_exit_after_h1_no_selected",
+        group="p1_exit_k1_no_selected",
         selected_base_index=exit1_no_selected_base_index,
         path_returns=path_returns,
         thresholds=tp_sweep_thresholds,
@@ -1274,7 +1292,7 @@ def _summarize_split(
     )
     exit1_no_selected_h2_tp_rows = _tp_sweep_rows(
         split=split,
-        group="p1_exit_after_h1_no_selected_h2",
+        group="p1_exit_k1_no_selected_h2",
         selected_base_index=exit1_no_selected_base_index,
         path_returns=path_returns,
         thresholds=tp_sweep_thresholds,
@@ -1285,7 +1303,7 @@ def _summarize_split(
 
     exit1_no_selected_no_h2_tp_rows = _tp_sweep_rows(
         split=split,
-        group="p2_exit_after_h1_no_selected_no_h2",
+        group="p2_exit_k1_no_selected_no_h2",
         selected_base_index=exit1_no_selected_no_h2_index,
         path_returns=path_returns,
         thresholds=tp_sweep_thresholds,
@@ -1294,7 +1312,7 @@ def _summarize_split(
     )
     exit2_selected_tp_rows = _tp_sweep_rows(
         split=split,
-        group="p2_exit_after_h2_selected",
+        group="p2_exit_k2_selected",
         selected_base_index=exit2_selected_base_index,
         path_returns=path_returns,
         thresholds=tp_sweep_thresholds,
@@ -1303,7 +1321,7 @@ def _summarize_split(
     )
     exit2_no_selected_tp_rows = _tp_sweep_rows(
         split=split,
-        group="p2_exit_after_h2_no_selected",
+        group="p2_exit_k2_no_selected",
         selected_base_index=exit2_no_selected_base_index,
         path_returns=path_returns,
         thresholds=tp_sweep_thresholds,
@@ -2530,12 +2548,12 @@ def _empty_stage_tp_rows(split: str, thresholds: list[float]) -> list[dict[str, 
     groups = [
         "p1_base_signal",
         "p1_base_no_h1",
-        "p1_exit_after_h1_selected",
-        "p1_exit_after_h1_no_selected",
-        "p1_exit_after_h1_no_selected_h2",
-        "p2_exit_after_h1_no_selected_no_h2",
-        "p2_exit_after_h2_selected",
-        "p2_exit_after_h2_no_selected",
+        "p1_exit_k1_selected",
+        "p1_exit_k1_no_selected",
+        "p1_exit_k1_no_selected_h2",
+        "p2_exit_k1_no_selected_no_h2",
+        "p2_exit_k2_selected",
+        "p2_exit_k2_no_selected",
     ]
     rows: list[dict[str, Any]] = []
     for group in groups:
@@ -3599,9 +3617,10 @@ def _parse_spec(
     require_top_fraction: bool = False,
 ) -> ModelSpec:
     parts = [part.strip() for part in str(value).split("#")]
-    if len(parts) not in {4, 5, 6}:
+    if len(parts) not in {4, 5, 6, 7}:
         raise ValueError(
-            "Spec must be ARCHIVE#RANK#MODE#THRESHOLD[#TOP_FRACTION[#DIRECTION]], "
+            "Spec must be ARCHIVE#RANK#MODE#THRESHOLD"
+            "[#TOP_FRACTION[#DIRECTION[#EXIT_AFTER_K]]], "
             f"got: {value!r}"
         )
     archive_text, rank_text, mode_text, threshold_text = parts[:4]
@@ -3613,12 +3632,13 @@ def _parse_spec(
     top_fraction = (
         float(parts[4]) if len(parts) == 5 and parts[4] else float(default_top_fraction)
     )
-    if len(parts) == 6:
+    if len(parts) >= 6:
         top_fraction = float(parts[4]) if parts[4] else float(default_top_fraction)
     direction = _archive_label_direction(
         Path(archive_text),
-        explicit_direction=parts[5] if len(parts) == 6 and parts[5] else None,
+        explicit_direction=parts[5] if len(parts) >= 6 and parts[5] else None,
     )
+    explicit_k = int(parts[6]) if len(parts) == 7 and parts[6] else None
     if not 0 < top_fraction <= 1:
         raise ValueError(f"top fraction must be in (0, 1], got {top_fraction}.")
     return ModelSpec(
@@ -3628,6 +3648,11 @@ def _parse_spec(
         label_direction=direction,
         label_threshold=float(threshold_text),
         top_fraction=top_fraction,
+        exit_after_k=(
+            config.resolve_exit_after_k(mode_text, explicit_k)
+            if explicit_k is not None
+            else _archive_exit_after_k(Path(archive_text), mode_text)
+        ),
     )
 
 

@@ -342,18 +342,20 @@ class CryptoPipelineTests(unittest.TestCase):
             for i in range(5)
         ]
         exit1 = ModelSpec(
-            Path("crypto_btc_exit_after_h1_h5_tp04_seed1_12h.json"),
+            Path("crypto_btc_exit_k1_h5_tp04_seed1_12h.json"),
             1,
-            "exit_after_h1",
+            "exit_after_k",
             0.004,
             0.20,
+            exit_after_k=1,
         )
         exit2 = ModelSpec(
-            Path("crypto_btc_exit_after_h2_h5_tp04_seed1_12h.json"),
+            Path("crypto_btc_exit_k2_h5_tp04_seed1_12h.json"),
             1,
-            "exit_after_h2",
+            "exit_after_k",
             0.004,
             0.10,
+            exit_after_k=2,
         )
 
         name = _backtest_name(base_specs, exit1, exit2, "and", 0.005)
@@ -875,7 +877,7 @@ class CryptoPipelineTests(unittest.TestCase):
         self.assertAlmostEqual(summary["base_low_h1_le_neg005_rate"], 1.0)
         tp_sweep = pd.DataFrame(tp_rows)
         exit2_no_selected = tp_sweep[
-            tp_sweep["group"] == "p2_exit_after_h2_no_selected"
+            tp_sweep["group"] == "p2_exit_k2_no_selected"
         ]
         self.assertAlmostEqual(
             float(exit2_no_selected["close_h2_return_mean"].iloc[0]),
@@ -883,7 +885,7 @@ class CryptoPipelineTests(unittest.TestCase):
         )
         rendered = _sweep_table(
             tp_sweep,
-            group_name="p2_exit_after_h2_no_selected",
+            group_name="p2_exit_k2_no_selected",
             include_close_h2=True,
         )
         self.assertIn("val mean close H2", rendered["split"].tolist())
@@ -2078,6 +2080,168 @@ class CryptoPipelineTests(unittest.TestCase):
         self.assertEqual(test_df.index[0], df.index[4])
         self.assertEqual(test_df.index[-1], df.index[6])
         self.assertNotIn(df.index[7], test_df.index)
+
+    def test_exit_after_k_supports_k1_and_k2(self):
+        df = _synthetic_crypto_frame(40)
+        for decision_k in (1, 2):
+            labeled = add_binary_labels(
+                df,
+                horizons=[5],
+                threshold=0.001,
+                label_mode="exit_after_k",
+                label_direction="Long",
+                exit_after_k=decision_k,
+            )
+            self.assertIn("future_return_h5", labeled)
+            self.assertIn("label_h5", labeled)
+            self.assertGreater(labeled["label_h5"].notna().sum(), 0)
+
+    def test_exit_after_k3_uses_open_h1_and_only_h4_h5_as_future(self):
+        index = pd.date_range("2025-01-01", periods=8, freq="5min")
+        df = pd.DataFrame(
+            {
+                "open": 100.0,
+                "high": 100.1,
+                "low": 99.9,
+                "close": 100.0,
+                "volume": 1.0,
+                "trade_count": 1.0,
+                "taker_buy_base_volume": 0.5,
+                "taker_buy_quote_volume": 50.0,
+            },
+            index=index,
+        )
+        # Decision row is index[3] (H3), entry is open index[1] (H1).
+        df.loc[index[4], "high"] = 100.5  # H4 reaches +0.5%.
+        labeled = add_binary_labels(
+            df,
+            horizons=[5],
+            threshold=0.004,
+            label_mode="exit_after_k",
+            label_direction="Long",
+            exit_after_k=3,
+        )
+
+        # MFE reaches +0.5%, but executable payoff is capped at the +0.4% TP.
+        self.assertAlmostEqual(labeled.loc[index[3], "future_return_h5"], 0.004)
+        self.assertEqual(labeled.loc[index[3], "label_h5"], 1.0)
+
+        # A prior H2 hit makes this decision row ineligible rather than label 0.
+        df.loc[index[2], "high"] = 100.6
+        filtered = add_binary_labels(
+            df,
+            horizons=[5],
+            threshold=0.004,
+            label_mode="exit_after_k",
+            label_direction="Long",
+            exit_after_k=3,
+        )
+        self.assertTrue(pd.isna(filtered.loc[index[3], "label_h5"]))
+
+    def test_exit_after_k3_short_uses_lows_and_excludes_prior_hit(self):
+        index = pd.date_range("2025-01-01", periods=8, freq="5min")
+        df = pd.DataFrame(
+            {
+                "open": 100.0,
+                "high": 100.1,
+                "low": 99.9,
+                "close": 100.0,
+                "volume": 1.0,
+                "trade_count": 1.0,
+                "taker_buy_base_volume": 0.5,
+                "taker_buy_quote_volume": 50.0,
+            },
+            index=index,
+        )
+        df.loc[index[5], "low"] = 99.4  # H5 reaches +0.6% for Short.
+        labeled = add_binary_labels(
+            df,
+            horizons=[5],
+            threshold=0.004,
+            label_mode="exit_after_k",
+            label_direction="Short",
+            exit_after_k=3,
+        )
+        # Short MFE reaches +0.6%, but executable payoff is capped at TP.
+        self.assertAlmostEqual(labeled.loc[index[3], "future_return_h5"], 0.004)
+        self.assertEqual(labeled.loc[index[3], "label_h5"], 1.0)
+
+        df.loc[index[1], "low"] = 99.5  # H1 already hit Short TP.
+        filtered = add_binary_labels(
+            df,
+            horizons=[5],
+            threshold=0.004,
+            label_mode="exit_after_k",
+            label_direction="Short",
+            exit_after_k=3,
+        )
+        self.assertTrue(pd.isna(filtered.loc[index[3], "label_h5"]))
+
+    def test_exit_after_k_miss_uses_final_close_return_for_long_and_short(self):
+        index = pd.date_range("2025-01-01", periods=8, freq="5min")
+        df = pd.DataFrame(
+            {
+                "open": 100.0,
+                "high": 100.1,
+                "low": 99.9,
+                "close": 100.0,
+                "volume": 1.0,
+                "trade_count": 1.0,
+                "taker_buy_base_volume": 0.5,
+                "taker_buy_quote_volume": 50.0,
+            },
+            index=index,
+        )
+        # Decision row index[3] is H3; final exit index[5] is H5.
+        df.loc[index[5], "close"] = 99.0
+        long_labeled = add_binary_labels(
+            df,
+            horizons=[5],
+            threshold=0.004,
+            label_mode="exit_after_k",
+            label_direction="Long",
+            exit_after_k=3,
+        )
+        self.assertEqual(long_labeled.loc[index[3], "label_h5"], 0.0)
+        self.assertAlmostEqual(
+            long_labeled.loc[index[3], "future_return_h5"],
+            -0.01,
+        )
+
+        df.loc[index[5], "close"] = 101.0
+        short_labeled = add_binary_labels(
+            df,
+            horizons=[5],
+            threshold=0.004,
+            label_mode="exit_after_k",
+            label_direction="Short",
+            exit_after_k=3,
+        )
+        self.assertEqual(short_labeled.loc[index[3], "label_h5"], 0.0)
+        self.assertAlmostEqual(
+            short_labeled.loc[index[3], "future_return_h5"],
+            -0.01,
+        )
+
+    def test_backtest_spec_accepts_explicit_exit_after_k(self):
+        spec = _parse_spec(
+            "missing.json#1#exit_after_k#0.004#0.20#Short#3",
+            default_top_fraction=0.25,
+        )
+        self.assertEqual(spec.label_mode, "exit_after_k")
+        self.assertEqual(spec.label_direction, "short")
+        self.assertEqual(spec.exit_after_k, 3)
+
+    def test_exit_after_k_must_precede_every_horizon(self):
+        df = _synthetic_crypto_frame(20)
+        with self.assertRaisesRegex(ValueError, "smaller than every holding horizon"):
+            add_binary_labels(
+                df,
+                horizons=[3],
+                threshold=0.001,
+                label_mode="exit_after_k",
+                exit_after_k=3,
+            )
 
     def test_crypto_fitness_runs_on_synthetic_binary_fold(self):
         df = _synthetic_crypto_frame(900)
