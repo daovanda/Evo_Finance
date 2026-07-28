@@ -5,11 +5,14 @@ Strategy:
 1. Train the selected archive rank using its metadata Horizon and label.
 2. Learn the top-fraction prediction cutoff on Final Val.
 3. Apply that unchanged cutoff to Test.
-4. Before entry, require initial_slope(t) < -minimum and a Short slowdown
-   signal at t.
-5. Enter Long at open H1 for every signal that passes the entry filter.
-6. During H1 only, resolve TP versus the dedicated H1 stop chronologically
-   across its five one-minute candles; a tie inside one minute uses SL-first.
+4. Keep only timestamps selected by both the MFE model and the H1 Long
+   adverse-floor model.
+5. Optionally require initial_slope(t) < -minimum and a Short slowdown signal
+   at t, then enter Long at open H1.
+6. During H1 only, inspect TP versus the dedicated H1 stop from the 5m OHLC:
+   TP-only and SL-only both exit at close H1. If both barriers are touched,
+   close H1 at/above TP counts as TP, close H1 at/below SL counts as SL, and
+   a close strictly between the barriers exits at open H2.
 7. After H1 and H2 close, recompute the two-candle high slope:
    - slope > +minimum and Long slowdown signal: arm the slowdown stop;
    - slope < -minimum and no Short slowdown signal: arm the slowdown stop;
@@ -19,12 +22,15 @@ Strategy:
    and any remaining position exits at close H3.
 
 PowerShell:
-    python temp/backtest_5m_long_mfe_h3.py `
+    python -m temp.backtest_5m_long_mfe_h3 `
       --archive crypto/results/crypto_btc_5m_long_mfe_h3_tp01_top40_seed1_8h.json `
+      --adverse-floor-archive crypto/results/crypto_btc_5m_long_adverse_floor_h1_floor015_top70_seed1_1h.json `
       --long-slowdown-archive crypto/results/crypto_btc_5m_long_slope_slowdown_lb2_h1_thr003_top40_seed1_1h.json `
       --short-slowdown-archive crypto/results/crypto_btc_5m_Short_slope_slowdown_lb2_h1_thr003_top20_seed1_1h.json `
       --rank 1 `
+      --adverse-floor-rank 1 `
       --top-fraction 0.40 `
+      --adverse-floor-top-fraction 0.70 `
       --long-slowdown-top-fraction 0.40 `
       --short-slowdown-top-fraction 0.40 `
       --entry-filter `
@@ -75,6 +81,10 @@ logger = logging.getLogger("temp.backtest_5m_long_mfe_h3")
 DEFAULT_ARCHIVE = Path(
     "crypto/results/crypto_btc_5m_long_mfe_h3_tp01_top40_seed1_8h.json"
 )
+DEFAULT_ADVERSE_FLOOR_ARCHIVE = Path(
+    "crypto/results/"
+    "crypto_btc_5m_long_adverse_floor_h1_floor015_top70_seed1_1h.json"
+)
 DEFAULT_LONG_SLOWDOWN_ARCHIVE = Path(
     "crypto/results/"
     "crypto_btc_5m_long_slope_slowdown_lb2_h1_thr003_top40_seed1_1h.json"
@@ -88,6 +98,7 @@ DEFAULT_DATA_1M = Path("data/crypto/BTCUSDT_1m.csv")
 DEFAULT_OUT_DIR = Path("temp/output")
 DEFAULT_RANK = 1
 DEFAULT_TOP_FRACTION = 0.40
+DEFAULT_ADVERSE_FLOOR_TOP_FRACTION = 0.70
 DEFAULT_SLOWDOWN_RANK = 1
 DEFAULT_LONG_SLOWDOWN_TOP_FRACTION = 0.40
 DEFAULT_SHORT_SLOWDOWN_TOP_FRACTION = 0.40
@@ -132,10 +143,12 @@ def make_price_path(raw_df: pd.DataFrame, horizon: int) -> pd.DataFrame:
             pd.to_numeric(raw_df["low"], errors="coerce").shift(-step).div(entry)
             - 1.0
         )
-    result[f"close_h{horizon}"] = (
-        pd.to_numeric(raw_df["close"], errors="coerce").shift(-horizon).div(entry)
-        - 1.0
-    )
+        result[f"close_h{step}"] = (
+            pd.to_numeric(raw_df["close"], errors="coerce")
+            .shift(-step)
+            .div(entry)
+            - 1.0
+        )
     return result.replace([np.inf, -np.inf], np.nan)
 
 
@@ -287,7 +300,7 @@ def simulate_long_slowdown_strategy(
     if h1_resolution["h1_outcome"].isna().any():
         missing = result.index[h1_resolution["h1_outcome"].isna()][:5]
         raise ValueError(
-            "Missing 1m H1 TP/SL resolution for signals: "
+            "Missing H1 TP/SL resolution for signals: "
             f"{list(missing)}"
         )
     h1_outcome = h1_resolution["h1_outcome"].astype(str).to_numpy()
@@ -303,7 +316,22 @@ def simulate_long_slowdown_strategy(
         h1_resolution["h1_same_minute_tie"].fillna(False).to_numpy(dtype=bool)
     )
 
-    # H1 barrier ordering is resolved from exactly five one-minute candles.
+    # A one-sided H1 touch exits at close H1, not at the touched barrier.
+    h1_tp_only_close = active & (h1_outcome == "h1_tp_only_close")
+    gross_return[h1_tp_only_close] = h1_fill_return[h1_tp_only_close]
+    exit_h[h1_tp_only_close] = 1
+    outcome[h1_tp_only_close] = "h1_tp_only_close"
+    decision_h1[h1_tp_only_close] = "tp_only_exit_close_h1"
+    active[h1_tp_only_close] = False
+
+    h1_stop_only_close = active & (h1_outcome == "h1_stop_only_close")
+    gross_return[h1_stop_only_close] = h1_fill_return[h1_stop_only_close]
+    exit_h[h1_stop_only_close] = 1
+    outcome[h1_stop_only_close] = "h1_stop_only_close"
+    decision_h1[h1_stop_only_close] = "stop_only_exit_close_h1"
+    active[h1_stop_only_close] = False
+
+    # When both H1 barriers are touched, its close confirms the fill rule.
     stop_h1 = active & (h1_outcome == "h1_stop")
     gross_return[stop_h1] = h1_fill_return[stop_h1]
     exit_h[stop_h1] = 1
@@ -317,6 +345,15 @@ def simulate_long_slowdown_strategy(
     outcome[hit_h1] = "tp_h1"
     decision_h1[hit_h1] = "tp_before_decision"
     active[hit_h1] = False
+
+    close_rule_open_h2 = active & (
+        h1_outcome == "h1_close_rule_open_h2"
+    )
+    gross_return[close_rule_open_h2] = open_h2[close_rule_open_h2]
+    exit_h[close_rule_open_h2] = 2
+    outcome[close_rule_open_h2] = "h1_close_rule_open_h2"
+    decision_h1[close_rule_open_h2] = "both_hit_close_between_exit_open_h2"
+    active[close_rule_open_h2] = False
 
     positive_h1 = active & (slope_h1 > min_slope)
     negative_h1 = active & (slope_h1 < -min_slope)
@@ -413,6 +450,69 @@ def load_one_minute_ohlc(
             f"{list(duplicates)}"
         )
     return minute
+
+
+def resolve_h1_tp_sl_from_5m(
+    selected_path: pd.DataFrame,
+    take_profit: float,
+    h1_stop_loss: float,
+) -> pd.DataFrame:
+    """Resolve H1 barriers using its 5m OHLC and the configured close rule.
+
+    A one-sided TP or SL touch exits at close H1. When both barriers are
+    touched, a close strictly between SL and TP defers the fill to open H2.
+    A close at/above TP counts as TP, while a close at/below SL counts as SL.
+    """
+    required = ["high_h1", "low_h1", "close_h1"]
+    missing = [column for column in required if column not in selected_path]
+    if missing:
+        raise ValueError(f"H1 path is missing columns: {missing}")
+
+    high_h1 = pd.to_numeric(selected_path["high_h1"], errors="coerce")
+    low_h1 = pd.to_numeric(selected_path["low_h1"], errors="coerce")
+    close_h1 = pd.to_numeric(selected_path["close_h1"], errors="coerce")
+    complete = high_h1.notna() & low_h1.notna() & close_h1.notna()
+    if not bool(complete.all()):
+        examples = list(selected_path.index[~complete][:5])
+        raise ValueError(f"Missing H1 OHLC returns for signals: {examples}")
+
+    tp_hit = high_h1.ge(float(take_profit))
+    stop_hit = low_h1.le(-float(h1_stop_loss))
+    tp_only = tp_hit & ~stop_hit
+    stop_only = stop_hit & ~tp_hit
+    both_hit = tp_hit & stop_hit
+    both_exit_open_h2 = (
+        both_hit
+        & close_h1.lt(float(take_profit))
+        & close_h1.gt(-float(h1_stop_loss))
+    )
+    both_tp_fill = both_hit & close_h1.ge(float(take_profit))
+    both_stop_fill = both_hit & close_h1.le(-float(h1_stop_loss))
+    outcomes = pd.Series("h1_none", index=selected_path.index, dtype=object)
+    outcomes.loc[tp_only] = "h1_tp_only_close"
+    outcomes.loc[stop_only] = "h1_stop_only_close"
+    outcomes.loc[both_tp_fill] = "tp_h1"
+    outcomes.loc[both_stop_fill] = "h1_stop"
+    outcomes.loc[both_exit_open_h2] = "h1_close_rule_open_h2"
+    fill_return = pd.Series(np.nan, index=selected_path.index, dtype=float)
+    fill_return.loc[tp_only | stop_only] = close_h1.loc[tp_only | stop_only]
+    fill_return.loc[both_tp_fill] = float(take_profit)
+    fill_return.loc[both_stop_fill] = -float(h1_stop_loss)
+
+    result = pd.DataFrame(index=selected_path.index)
+    result.index.name = "signal_time"
+    result["h1_outcome"] = outcomes
+    result["h1_first_minute"] = np.where(
+        tp_only | stop_only | both_tp_fill | both_stop_fill,
+        1,
+        0,
+    )
+    result["h1_fill_return"] = fill_return
+    result["h1_same_minute_tie"] = both_hit
+    result["entry_time"] = (
+        pd.DatetimeIndex(selected_path.index) + pd.Timedelta(minutes=5)
+    )
+    return result
 
 
 def resolve_h1_tp_sl_from_1m(
@@ -846,6 +946,8 @@ def summarize_split(
     simulations: pd.DataFrame,
     available_rows: int,
     prediction_threshold: float,
+    mfe_signal_count: int,
+    adverse_match_count: int,
 ) -> dict[str, Any]:
     n = len(simulations)
     outcomes = simulations.get("outcome", pd.Series(dtype=str)).astype(str)
@@ -860,6 +962,10 @@ def summarize_split(
         for step in range(1, 4)
     }
     h1_stop_count = int(outcomes.eq("h1_stop").sum())
+    h1_tp_only_close_mask = outcomes.eq("h1_tp_only_close")
+    h1_stop_only_close_mask = outcomes.eq("h1_stop_only_close")
+    h1_tp_only_close_count = int(h1_tp_only_close_mask.sum())
+    h1_stop_only_close_count = int(h1_stop_only_close_mask.sum())
     h1_tie = (
         simulations.get(
             "h1_same_minute_tie",
@@ -869,12 +975,14 @@ def summarize_split(
         .astype(bool)
     )
     h1_tie_count = int(h1_tie.sum())
+    h1_close_rule_open_h2_mask = outcomes.eq("h1_close_rule_open_h2")
     exit_open_h2_mask = outcomes.eq("slowdown_stop_open_h2")
     exit_open_h3_mask = outcomes.eq("slowdown_stop_open_h3")
     slowdown_stop_h2_mask = outcomes.eq("slowdown_stop_h2")
     slowdown_stop_h3_mask = outcomes.eq("slowdown_stop_h3")
     exit_open_h2_count = int(exit_open_h2_mask.sum())
     exit_open_h3_count = int(exit_open_h3_mask.sum())
+    h1_close_rule_open_h2_count = int(h1_close_rule_open_h2_mask.sum())
     slowdown_stop_h2_count = int(slowdown_stop_h2_mask.sum())
     slowdown_stop_h3_count = int(slowdown_stop_h3_mask.sum())
     close_count = int(outcomes.str.startswith("close_").sum())
@@ -929,6 +1037,13 @@ def summarize_split(
     return {
         "split": split,
         "available_rows": int(available_rows),
+        "mfe_signals": int(mfe_signal_count),
+        "adverse_matches": int(adverse_match_count),
+        "adverse_retention": (
+            float(adverse_match_count / mfe_signal_count)
+            if mfe_signal_count
+            else 0.0
+        ),
         "signals": int(n),
         "selected_rate": float(n / available_rows) if available_rows else 0.0,
         "prediction_threshold": float(prediction_threshold),
@@ -950,8 +1065,35 @@ def summarize_split(
             if h1_stop_count
             else float("nan")
         ),
+        "h1_tp_only_close_count": h1_tp_only_close_count,
+        "h1_tp_only_close_rate": (
+            float(h1_tp_only_close_count / n) if n else 0.0
+        ),
+        "h1_tp_only_close_mean": (
+            float(gross_return.loc[h1_tp_only_close_mask].mean())
+            if h1_tp_only_close_count
+            else float("nan")
+        ),
+        "h1_stop_only_close_count": h1_stop_only_close_count,
+        "h1_stop_only_close_rate": (
+            float(h1_stop_only_close_count / n) if n else 0.0
+        ),
+        "h1_stop_only_close_mean": (
+            float(gross_return.loc[h1_stop_only_close_mask].mean())
+            if h1_stop_only_close_count
+            else float("nan")
+        ),
         "h1_tie_count": h1_tie_count,
         "h1_tie_rate": float(h1_tie_count / n) if n else 0.0,
+        "h1_close_rule_open_h2_count": h1_close_rule_open_h2_count,
+        "h1_close_rule_open_h2_rate": (
+            float(h1_close_rule_open_h2_count / n) if n else 0.0
+        ),
+        "h1_close_rule_open_h2_mean": (
+            float(gross_return.loc[h1_close_rule_open_h2_mask].mean())
+            if h1_close_rule_open_h2_count
+            else float("nan")
+        ),
         "slowdown_stop_h2_count": slowdown_stop_h2_count,
         "slowdown_stop_h2_rate": (
             float(slowdown_stop_h2_count / n) if n else 0.0
@@ -1022,7 +1164,15 @@ def no_h1_mfe_sweep(
     cohort = selected_path.dropna(subset=required).copy()
     if "outcome" in cohort.columns:
         cohort = cohort[
-            ~cohort["outcome"].astype(str).isin({"tp_h1", "h1_stop"})
+            ~cohort["outcome"].astype(str).isin(
+                {
+                    "tp_h1",
+                    "h1_stop",
+                    "h1_tp_only_close",
+                    "h1_stop_only_close",
+                    "h1_close_rule_open_h2",
+                }
+            )
         ]
     else:
         cohort = cohort[
@@ -1111,6 +1261,11 @@ def summary_display(summary: pd.DataFrame) -> pd.DataFrame:
             {
                 "split": str(row["split"]),
                 "signals": f"{int(row['signals']):,}",
+                "MFE signals": f"{int(row['mfe_signals']):,}",
+                "MFE+floor": (
+                    f"{int(row['adverse_matches']):,} "
+                    f"({float(row['adverse_retention']):.2%})"
+                ),
                 "selected": f"{float(row['selected_rate']):.2%}",
                 "trades/day": f"{float(row['trades_per_day']):.2f}",
                 "TP": f"{int(row['tp_count']):,} ({float(row['tp_rate']):.2%})",
@@ -1136,9 +1291,24 @@ def exit_detail_display(summary: pd.DataFrame) -> pd.DataFrame:
                     f"({float(row['h1_stop_rate']):.2%}) "
                     f"mean={signed_percent(row['h1_stop_mean'])}"
                 ),
-                "H1 same-1m TP+SL -> SL": (
+                "H1 TP-only -> close H1": (
+                    f"{int(row['h1_tp_only_close_count']):,} "
+                    f"({float(row['h1_tp_only_close_rate']):.2%}) "
+                    f"mean={signed_percent(row['h1_tp_only_close_mean'])}"
+                ),
+                "H1 SL-only -> close H1": (
+                    f"{int(row['h1_stop_only_close_count']):,} "
+                    f"({float(row['h1_stop_only_close_rate']):.2%}) "
+                    f"mean={signed_percent(row['h1_stop_only_close_mean'])}"
+                ),
+                "H1 TP+SL resolved by close": (
                     f"{int(row['h1_tie_count']):,} "
                     f"({float(row['h1_tie_rate']):.2%})"
+                ),
+                "H1 close-rule open H2": (
+                    f"{int(row['h1_close_rule_open_h2_count']):,} "
+                    f"({float(row['h1_close_rule_open_h2_rate']):.2%}) "
+                    f"mean={signed_percent(row['h1_close_rule_open_h2_mean'])}"
                 ),
                 "slowdown SL H2": (
                     f"{int(row['slowdown_stop_h2_count']):,} "
@@ -1315,10 +1485,12 @@ def run(
     args: argparse.Namespace,
 ) -> tuple[pd.DataFrame, Path, Path | None, pd.DataFrame]:
     archive_path = Path(args.archive)
+    adverse_floor_path = Path(args.adverse_floor_archive)
     long_slowdown_path = Path(args.long_slowdown_archive)
     short_slowdown_path = Path(args.short_slowdown_archive)
     data_path = Path(args.data)
     metadata = load_archive_metadata(archive_path)
+    adverse_floor_metadata = load_archive_metadata(adverse_floor_path)
     long_slowdown_metadata = load_archive_metadata(long_slowdown_path)
     short_slowdown_metadata = load_archive_metadata(short_slowdown_path)
     label_mode = config.canonical_label_mode(metadata.get("label_mode"))
@@ -1330,6 +1502,11 @@ def run(
         archive_path,
         fallback=[3],
         label="Long MFE backtest",
+    )
+    adverse_floor_horizons = _archive_horizons(
+        adverse_floor_path,
+        fallback=[1],
+        label="Long adverse-floor filter",
     )
     long_slowdown_horizons = _archive_horizons(
         long_slowdown_path,
@@ -1349,6 +1526,24 @@ def run(
     if horizons != [3]:
         raise ValueError(
             f"This script requires archive metadata horizons=[3], got {horizons}."
+        )
+    adverse_floor_mode = config.canonical_label_mode(
+        adverse_floor_metadata.get("label_mode")
+    )
+    adverse_floor_direction = config.canonical_label_direction(
+        adverse_floor_metadata.get("label_direction")
+    )
+    if (
+        adverse_floor_mode != "adverse_floor"
+        or adverse_floor_direction != "long"
+        or adverse_floor_horizons != [1]
+    ):
+        raise ValueError(
+            "Adverse-floor archive must use mode=adverse_floor, "
+            "direction=long, horizons=[1]; got "
+            f"mode={adverse_floor_mode}, "
+            f"direction={adverse_floor_direction}, "
+            f"horizons={adverse_floor_horizons}."
         )
     for name, slowdown_metadata, expected_direction, slowdown_horizons in (
         (
@@ -1414,6 +1609,14 @@ def run(
         top_fraction=float(args.top_fraction),
         label_direction=label_direction,
     )
+    adverse_floor_spec = ModelSpec(
+        archive_path=adverse_floor_path,
+        rank=int(args.adverse_floor_rank),
+        label_mode=adverse_floor_mode,
+        label_threshold=float(adverse_floor_metadata["label_threshold"]),
+        top_fraction=float(args.adverse_floor_top_fraction),
+        label_direction=adverse_floor_direction,
+    )
     long_slowdown_spec = ModelSpec(
         archive_path=long_slowdown_path,
         rank=int(args.long_slowdown_rank),
@@ -1433,6 +1636,10 @@ def run(
     raw_df = load_ohlcv(data_path)
     purge_bars = config.purge_bars_for_horizons([3, 1])
     entry = _load_rank_entry(archive_path, spec.rank)
+    adverse_floor_entry = _load_rank_entry(
+        adverse_floor_path,
+        adverse_floor_spec.rank,
+    )
     long_slowdown_entry = _load_rank_entry(
         long_slowdown_path,
         long_slowdown_spec.rank,
@@ -1444,6 +1651,7 @@ def run(
     quality_indices = []
     for quality_spec, quality_horizons in (
         (spec, horizons),
+        (adverse_floor_spec, adverse_floor_horizons),
         (long_slowdown_spec, [1]),
         (short_slowdown_spec, [1]),
     ):
@@ -1458,14 +1666,19 @@ def run(
                 purge_bars=purge_bars,
             )
         )
-    quality_train = quality_indices[0].union(
-        quality_indices[1]
-    ).union(quality_indices[2])
+    quality_train = quality_indices[0]
+    for quality_index in quality_indices[1:]:
+        quality_train = quality_train.union(quality_index)
     feature_space = _cached_feature_space(
         raw_df=raw_df,
         data_path=data_path,
         required_windows=_required_windows_for_entries(
-            [entry, long_slowdown_entry, short_slowdown_entry]
+            [
+                entry,
+                adverse_floor_entry,
+                long_slowdown_entry,
+                short_slowdown_entry,
+            ]
         ),
         quality_index=quality_train,
     )
@@ -1475,6 +1688,17 @@ def run(
         raw_df=raw_df,
         feature_space=feature_space,
         horizons=horizons,
+        val_start=args.val_start,
+        test_start=args.test_start,
+        test_end=args.test_end,
+        purge_bars=purge_bars,
+    )
+    adverse_floor_bundle = _train_spec_bundle(
+        spec=adverse_floor_spec,
+        entry=adverse_floor_entry,
+        raw_df=raw_df,
+        feature_space=feature_space,
+        horizons=adverse_floor_horizons,
         val_start=args.val_start,
         test_start=args.test_start,
         test_end=args.test_end,
@@ -1512,17 +1736,21 @@ def run(
     simulations: dict[str, pd.DataFrame] = {}
     no_h1_sweeps: list[pd.DataFrame] = []
     rows: list[dict[str, Any]] = []
-    prepared_splits: list[tuple[str, Any, Any, Any, pd.DataFrame]] = []
+    prepared_splits: list[
+        tuple[str, Any, Any, Any, pd.DataFrame, int, int]
+    ] = []
     split_inputs = (
         (
             "val",
             bundle.val,
+            adverse_floor_bundle.val,
             long_slowdown_bundle.val,
             short_slowdown_bundle.val,
         ),
         (
             "test",
             bundle.test,
+            adverse_floor_bundle.test,
             long_slowdown_bundle.test,
             short_slowdown_bundle.test,
         ),
@@ -1530,10 +1758,22 @@ def run(
     for (
         split_name,
         signals,
+        adverse_floor_signals,
         long_slowdown_signals,
         short_slowdown_signals,
     ) in split_inputs:
-        base_selected_index = pd.Index(signals.selected_index)
+        mfe_selected_index = pd.Index(signals.selected_index)
+        adverse_selected_index = pd.Index(
+            adverse_floor_signals.selected_index
+        )
+        mfe_floor_index = mfe_selected_index[
+            mfe_selected_index.isin(adverse_selected_index)
+        ]
+        if args.adverse_floor_filter:
+            base_selected_index = mfe_floor_index
+        else:
+            base_selected_index = mfe_selected_index
+        adverse_match_count = len(mfe_floor_index)
         if args.entry_filter:
             short_selected_index = pd.Index(
                 short_slowdown_signals.selected_index
@@ -1552,16 +1792,19 @@ def run(
         else:
             entry_filter_index = base_selected_index
         logger.info(
-            "%s entry filter=%s: base=%d | selected=%d (%.2f%% of base)",
+            "%s adverse filter=%s: MFE=%d | MFE+floor=%d "
+            "(%.2f%% of MFE) | entry filter=%s -> %d",
             split_name.upper(),
-            "ON" if args.entry_filter else "OFF",
-            len(base_selected_index),
-            len(entry_filter_index),
+            "ON" if args.adverse_floor_filter else "OFF",
+            len(mfe_selected_index),
+            adverse_match_count,
             (
-                100.0 * len(entry_filter_index) / len(base_selected_index)
-                if len(base_selected_index)
+                100.0 * adverse_match_count / len(mfe_selected_index)
+                if len(mfe_selected_index)
                 else 0.0
             ),
+            "ON" if args.entry_filter else "OFF",
+            len(entry_filter_index),
         )
         selected_path = path.reindex(entry_filter_index)
         prepared_splits.append(
@@ -1571,25 +1814,24 @@ def run(
                 long_slowdown_signals,
                 short_slowdown_signals,
                 selected_path,
+                len(mfe_selected_index),
+                adverse_match_count,
             )
         )
 
     selected_indexes = [
         pd.DatetimeIndex(selected_path.index)
-        for _, _, _, _, selected_path in prepared_splits
+        for _, _, _, _, selected_path, _, _ in prepared_splits
         if not selected_path.empty
     ]
-    if selected_indexes:
+    if selected_indexes and not args.skip_1m_analysis:
         all_selected_times = selected_indexes[0]
         for selected_index in selected_indexes[1:]:
             all_selected_times = all_selected_times.union(selected_index)
         minute_start = all_selected_times.min() + pd.Timedelta(minutes=5)
-        minute_end_offset = 19 if not args.skip_1m_analysis else 9
-        minute_end = all_selected_times.max() + pd.Timedelta(
-            minutes=minute_end_offset
-        )
+        minute_end = all_selected_times.max() + pd.Timedelta(minutes=19)
         logger.info(
-            "Loading 1m OHLC for causal H1 ordering: %s -> %s",
+            "Loading 1m OHLC for optional diagnostics: %s -> %s",
             minute_start,
             minute_end,
         )
@@ -1608,11 +1850,11 @@ def run(
         long_slowdown_signals,
         short_slowdown_signals,
         selected_path,
+        mfe_signal_count,
+        adverse_match_count,
     ) in prepared_splits:
-        h1_barrier_outcomes = resolve_h1_tp_sl_from_1m(
-            signal_index=selected_path.index,
-            expected_entry_open=selected_path["entry_open"],
-            minute=minute_df,
+        h1_barrier_outcomes = resolve_h1_tp_sl_from_5m(
+            selected_path=selected_path,
             take_profit=float(args.take_profit),
             h1_stop_loss=float(args.h1_stop_loss),
         )
@@ -1643,6 +1885,8 @@ def run(
                 simulations=simulated,
                 available_rows=len(signals.data),
                 prediction_threshold=signals.pred_threshold,
+                mfe_signal_count=mfe_signal_count,
+                adverse_match_count=adverse_match_count,
             )
         )
 
@@ -1650,12 +1894,14 @@ def run(
     no_h1_sweep = pd.concat(no_h1_sweeps, ignore_index=True)
     run_name = (
         f"{archive_path.stem}_r{spec.rank:02d}_top"
-        f"{float(args.top_fraction) * 100.0:.0f}_slowL"
+        f"{float(args.top_fraction) * 100.0:.0f}_adv"
+        f"{adverse_floor_spec.top_fraction * 100.0:.0f}_"
+        f"{'advOn' if args.adverse_floor_filter else 'advOff'}_slowL"
         f"{long_slowdown_spec.top_fraction * 100.0:.0f}_slowS"
         f"{short_slowdown_spec.top_fraction * 100.0:.0f}_"
         f"{'entryNegSlowS' if args.entry_filter else 'entryFilterOff'}_tp"
         f"{float(args.take_profit) * 100.0:.3f}pct_h1SL"
-        f"{float(args.h1_stop_loss) * 100.0:.3f}pct_h1Order1m_slowSL"
+        f"{float(args.h1_stop_loss) * 100.0:.3f}pct_h1CloseRule_slowSL"
         f"{float(args.slowdown_stop_loss) * 100.0:.3f}pct"
     ).replace(".", "p")
     output_path = Path(args.out_dir) / f"{run_name}.png"
@@ -1665,14 +1911,19 @@ def run(
         else "entry filter: OFF"
     )
     title = (
-        "5m Long MFE H3 + per-candle slope slowdown exits | "
+        "5m Long MFE H3 + H1 adverse-floor AND filter + slope exits | "
         f"base r{spec.rank} top={spec.top_fraction:.0%} | "
+        f"adverse floor r{adverse_floor_spec.rank} "
+        f"top={adverse_floor_spec.top_fraction:.0%} "
+        f"({'ON' if args.adverse_floor_filter else 'OFF'}) | "
         f"Long slowdown top={long_slowdown_spec.top_fraction:.0%} | "
         f"Short slowdown top={short_slowdown_spec.top_fraction:.0%} | "
         f"{entry_filter_title} | "
         f"H1-only TP=+{float(args.take_profit):.2%}, H1-only SL="
         f"-{float(args.h1_stop_loss):.2%}, slowdown SL="
-        f"-{float(args.slowdown_stop_loss):.2%}, H1 order=1m/SL-first tie, "
+        f"-{float(args.slowdown_stop_loss):.2%}, "
+        "H1 one-sided touch -> close H1; TP+SL tie: close>=TP -> TP, "
+        "close<=SL -> SL, else open H2, "
         "neutral=HOLD, "
         f"max exit=close H3 | cost={float(args.trade_cost):.2%}"
     )
@@ -1803,6 +2054,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archive", default=str(DEFAULT_ARCHIVE))
     parser.add_argument(
+        "--adverse-floor-archive",
+        default=str(DEFAULT_ADVERSE_FLOOR_ARCHIVE),
+    )
+    parser.add_argument(
         "--long-slowdown-archive",
         default=str(DEFAULT_LONG_SLOWDOWN_ARCHIVE),
     )
@@ -1814,6 +2069,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-1m", default=str(DEFAULT_DATA_1M))
     parser.add_argument("--rank", type=int, default=DEFAULT_RANK)
     parser.add_argument(
+        "--adverse-floor-rank",
+        type=int,
+        default=DEFAULT_RANK,
+    )
+    parser.add_argument(
         "--long-slowdown-rank",
         type=int,
         default=DEFAULT_SLOWDOWN_RANK,
@@ -1824,6 +2084,21 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_SLOWDOWN_RANK,
     )
     parser.add_argument("--top-fraction", type=float, default=DEFAULT_TOP_FRACTION)
+    parser.add_argument(
+        "--adverse-floor-top-fraction",
+        type=float,
+        default=DEFAULT_ADVERSE_FLOOR_TOP_FRACTION,
+    )
+    parser.add_argument(
+        "--adverse-floor-filter",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Require the H1 Long adverse-floor model to select the same "
+            "timestamp as the MFE model. Use --no-adverse-floor-filter "
+            "for an unchanged MFE baseline."
+        ),
+    )
     parser.add_argument(
         "--long-slowdown-top-fraction",
         type=float,

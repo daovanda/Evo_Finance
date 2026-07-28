@@ -32,7 +32,7 @@ PAYOFF_ADVERSE_FLOOR: float = -999.0
 TP_SAFE_PATH: float = 0.003  # TP used by LABEL_MODE="safe_path_mfe"
 SAFE_ADVERSE_FLOOR: float = -0.0015  # stop-first low/high floor for safe_path_mfe
 SAFE_PATH_RULE: str = "adverse_stop_first_v1"
-SLOPE_LOOKBACK: int = 5
+SLOPE_LOOKBACK: int = 2
 SLOPE_SLOWDOWN_THRESHOLD: float = 0.0002  # 0.03% log-OLS slope per candle
 SLOPE_MIN_INITIAL: float = 0.0001  # 0.02% log-OLS slope per candle
 SLOPE_PRICE_COLUMN: str = "high"
@@ -223,6 +223,56 @@ def mfe_future_return(
         return directional_price_return(min_low, entry_open, direction)
     max_high = future_highs.max(axis=1, skipna=False)
     return directional_price_return(max_high, entry_open, direction)
+
+
+def mfe_ahead_future_return(
+    df: Any,
+    horizon: int,
+    direction: str | None = None,
+) -> Any:
+    """Look-ahead MFE measured from the current candle's open.
+
+    The model row represents H1 and may use all information through close H1.
+    Entry remains open H1, and an h-candle target spans H1..Hh:
+
+        Long:  max(high(H1)..high(Hh)) / open(H1) - 1
+        Short: open(H1) / min(low(H1)..low(Hh)) - 1
+
+    This intentionally exposes H1 to the model and must not be interpreted as
+    a causal entry-at-open strategy.
+    """
+    h = int(horizon)
+    if h < 1:
+        raise ValueError("horizon must be positive for mfe_ahead.")
+
+    entry_open = pd.to_numeric(df["open"], errors="coerce")
+    future_highs = pd.concat(
+        [df["high"].shift(-offset) for offset in range(0, h)],
+        axis=1,
+    )
+    future_lows = pd.concat(
+        [df["low"].shift(-offset) for offset in range(0, h)],
+        axis=1,
+    )
+    if canonical_label_direction(direction) == "short":
+        favorable_price = future_lows.min(axis=1, skipna=False)
+    else:
+        favorable_price = future_highs.max(axis=1, skipna=False)
+    return directional_price_return(favorable_price, entry_open, direction)
+
+
+def mfe_ahead_close_return(
+    df: Any,
+    horizon: int,
+    direction: str | None = None,
+) -> Any:
+    """Directional close-Hh return relative to the current H1 open."""
+    h = int(horizon)
+    if h < 1:
+        raise ValueError("horizon must be positive for mfe_ahead.")
+    entry_open = pd.to_numeric(df["open"], errors="coerce")
+    final_close = pd.to_numeric(df["close"], errors="coerce").shift(-(h - 1))
+    return directional_price_return(final_close, entry_open, direction)
 
 
 def adverse_floor_future_return(
@@ -539,6 +589,7 @@ LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
     "slope_slowdown": slope_slowdown_future_return,
     "close_path_mean": close_path_mean_future_return,
     "mfe": mfe_future_return,
+    "mfe_ahead": mfe_ahead_future_return,
     "adverse_floor": adverse_floor_future_return,
     "safe_path_mfe": safe_path_mfe_future_return,
     "payoff": payoff_future_return,
@@ -626,8 +677,8 @@ WF_PURGE_BARS: int | None = None  # None => max(HOLDING_HORIZONS) + 1
 # Safe feature construction. All features are time-series/ratio normalized;
 # raw price/volume scale columns are intentionally not selectable.
 # WINDOWS: list[int] = [1,2,3,4,5,7,10,14,20,30,40,50,60,80,120,160,240,320,400,480,600,800,960,1200,1440,]
-# WINDOWS: list[int] = [1,2,3,4,5,6]
-WINDOWS: list[int] = [2,3,5]
+#WINDOWS: list[int] = [1,2,3,4,5,6]
+WINDOWS: list[int] = [2, 5, 7, 15, 25, 30]
 FEATURE_MIN_VALID_RATIO: float = 0.70
 FEATURE_MAX_DOMINANT_VALUE_RATIO: float = 0.985
 FEATURE_CORR_THRESHOLD: float = 0.70

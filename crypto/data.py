@@ -90,6 +90,9 @@ def add_binary_labels(
     For mfe, the label source remains maximum favorable excursion, while
     future_return_h stores the executable strategy payoff used by fitness:
     threshold on a TP hit, otherwise the close return at the final horizon.
+    For mfe_ahead, the model row is H1 and may use its completed candle. Entry
+    remains open H1; MFE and the TP-or-close payoff span H1..Hh. This mode
+    intentionally contains H1 look-ahead relative to the entry price.
     The safe_path_mfe mode uses its explicit first-hit/path-safety label.
     For payoff, label=1 additionally requires the full H1..H adverse path to
     stay strictly above config.PAYOFF_ADVERSE_FLOOR. Its future_return remains
@@ -219,12 +222,19 @@ def add_binary_labels(
             labeled[f"label_h{h}"] = explicit_label
             continue
 
-        if selected_mode == "mfe":
-            close_return = config.close_exit_future_return(
-                labeled,
-                h,
-                direction=selected_direction,
-            )
+        if selected_mode in {"mfe", "mfe_ahead"}:
+            if selected_mode == "mfe_ahead":
+                close_return = config.mfe_ahead_close_return(
+                    labeled,
+                    h,
+                    direction=selected_direction,
+                )
+            else:
+                close_return = config.close_exit_future_return(
+                    labeled,
+                    h,
+                    direction=selected_direction,
+                )
             complete = future_return.notna() & close_return.notna()
             hit_tp = future_return > float(label_threshold)
             strategy_return = close_return.where(

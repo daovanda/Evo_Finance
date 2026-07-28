@@ -1016,6 +1016,43 @@ class CryptoPipelineTests(unittest.TestCase):
         self.assertEqual(labeled["label_h3"].iloc[1], 0.0)
         self.assertTrue(pd.isna(labeled["label_h3"].iloc[-1]))
 
+    def test_mfe_ahead_uses_current_h1_open_and_current_h1_high(self):
+        idx = pd.date_range("2024-01-01", periods=5, freq="15min")
+        df = pd.DataFrame(
+            {
+                "open": [100.0] * 5,
+                "high": [104.0, 101.0, 101.0, 100.0, 100.0],
+                "low": [99.0] * 5,
+                "close": [100.0, 100.0, 98.0, 98.0, 100.0],
+                "volume": [10.0] * 5,
+                "trade_count": [10] * 5,
+                "taker_buy_base_volume": [5.0] * 5,
+                "taker_buy_quote_volume": [500.0] * 5,
+            },
+            index=idx,
+        )
+
+        labeled = add_binary_labels(
+            df,
+            horizons=[3],
+            threshold=0.03,
+            label_mode="mfe_ahead",
+            label_direction="Long",
+        )
+
+        expected = pd.Series(
+            [0.03, -0.02, 0.0, np.nan, np.nan],
+            index=idx,
+            name="future_return_h3",
+        )
+        pd.testing.assert_series_equal(labeled["future_return_h3"], expected)
+        self.assertEqual(labeled["label_h3"].iloc[0], 1.0)
+        self.assertEqual(labeled["label_h3"].iloc[1], 0.0)
+        self.assertEqual(
+            config.canonical_label_mode("MFE_Ahead"),
+            "mfe_ahead",
+        )
+
     def test_payoff_label_requires_long_and_short_adverse_path_floor(self):
         idx = pd.date_range("2024-01-01", periods=5, freq="15min")
         common = {
