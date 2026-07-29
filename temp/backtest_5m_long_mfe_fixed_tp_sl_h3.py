@@ -11,6 +11,10 @@ When TP and SL are both reached in the same 5-minute candle, OHLC cannot reveal
 their order. The default is conservative ``stop_first``; use
 ``--same-candle-policy tp_first`` for the optimistic sensitivity case.
 
+The trained LightGBM model, Val/Test predictions, Val threshold, and selected
+indices are cached under ``temp/model``. An unchanged model/data/config run
+loads this cache before feature construction and training.
+
 PowerShell:
     python -m temp.backtest_5m_long_mfe_fixed_tp_sl_h3 `
       --archive crypto/results/crypto_btc_5m_long_mfe_h3_tp01_top40_seed1_8h.json `
@@ -28,6 +32,7 @@ Oracle look-ahead variant (for diagnostic use only):
       --archive crypto/results/crypto_btc_5m_long_mfe_h3_tp01_top40_seed1_8h.json `
       --rank 1 `
       --top-fraction 0.40 `
+      --filter-take-profit 0.001 `
       --take-profit 0.001 `
       --stop-loss 0.001 `
       --trade-cost 0.00016 `
@@ -41,7 +46,10 @@ Oracle look-ahead variant (for diagnostic use only):
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import logging
+import pickle
 from pathlib import Path
 from typing import Any
 
@@ -55,19 +63,17 @@ import pandas as pd
 from crypto import config
 from crypto.analyze import _required_windows_for_entries
 from crypto.backtest import (
+    BundleSignals,
     ModelSpec,
     _archive_horizons,
     _cached_feature_space,
+    _combine_horizons,
     _load_rank_entry,
     _quality_train_index,
+    _split_signals,
     _train_spec_bundle,
 )
 from crypto.data import load_ohlcv
-from temp.backtest_5m_long_mfe_h3 import (
-    load_archive_metadata,
-    load_one_minute_ohlc,
-    make_price_path,
-)
 
 
 logging.basicConfig(
@@ -84,11 +90,251 @@ DEFAULT_ARCHIVE = Path(
 DEFAULT_DATA = Path("data/crypto/BTCUSDT_5m.csv")
 DEFAULT_DATA_1M = Path("data/crypto/BTCUSDT_1m.csv")
 DEFAULT_OUT_DIR = Path("temp/output")
+DEFAULT_MODEL_CACHE_DIR = Path("temp/model")
 DEFAULT_RANK = 1
 DEFAULT_TOP_FRACTION = 0.40
 DEFAULT_TAKE_PROFIT = 0.001
+DEFAULT_FILTER_TAKE_PROFIT: float | None = None
 DEFAULT_STOP_LOSS = 0.001
 DEFAULT_TRADE_COST = 0.00016
+DEFAULT_OPT_TP_START = 0.00025
+DEFAULT_OPT_TP_END = 0.005
+DEFAULT_OPT_TP_STEP = 0.00025
+DEFAULT_OPT_SL_START = 0.00025
+DEFAULT_OPT_SL_END = 0.005
+DEFAULT_OPT_SL_STEP = 0.00025
+
+
+def load_archive_metadata(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+    if not isinstance(metadata, dict):
+        raise ValueError(f"Archive metadata must be an object: {path}")
+    return dict(metadata)
+
+
+def make_price_path(
+    raw_df: pd.DataFrame,
+    horizon: int,
+    direction: str = "long",
+) -> pd.DataFrame:
+    entry_open = pd.to_numeric(raw_df["open"], errors="coerce").shift(-1)
+    selected_direction = config.canonical_label_direction(direction)
+    result = pd.DataFrame(index=raw_df.index)
+    result["entry_open"] = entry_open
+    for step in range(1, int(horizon) + 1):
+        if selected_direction == "short":
+            future_open = pd.to_numeric(
+                raw_df["open"], errors="coerce"
+            ).shift(-step)
+            future_low = pd.to_numeric(
+                raw_df["low"], errors="coerce"
+            ).shift(-step)
+            future_high = pd.to_numeric(
+                raw_df["high"], errors="coerce"
+            ).shift(-step)
+            future_close = pd.to_numeric(
+                raw_df["close"], errors="coerce"
+            ).shift(-step)
+            result[f"open_h{step}"] = 1.0 - future_open.div(entry_open)
+            # Normalize Short so high_h is favorable and low_h is adverse.
+            result[f"high_h{step}"] = 1.0 - future_low.div(entry_open)
+            result[f"low_h{step}"] = 1.0 - future_high.div(entry_open)
+            result[f"close_h{step}"] = 1.0 - future_close.div(entry_open)
+        else:
+            for column in ("open", "high", "low", "close"):
+                price = pd.to_numeric(
+                    raw_df[column], errors="coerce"
+                ).shift(-step)
+                result[f"{column}_h{step}"] = price.div(entry_open).sub(1.0)
+    return result.replace([np.inf, -np.inf], np.nan)
+
+
+def load_one_minute_ohlc(
+    path: Path,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.DataFrame:
+    frame = pd.read_csv(
+        path,
+        usecols=["date", "open", "high", "low", "close"],
+        parse_dates=["date"],
+    )
+    frame = frame.set_index("date").sort_index()
+    frame = frame.loc[
+        (frame.index >= pd.Timestamp(start))
+        & (frame.index <= pd.Timestamp(end))
+    ].copy()
+    for column in ("open", "high", "low", "close"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.dropna(subset=["open", "high", "low", "close"])
+    if frame.index.has_duplicates:
+        frame = frame.loc[~frame.index.duplicated(keep="last")]
+    return frame
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _trained_bundle_cache_path(
+    cache_dir: Path,
+    archive_path: Path,
+    data_path: Path,
+    raw_df: pd.DataFrame,
+    spec: ModelSpec,
+    horizons: list[int],
+    val_start: str,
+    test_start: str,
+    test_end: str | None,
+    purge_bars: int,
+    include_top_fraction: bool = False,
+) -> Path:
+    data_stat = data_path.stat()
+    project_root = Path(__file__).resolve().parents[1]
+    source_paths = [
+        project_root / "crypto/config.py",
+        project_root / "crypto/data.py",
+        project_root / "crypto/analyze.py",
+        project_root / "crypto/backtest.py",
+    ]
+    payload = {
+        "schema": 1 if include_top_fraction else 2,
+        "archive": str(archive_path.resolve()),
+        "archive_sha256": _sha256_file(archive_path),
+        "rank": int(spec.rank),
+        "label_mode": spec.label_mode,
+        "label_direction": spec.label_direction,
+        "label_threshold": float(spec.label_threshold),
+        "exit_after_k": spec.exit_after_k,
+        "horizons": [int(value) for value in horizons],
+        "data": str(data_path.resolve()),
+        "data_size": int(data_stat.st_size),
+        "data_mtime_ns": int(data_stat.st_mtime_ns),
+        "data_rows": int(len(raw_df)),
+        "data_start": str(raw_df.index.min()),
+        "data_end": str(raw_df.index.max()),
+        "val_start": str(val_start),
+        "test_start": str(test_start),
+        "test_end": None if test_end is None else str(test_end),
+        "purge_bars": int(purge_bars),
+        "training_sources": {
+            str(path): _sha256_file(path)
+            for path in source_paths
+            if path.exists()
+        },
+    }
+    if include_top_fraction:
+        payload["top_fraction"] = float(spec.top_fraction)
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    key = hashlib.sha256(encoded).hexdigest()[:20]
+    safe_stem = "".join(
+        character if character.isalnum() or character in "-_" else "_"
+        for character in archive_path.stem
+    )
+    return cache_dir / f"{safe_stem}_r{spec.rank:02d}_{key}.pkl"
+
+
+def _load_trained_bundle_cache(path: Path) -> BundleSignals | None:
+    if not path.exists():
+        return None
+    try:
+        with path.open("rb") as handle:
+            bundle = pickle.load(handle)
+    except Exception as exc:
+        logger.warning("Ignoring unreadable model cache %s: %s", path, exc)
+        return None
+    if not isinstance(bundle, BundleSignals):
+        logger.warning("Ignoring incompatible model cache: %s", path)
+        return None
+    logger.info("Loaded trained model signals from cache: %s", path)
+    return bundle
+
+
+def _save_trained_bundle_cache(path: Path, bundle: BundleSignals) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("wb") as handle:
+        pickle.dump(bundle, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    temporary.replace(path)
+    logger.info("Saved trained model signals to cache: %s", path)
+
+
+def _bundle_with_top_fraction(
+    bundle: BundleSignals,
+    top_fraction: float,
+) -> BundleSignals:
+    fraction = float(top_fraction)
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError("top_fraction must be in (0, 1].")
+
+    source_val_horizons = bundle.val_horizons or (bundle.val,)
+    source_test_horizons = bundle.test_horizons or (bundle.test,)
+    if len(source_val_horizons) != len(source_test_horizons):
+        raise ValueError("Cached Val/Test horizon counts do not match.")
+
+    val_horizons = []
+    test_horizons = []
+    for val_source, test_source in zip(
+        source_val_horizons,
+        source_test_horizons,
+        strict=True,
+    ):
+        val = _split_signals(
+            split="val",
+            label=val_source.data["label"],
+            pred=val_source.data["pred"],
+            top_fraction=fraction,
+        )
+        test = _split_signals(
+            split="test",
+            label=test_source.data["label"],
+            pred=test_source.data["pred"],
+            top_fraction=fraction,
+            pred_threshold=val.pred_threshold,
+        )
+        val_horizons.append(val)
+        test_horizons.append(test)
+
+    if len(val_horizons) == 1:
+        val = val_horizons[0]
+        test = test_horizons[0]
+    else:
+        val = _combine_horizons(
+            split="val",
+            split_results=val_horizons,
+            top_fraction=fraction,
+        )
+        test = _combine_horizons(
+            split="test",
+            split_results=test_horizons,
+            top_fraction=fraction,
+        )
+
+    logger.info(
+        "Applied top fraction %.2f%% from cached predictions | "
+        "val_threshold=%.8f | val_selected=%d | test_selected=%d",
+        fraction * 100.0,
+        val.pred_threshold,
+        len(val.selected_index),
+        len(test.selected_index),
+    )
+    return BundleSignals(
+        label=bundle.label,
+        val=val,
+        test=test,
+        val_horizons=tuple(val_horizons),
+        test_horizons=tuple(test_horizons),
+        models=bundle.models,
+    )
 
 
 def simulate_fixed_tp_sl(
@@ -161,21 +407,26 @@ def simulate_fixed_tp_sl(
 def simulate_next_1m_tp_oracle(
     selected_path: pd.DataFrame,
     minute: pd.DataFrame,
+    filter_take_profit: float,
     take_profit: float,
     stop_loss: float,
     trade_cost: float,
     same_candle_policy: str,
+    direction: str = "long",
 ) -> pd.DataFrame:
     """Filter on H1 minute 1, then trade from H1 minutes 2-5 onward.
 
     This deliberately uses future information and is therefore an oracle
     diagnostic, not a causal strategy suitable for live trading.
     """
+    filter_tp = float(filter_take_profit)
     tp = float(take_profit)
     sl = float(stop_loss)
     policy = str(same_candle_policy).strip().lower()
     if policy not in {"stop_first", "tp_first"}:
         raise ValueError("same_candle_policy must be stop_first or tp_first.")
+    if filter_tp <= 0.0:
+        raise ValueError("filter_take_profit must be positive.")
 
     signals = pd.DatetimeIndex(selected_path.index)
     entry_times = signals + pd.Timedelta(minutes=5)
@@ -212,9 +463,13 @@ def simulate_next_1m_tp_oracle(
             "The first H1 1m open does not match the 5m H1 entry open."
         )
 
-    high_return = high_values / entry_open[:, None] - 1.0
-    low_return = low_values / entry_open[:, None] - 1.0
-    keep = high_return[:, 0] >= tp
+    if config.canonical_label_direction(direction) == "short":
+        high_return = 1.0 - low_values / entry_open[:, None]
+        low_return = 1.0 - high_values / entry_open[:, None]
+    else:
+        high_return = high_values / entry_open[:, None] - 1.0
+        low_return = low_values / entry_open[:, None] - 1.0
+    keep = high_return[:, 0] >= filter_tp
     result = selected_path.iloc[np.flatnonzero(keep)].copy()
     kept_high = high_return[keep]
     kept_low = low_return[keep]
@@ -285,6 +540,64 @@ def simulate_next_1m_tp_oracle(
     return result
 
 
+def _parameter_grid(start: float, end: float, step: float) -> np.ndarray:
+    start_value = float(start)
+    end_value = float(end)
+    step_value = float(step)
+    if start_value <= 0.0 or end_value < start_value or step_value <= 0.0:
+        raise ValueError(
+            "Optimization grid requires 0 < start <= end and step > 0."
+        )
+    count = int(np.floor((end_value - start_value) / step_value + 1e-12))
+    values = start_value + np.arange(count + 1, dtype=float) * step_value
+    if values[-1] < end_value - 1e-12:
+        values = np.append(values, end_value)
+    return values
+
+
+def optimize_tp_sl_on_val(
+    val_execution_path: pd.DataFrame,
+    trade_cost: float,
+    same_candle_policy: str,
+    tp_values: np.ndarray,
+    sl_values: np.ndarray,
+) -> tuple[float, float, pd.DataFrame]:
+    rows: list[dict[str, float]] = []
+    for take_profit in tp_values:
+        for stop_loss in sl_values:
+            simulation = simulate_fixed_tp_sl(
+                selected_path=val_execution_path,
+                take_profit=float(take_profit),
+                stop_loss=float(stop_loss),
+                trade_cost=float(trade_cost),
+                same_candle_policy=same_candle_policy,
+            )
+            rows.append(
+                {
+                    "take_profit": float(take_profit),
+                    "stop_loss": float(stop_loss),
+                    "gross_mean": float(simulation["gross_return"].mean()),
+                    "net_mean": float(simulation["net_return"].mean()),
+                    "win_rate": float(
+                        (simulation["net_return"] > 0.0).mean()
+                    ),
+                }
+            )
+    sweep = pd.DataFrame(rows)
+    if sweep.empty or not np.isfinite(sweep["net_mean"]).any():
+        raise ValueError("TP/SL optimization produced no finite Val result.")
+    best = sweep.sort_values(
+        ["net_mean", "win_rate", "take_profit", "stop_loss"],
+        ascending=[False, False, True, True],
+        kind="stable",
+    ).iloc[0]
+    return (
+        float(best["take_profit"]),
+        float(best["stop_loss"]),
+        sweep,
+    )
+
+
 def summarize_split(
     split: str,
     simulation: pd.DataFrame,
@@ -297,6 +610,10 @@ def summarize_split(
     tp_mask = outcomes.str.startswith("tp_")
     sl_mask = outcomes.str.startswith("sl_")
     close_mask = outcomes.eq("close_h3")
+    min_high_h2_h3 = simulation[
+        ["high_h2", "high_h3"]
+    ].apply(pd.to_numeric, errors="coerce").min(axis=1, skipna=False)
+    close_h3 = pd.to_numeric(simulation["close_h3"], errors="coerce")
     return {
         "split": split,
         "available_rows": int(available_rows),
@@ -313,6 +630,16 @@ def summarize_split(
         "prediction_threshold": float(prediction_threshold),
         "tp_count": int(tp_mask.sum()),
         "tp_rate": float(tp_mask.mean()) if n else 0.0,
+        "tp_min_high_h2_h3": (
+            float(min_high_h2_h3.loc[tp_mask].min())
+            if bool(tp_mask.any())
+            else np.nan
+        ),
+        "tp_close_h3_mean": (
+            float(close_h3.loc[tp_mask].mean())
+            if bool(tp_mask.any())
+            else np.nan
+        ),
         "sl_count": int(sl_mask.sum()),
         "sl_rate": float(sl_mask.mean()) if n else 0.0,
         "close_h3_count": int(close_mask.sum()),
@@ -325,202 +652,6 @@ def summarize_split(
         "gross_mean": float(simulation["gross_return"].mean()) if n else 0.0,
         "net_mean": float(simulation["net_return"].mean()) if n else 0.0,
         "win_rate": float((simulation["net_return"] > 0.0).mean()) if n else 0.0,
-    }
-
-
-def summarize_h1_both(
-    split: str,
-    simulation: pd.DataFrame,
-    take_profit: float,
-    stop_loss: float,
-) -> dict[str, Any]:
-    high_h1 = pd.to_numeric(simulation["high_h1"], errors="coerce")
-    low_h1 = pd.to_numeric(simulation["low_h1"], errors="coerce")
-    close_h1 = pd.to_numeric(simulation["close_h1"], errors="coerce")
-    close_h2 = pd.to_numeric(simulation["close_h2"], errors="coerce")
-    close_h3 = pd.to_numeric(simulation["close_h3"], errors="coerce")
-    low_h2 = pd.to_numeric(simulation["low_h2"], errors="coerce")
-    low_h3 = pd.to_numeric(simulation["low_h3"], errors="coerce")
-    high_h2 = pd.to_numeric(simulation["high_h2"], errors="coerce")
-    high_h3 = pd.to_numeric(simulation["high_h3"], errors="coerce")
-    tp_hit = high_h1.ge(float(take_profit))
-    sl_hit = low_h1.le(-float(stop_loss))
-    both = tp_hit & sl_hit
-    tp_only = tp_hit & ~sl_hit
-    sl_only = sl_hit & ~tp_hit
-    one_side = tp_only | sl_only
-    neither = ~tp_hit & ~sl_hit
-    both_count = int(both.sum())
-    tp_only_count = int(tp_only.sum())
-    sl_only_count = int(sl_only.sum())
-    one_side_count = int(one_side.sum())
-    neither_count = int(neither.sum())
-    tp_only_h2_low = tp_only & low_h2.lt(float(take_profit))
-    sl_only_h2_high = sl_only & high_h2.gt(-float(stop_loss))
-    tp_only_h2_low_h3_high = (
-        tp_only_h2_low & high_h3.gt(float(take_profit))
-    )
-    sl_only_h2_high_h3_low = (
-        sl_only_h2_high & low_h3.lt(-float(stop_loss))
-    )
-    tp_only_h2_low_count = int(tp_only_h2_low.sum())
-    sl_only_h2_high_count = int(sl_only_h2_high.sum())
-    tp_only_h2_low_h3_high_count = int(tp_only_h2_low_h3_high.sum())
-    sl_only_h2_high_h3_low_count = int(sl_only_h2_high_h3_low.sum())
-    close_above_tp = both & close_h1.ge(float(take_profit))
-    close_below_sl = both & close_h1.le(-float(stop_loss))
-    close_between = both & ~(close_above_tp | close_below_sl)
-
-    def distribution(
-        series: pd.Series,
-        mask: pd.Series,
-        prefix: str,
-        quantile_name: str,
-        quantile: float,
-    ) -> dict[str, float]:
-        values = pd.to_numeric(series.loc[mask], errors="coerce").dropna()
-        if values.empty:
-            return {
-                f"{prefix}_mean": np.nan,
-                f"{prefix}_min": np.nan,
-                f"{prefix}_{quantile_name}": np.nan,
-                f"{prefix}_max": np.nan,
-            }
-        return {
-            f"{prefix}_mean": float(values.mean()),
-            f"{prefix}_min": float(values.min()),
-            f"{prefix}_{quantile_name}": float(values.quantile(quantile)),
-            f"{prefix}_max": float(values.max()),
-        }
-
-    path_distribution: dict[str, float] = {}
-    for group_prefix, group_mask in (
-        ("tp_only", tp_only),
-        ("sl_only", sl_only),
-    ):
-        for horizon, low_series, high_series in (
-            (2, low_h2, high_h2),
-            (3, low_h3, high_h3),
-        ):
-            path_distribution.update(
-                distribution(
-                    low_series,
-                    group_mask,
-                    f"{group_prefix}_low_h{horizon}",
-                    "q70",
-                    0.70,
-                )
-            )
-            path_distribution.update(
-                distribution(
-                    high_series,
-                    group_mask,
-                    f"{group_prefix}_high_h{horizon}",
-                    "q30",
-                    0.30,
-                )
-            )
-    return {
-        "split": split,
-        "signals": len(simulation),
-        "both_count": both_count,
-        "both_rate": (
-            float(both_count / len(simulation)) if len(simulation) else 0.0
-        ),
-        "close_above_tp_count": int(close_above_tp.sum()),
-        "close_above_tp_rate": (
-            float(close_above_tp.sum() / both_count) if both_count else 0.0
-        ),
-        "close_between_count": int(close_between.sum()),
-        "close_between_rate": (
-            float(close_between.sum() / both_count) if both_count else 0.0
-        ),
-        "close_below_sl_count": int(close_below_sl.sum()),
-        "close_below_sl_rate": (
-            float(close_below_sl.sum() / both_count) if both_count else 0.0
-        ),
-        "both_close_h1_mean": (
-            float(close_h1.loc[both].mean()) if both_count else np.nan
-        ),
-        "one_side_count": one_side_count,
-        "one_side_rate": (
-            float(one_side_count / len(simulation))
-            if len(simulation)
-            else 0.0
-        ),
-        "one_side_close_h3_mean": (
-            float(close_h3.loc[one_side].mean())
-            if one_side_count
-            else np.nan
-        ),
-        "tp_only_count": tp_only_count,
-        "tp_only_rate": (
-            float(tp_only_count / len(simulation))
-            if len(simulation)
-            else 0.0
-        ),
-        "tp_only_h2_low_h3_high_count": tp_only_h2_low_h3_high_count,
-        "tp_only_h2_low_count": tp_only_h2_low_count,
-        "tp_only_h2_low_h3_high_rate": (
-            float(tp_only_h2_low_h3_high_count / tp_only_h2_low_count)
-            if tp_only_h2_low_count
-            else 0.0
-        ),
-        "tp_only_close_h3_mean": (
-            float(close_h3.loc[tp_only].mean())
-            if tp_only_count
-            else np.nan
-        ),
-        "tp_only_close_h1_mean": (
-            float(close_h1.loc[tp_only].mean())
-            if tp_only_count
-            else np.nan
-        ),
-        "tp_only_close_h2_mean": (
-            float(close_h2.loc[tp_only].mean())
-            if tp_only_count
-            else np.nan
-        ),
-        "sl_only_count": sl_only_count,
-        "sl_only_rate": (
-            float(sl_only_count / len(simulation))
-            if len(simulation)
-            else 0.0
-        ),
-        "sl_only_h2_high_h3_low_count": sl_only_h2_high_h3_low_count,
-        "sl_only_h2_high_count": sl_only_h2_high_count,
-        "sl_only_h2_high_h3_low_rate": (
-            float(sl_only_h2_high_h3_low_count / sl_only_h2_high_count)
-            if sl_only_h2_high_count
-            else 0.0
-        ),
-        "sl_only_close_h3_mean": (
-            float(close_h3.loc[sl_only].mean())
-            if sl_only_count
-            else np.nan
-        ),
-        "sl_only_close_h1_mean": (
-            float(close_h1.loc[sl_only].mean())
-            if sl_only_count
-            else np.nan
-        ),
-        "sl_only_close_h2_mean": (
-            float(close_h2.loc[sl_only].mean())
-            if sl_only_count
-            else np.nan
-        ),
-        **path_distribution,
-        "neither_count": neither_count,
-        "neither_rate": (
-            float(neither_count / len(simulation))
-            if len(simulation)
-            else 0.0
-        ),
-        "neither_close_h3_mean": (
-            float(close_h3.loc[neither].mean())
-            if neither_count
-            else np.nan
-        ),
     }
 
 
@@ -537,6 +668,12 @@ def main_table(summary: pd.DataFrame) -> pd.DataFrame:
                 "TP": (
                     f"{int(row['tp_count']):,} "
                     f"({float(row['tp_rate']):.2%})"
+                ),
+                "TP min(high H2,H3)": (
+                    f"{float(row['tp_min_high_h2_h3']):+.3%}"
+                ),
+                "TP group mean close H3": (
+                    f"{float(row['tp_close_h3_mean']):+.3%}"
                 ),
                 "SL": (
                     f"{int(row['sl_count']):,} "
@@ -555,202 +692,57 @@ def main_table(summary: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def both_table(h1_both: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    for _, row in h1_both.iterrows():
-        rows.append(
-            {
-                "split": row["split"],
-                "H1 TP+SL / signals": (
-                    f"{int(row['both_count']):,}/{int(row['signals']):,} "
-                    f"({float(row['both_rate']):.2%})"
-                ),
-                "close H1 >= TP | both": (
-                    f"{int(row['close_above_tp_count']):,} "
-                    f"({float(row['close_above_tp_rate']):.2%})"
-                ),
-                "SL < close H1 < TP | both": (
-                    f"{int(row['close_between_count']):,} "
-                    f"({float(row['close_between_rate']):.2%})"
-                ),
-                "close H1 <= SL | both": (
-                    f"{int(row['close_below_sl_count']):,} "
-                    f"({float(row['close_below_sl_rate']):.2%})"
-                ),
-                "both mean close H1": (
-                    f"{float(row['both_close_h1_mean']):+.3%}"
-                ),
-                "H1 only TP or SL -> close H3": (
-                    f"{int(row['one_side_count']):,} "
-                    f"({float(row['one_side_rate']):.2%}) "
-                    f"mean={float(row['one_side_close_h3_mean']):+.3%}"
-                ),
-                "H1 neither TP nor SL -> close H3": (
-                    f"{int(row['neither_count']):,} "
-                    f"({float(row['neither_rate']):.2%}) "
-                    f"mean={float(row['neither_close_h3_mean']):+.3%}"
-                ),
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-def one_side_detail_table(h1_both: pd.DataFrame) -> pd.DataFrame:
-    """Show close-path means separately for H1 TP-only and SL-only groups."""
-    def distribution_text(
-        row: pd.Series,
-        metric_prefix: str,
-        quantile_name: str,
-    ) -> str:
-        keys = ("mean", "min", quantile_name, "max")
-        values = [row[f"{metric_prefix}_{key}"] for key in keys]
-        if any(pd.isna(value) for value in values):
-            return "n/a"
-        return "|".join(f"{float(value):+.3%}" for value in values)
-
-    rows: list[dict[str, str]] = []
-    for _, row in h1_both.iterrows():
-        for group, prefix in (("TP-only", "tp_only"), ("SL-only", "sl_only")):
-            rows.append(
-                {
-                    "split / H1 group": f"{row['split']} {group}",
-                    "n / signals": (
-                        f"{int(row[f'{prefix}_count']):,}/"
-                        f"{int(row['signals']):,} "
-                        f"({float(row[f'{prefix}_rate']):.2%})"
-                    ),
-                    "mean close H1": (
-                        f"{float(row[f'{prefix}_close_h1_mean']):+.3%}"
-                    ),
-                    "mean close H2": (
-                        f"{float(row[f'{prefix}_close_h2_mean']):+.3%}"
-                    ),
-                    "mean close H3": (
-                        f"{float(row[f'{prefix}_close_h3_mean']):+.3%}"
-                    ),
-                    "low H2 mean|min|Q70|max": (
-                        distribution_text(
-                            row,
-                            f"{prefix}_low_h2",
-                            "q70",
-                        )
-                    ),
-                    "low H3 mean|min|Q70|max": (
-                        distribution_text(
-                            row,
-                            f"{prefix}_low_h3",
-                            "q70",
-                        )
-                    ),
-                    "high H2 mean|min|Q30|max": (
-                        distribution_text(
-                            row,
-                            f"{prefix}_high_h2",
-                            "q30",
-                        )
-                    ),
-                    "high H3 mean|min|Q30|max": (
-                        distribution_text(
-                            row,
-                            f"{prefix}_high_h3",
-                            "q30",
-                        )
-                    ),
-                }
-            )
-    return pd.DataFrame(rows)
-
-
-def one_side_follow_through_table(h1_both: pd.DataFrame) -> pd.DataFrame:
-    """Measure H2-H3 follow-through within each H1 one-sided cohort."""
-    rows: list[dict[str, str]] = []
-    for _, row in h1_both.iterrows():
-        rows.append(
-            {
-                "split": row["split"],
-                "H1 TP-only AND low H2 < TP n": (
-                    f"{int(row['tp_only_h2_low_count']):,}"
-                ),
-                (
-                    "P(low H2 < TP AND high H3 > TP | "
-                    "H1 TP-only AND low H2 < TP)"
-                ): (
-                    f"{int(row['tp_only_h2_low_h3_high_count']):,}/"
-                    f"{int(row['tp_only_h2_low_count']):,} "
-                    f"({float(row['tp_only_h2_low_h3_high_rate']):.2%})"
-                ),
-                "H1 SL-only AND high H2 > -SL n": (
-                    f"{int(row['sl_only_h2_high_count']):,}"
-                ),
-                (
-                    "P(high H2 > -SL AND low H3 < -SL | "
-                    "H1 SL-only AND high H2 > -SL)"
-                ): (
-                    f"{int(row['sl_only_h2_high_h3_low_count']):,}/"
-                    f"{int(row['sl_only_h2_high_count']):,} "
-                    f"({float(row['sl_only_h2_high_h3_low_rate']):.2%})"
-                ),
-            }
-        )
-    return pd.DataFrame(rows)
+def optimized_table(
+    summary: pd.DataFrame,
+    take_profit: float,
+    stop_loss: float,
+) -> pd.DataFrame:
+    frame = main_table(summary)
+    frame.insert(1, "Val-opt TP", f"{float(take_profit):.3%}")
+    frame.insert(2, "Val-opt SL", f"{float(stop_loss):.3%}")
+    return frame
 
 
 def draw_report(
     summary: pd.DataFrame,
-    h1_both: pd.DataFrame,
     simulations: dict[str, pd.DataFrame],
+    optimized_summary: pd.DataFrame,
+    optimized_simulations: dict[str, pd.DataFrame],
+    optimized_take_profit: float,
+    optimized_stop_loss: float,
     output_path: Path,
     title: str,
 ) -> None:
     fig, axes = plt.subplots(
-        6,
+        5,
         1,
-        figsize=(27, 19),
-        gridspec_kw={
-            "height_ratios": [1.0, 1.0, 1.0, 0.9, 3.0, 1.7]
-        },
+        figsize=(27, 21),
+        gridspec_kw={"height_ratios": [1.0, 2.8, 1.0, 2.8, 1.5]},
         constrained_layout=True,
     )
-    for axis, frame, table_title in (
-        (axes[0], main_table(summary), "Fixed TP/SL strategy"),
-        (
-            axes[1],
-            both_table(h1_both),
-            "H1 touched both TP and SL",
-        ),
-        (
-            axes[2],
-            one_side_detail_table(h1_both),
-            "H1 one-sided touch: counterfactual close path",
-        ),
-        (
-            axes[3],
-            one_side_follow_through_table(h1_both),
-            "H1 one-sided touch: H2-H3 follow-through",
-        ),
-    ):
-        axis.axis("off")
-        table = axis.table(
-            cellText=frame.values,
-            colLabels=frame.columns,
-            cellLoc="center",
-            loc="center",
-        )
-        table.auto_set_font_size(False)
-        table.set_fontsize(7.4)
-        table.scale(1.0, 1.55)
-        for (row, _), cell in table.get_celld().items():
-            cell.set_edgecolor("#9ca3af")
-            if row == 0:
-                cell.set_facecolor("#1f2937")
-                cell.set_text_props(color="white", weight="bold")
-        axis.set_title(table_title, fontsize=11, pad=8)
+    frame = main_table(summary)
+    axes[0].axis("off")
+    table = axes[0].table(
+        cellText=frame.values,
+        colLabels=frame.columns,
+        cellLoc="center",
+        loc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(7.4)
+    table.scale(1.0, 1.55)
+    for (row, _), cell in table.get_celld().items():
+        cell.set_edgecolor("#9ca3af")
+        if row == 0:
+            cell.set_facecolor("#1f2937")
+            cell.set_text_props(color="white", weight="bold")
+    axes[0].set_title("Fixed TP/SL strategy", fontsize=11, pad=8)
 
     colors = {"val": "#2563eb", "test": "#dc2626"}
     for split, frame in simulations.items():
         ordered = frame.sort_index()
         cumulative = ordered["net_return"].cumsum()
-        axes[4].plot(
+        axes[1].plot(
             ordered.index,
             cumulative * 100.0,
             color=colors[split],
@@ -760,18 +752,66 @@ def draw_report(
                 f"end={float(cumulative.iloc[-1]) * 100.0:+.2f}%"
             ),
         )
-    axes[4].axhline(0.0, color="#4b5563", linestyle="--", linewidth=0.8)
-    axes[4].set_title("Fixed TP/SL cumulative net return")
-    axes[4].set_ylabel("Percentage points")
-    axes[4].grid(True, alpha=0.5)
-    axes[4].legend(frameon=False)
+    axes[1].axhline(0.0, color="#4b5563", linestyle="--", linewidth=0.8)
+    axes[1].set_title("Fixed TP/SL cumulative net return")
+    axes[1].set_ylabel("Percentage points")
+    axes[1].grid(True, alpha=0.5)
+    axes[1].legend(frameon=False)
+
+    optimized_frame = optimized_table(
+        optimized_summary,
+        optimized_take_profit,
+        optimized_stop_loss,
+    )
+    axes[2].axis("off")
+    optimized_artist = axes[2].table(
+        cellText=optimized_frame.values,
+        colLabels=optimized_frame.columns,
+        cellLoc="center",
+        loc="center",
+    )
+    optimized_artist.auto_set_font_size(False)
+    optimized_artist.set_fontsize(7.2)
+    optimized_artist.scale(1.0, 1.55)
+    for (row, _), cell in optimized_artist.get_celld().items():
+        cell.set_edgecolor("#9ca3af")
+        if row == 0:
+            cell.set_facecolor("#1f2937")
+            cell.set_text_props(color="white", weight="bold")
+    axes[2].set_title(
+        "Val-optimized TP/SL strategy (parameters applied unchanged to Test)",
+        fontsize=11,
+        pad=8,
+    )
+
+    for split, frame in optimized_simulations.items():
+        ordered = frame.sort_index()
+        cumulative = ordered["net_return"].cumsum()
+        axes[3].plot(
+            ordered.index,
+            cumulative * 100.0,
+            color=colors[split],
+            linewidth=1.1,
+            label=(
+                f"{split.upper()} n={len(ordered):,} | "
+                f"end={float(cumulative.iloc[-1]) * 100.0:+.2f}%"
+            ),
+        )
+    axes[3].axhline(0.0, color="#4b5563", linestyle="--", linewidth=0.8)
+    axes[3].set_title(
+        "Val-optimized TP/SL cumulative net return | "
+        f"TP={optimized_take_profit:.3%}, SL={optimized_stop_loss:.3%}"
+    )
+    axes[3].set_ylabel("Percentage points")
+    axes[3].grid(True, alpha=0.5)
+    axes[3].legend(frameon=False)
 
     combined = pd.concat(simulations.values()).sort_index()
     daily = pd.Series(1, index=combined.index).resample("D").sum()
-    axes[5].bar(daily.index, daily.to_numpy(), width=0.9, color="#f59e0b")
-    axes[5].set_title("Signals per day")
-    axes[5].set_ylabel("Signals")
-    axes[5].grid(True, axis="y", alpha=0.5)
+    axes[4].bar(daily.index, daily.to_numpy(), width=0.9, color="#f59e0b")
+    axes[4].set_title("Signals per day")
+    axes[4].set_ylabel("Signals")
+    axes[4].grid(True, axis="y", alpha=0.5)
 
     fig.suptitle(title, fontsize=12)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -784,19 +824,28 @@ def run(
 ) -> tuple[pd.DataFrame, pd.DataFrame, Path]:
     archive_path = Path(args.archive)
     data_path = Path(args.data)
+    filter_take_profit = (
+        float(args.take_profit)
+        if args.filter_take_profit is None
+        else float(args.filter_take_profit)
+    )
     metadata = load_archive_metadata(archive_path)
     mode = config.canonical_label_mode(metadata.get("label_mode"))
     direction = config.canonical_label_direction(
         metadata.get("label_direction")
     )
+    expected_direction = config.canonical_label_direction(
+        args.strategy_direction
+    )
     horizons = _archive_horizons(
         archive_path,
         fallback=[3],
-        label="5m Long MFE fixed TP/SL",
+        label=f"5m {expected_direction.title()} MFE fixed TP/SL",
     )
-    if mode != "mfe" or direction != "long" or horizons != [3]:
+    if mode != "mfe" or direction != expected_direction or horizons != [3]:
         raise ValueError(
-            "Archive must use mode=mfe, direction=long, horizons=[3]; got "
+            "Archive must use mode=mfe, "
+            f"direction={expected_direction}, horizons=[3]; got "
             f"mode={mode}, direction={direction}, horizons={horizons}."
         )
 
@@ -810,34 +859,70 @@ def run(
     )
     raw_df = load_ohlcv(data_path)
     purge_bars = config.purge_bars_for_horizons(horizons)
-    entry = _load_rank_entry(archive_path, spec.rank)
-    quality_index = _quality_train_index(
-        raw_df=raw_df,
-        spec=spec,
-        horizons=horizons,
-        val_start=args.val_start,
-        test_start=args.test_start,
-        test_end=args.test_end,
-        purge_bars=purge_bars,
-    )
-    feature_space = _cached_feature_space(
-        raw_df=raw_df,
+    model_cache_path = _trained_bundle_cache_path(
+        cache_dir=Path(args.model_cache_dir),
+        archive_path=archive_path,
         data_path=data_path,
-        required_windows=_required_windows_for_entries([entry]),
-        quality_index=quality_index,
-    )
-    bundle = _train_spec_bundle(
-        spec=spec,
-        entry=entry,
         raw_df=raw_df,
-        feature_space=feature_space,
+        spec=spec,
         horizons=horizons,
         val_start=args.val_start,
         test_start=args.test_start,
         test_end=args.test_end,
         purge_bars=purge_bars,
     )
-    path = make_price_path(raw_df, horizon=3)
+    legacy_model_cache_path = _trained_bundle_cache_path(
+        cache_dir=Path(args.model_cache_dir),
+        archive_path=archive_path,
+        data_path=data_path,
+        raw_df=raw_df,
+        spec=spec,
+        horizons=horizons,
+        val_start=args.val_start,
+        test_start=args.test_start,
+        test_end=args.test_end,
+        purge_bars=purge_bars,
+        include_top_fraction=True,
+    )
+    bundle = None
+    if not args.no_model_cache and not args.rebuild_model_cache:
+        bundle = _load_trained_bundle_cache(model_cache_path)
+        if bundle is None:
+            bundle = _load_trained_bundle_cache(legacy_model_cache_path)
+            if bundle is not None:
+                _save_trained_bundle_cache(model_cache_path, bundle)
+    if bundle is None:
+        entry = _load_rank_entry(archive_path, spec.rank)
+        quality_index = _quality_train_index(
+            raw_df=raw_df,
+            spec=spec,
+            horizons=horizons,
+            val_start=args.val_start,
+            test_start=args.test_start,
+            test_end=args.test_end,
+            purge_bars=purge_bars,
+        )
+        feature_space = _cached_feature_space(
+            raw_df=raw_df,
+            data_path=data_path,
+            required_windows=_required_windows_for_entries([entry]),
+            quality_index=quality_index,
+        )
+        bundle = _train_spec_bundle(
+            spec=spec,
+            entry=entry,
+            raw_df=raw_df,
+            feature_space=feature_space,
+            horizons=horizons,
+            val_start=args.val_start,
+            test_start=args.test_start,
+            test_end=args.test_end,
+            purge_bars=purge_bars,
+        )
+        if not args.no_model_cache:
+            _save_trained_bundle_cache(model_cache_path, bundle)
+    bundle = _bundle_with_top_fraction(bundle, spec.top_fraction)
+    path = make_price_path(raw_df, horizon=3, direction=direction)
     minute: pd.DataFrame | None = None
     if args.next_1m_tp_filter:
         selected_indexes = [
@@ -854,7 +939,6 @@ def run(
 
     simulations: dict[str, pd.DataFrame] = {}
     summary_rows: list[dict[str, Any]] = []
-    both_rows: list[dict[str, Any]] = []
     for split, signals in (("val", bundle.val), ("test", bundle.test)):
         selected_path = path.reindex(pd.Index(signals.selected_index))
         if args.next_1m_tp_filter:
@@ -868,10 +952,12 @@ def run(
                 simulation = simulate_next_1m_tp_oracle(
                     selected_path=selected_path,
                     minute=minute,
+                    filter_take_profit=filter_take_profit,
                     take_profit=float(args.take_profit),
                     stop_loss=float(args.stop_loss),
                     trade_cost=float(args.trade_cost),
                     same_candle_policy=args.same_candle_policy,
+                    direction=direction,
                 )
         else:
             simulation = simulate_fixed_tp_sl(
@@ -891,48 +977,158 @@ def run(
                 base_signal_count=len(selected_path),
             )
         )
-        both_rows.append(
-            summarize_h1_both(
-                split=split,
-                simulation=simulation,
-                take_profit=float(args.take_profit),
-                stop_loss=float(args.stop_loss),
-            )
-        )
 
     summary = pd.DataFrame(summary_rows)
-    h1_both = pd.DataFrame(both_rows)
+    tp_values = _parameter_grid(
+        args.optimize_tp_start,
+        args.optimize_tp_end,
+        args.optimize_tp_step,
+    )
+    sl_values = _parameter_grid(
+        args.optimize_sl_start,
+        args.optimize_sl_end,
+        args.optimize_sl_step,
+    )
+    optimized_take_profit, optimized_stop_loss, _ = optimize_tp_sl_on_val(
+        val_execution_path=simulations["val"],
+        trade_cost=float(args.trade_cost),
+        same_candle_policy=args.same_candle_policy,
+        tp_values=tp_values,
+        sl_values=sl_values,
+    )
+    logger.info(
+        "Val-optimal TP/SL | TP=%.4f%% SL=%.4f%% | grid=%dx%d",
+        optimized_take_profit * 100.0,
+        optimized_stop_loss * 100.0,
+        len(tp_values),
+        len(sl_values),
+    )
+    optimized_simulations: dict[str, pd.DataFrame] = {}
+    optimized_rows: list[dict[str, Any]] = []
+    for split, signals in (("val", bundle.val), ("test", bundle.test)):
+        optimized_simulation = simulate_fixed_tp_sl(
+            selected_path=simulations[split],
+            take_profit=optimized_take_profit,
+            stop_loss=optimized_stop_loss,
+            trade_cost=float(args.trade_cost),
+            same_candle_policy=args.same_candle_policy,
+        )
+        optimized_simulations[split] = optimized_simulation
+        optimized_rows.append(
+            summarize_split(
+                split=split,
+                simulation=optimized_simulation,
+                available_rows=len(signals.data),
+                prediction_threshold=float(signals.pred_threshold),
+                base_signal_count=len(signals.selected_index),
+            )
+        )
+    optimized_summary = pd.DataFrame(optimized_rows)
+    optimized_summary.attrs["take_profit"] = optimized_take_profit
+    optimized_summary.attrs["stop_loss"] = optimized_stop_loss
+    oracle_suffix = (
+        f"_next1m_filter{filter_take_profit * 100.0:.3f}pct"
+        if args.next_1m_tp_filter
+        else ""
+    )
     run_name = (
         f"{archive_path.stem}_r{spec.rank:02d}_top"
         f"{spec.top_fraction * 100.0:.0f}_fixed_tp"
         f"{float(args.take_profit) * 100.0:.3f}pct_sl"
         f"{float(args.stop_loss) * 100.0:.3f}pct_"
         f"{args.same_candle_policy}"
-        f"{'_next1m_oracle' if args.next_1m_tp_filter else ''}"
+        f"{oracle_suffix}"
     ).replace(".", "p")
     output_path = Path(args.out_dir) / f"{run_name}.png"
     title = (
-        "5m Long MFE H3 | fixed TP/SL through H1-H3 | "
+        f"5m {direction.title()} MFE H3 | fixed TP/SL through H1-H3 | "
         f"rank={spec.rank}, top={spec.top_fraction:.0%}, "
         f"TP=+{float(args.take_profit):.2%}, "
         f"SL=-{float(args.stop_loss):.2%}, "
         f"same-candle={args.same_candle_policy}, "
         f"cost={float(args.trade_cost):.3%}, "
         f"next-1m TP oracle={'ON' if args.next_1m_tp_filter else 'OFF'}"
+        + (
+            f", filter TP={filter_take_profit:.2%}"
+            if args.next_1m_tp_filter
+            else ""
+        )
     )
-    draw_report(summary, h1_both, simulations, output_path, title)
+    draw_report(
+        summary=summary,
+        simulations=simulations,
+        optimized_summary=optimized_summary,
+        optimized_simulations=optimized_simulations,
+        optimized_take_profit=optimized_take_profit,
+        optimized_stop_loss=optimized_stop_loss,
+        output_path=output_path,
+        title=title,
+    )
     logger.info("Saved report: %s", output_path)
-    return summary, h1_both, output_path
+    return summary, optimized_summary, output_path
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--archive", default=str(DEFAULT_ARCHIVE))
+def parse_args(
+    default_archive: Path = DEFAULT_ARCHIVE,
+    default_direction: str = "long",
+) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            f"Backtest the 5-minute {default_direction.title()} MFE H3 "
+            "strategy with a fixed execution table and Val-optimized TP/SL."
+        )
+    )
+    parser.add_argument("--archive", default=str(default_archive))
+    parser.add_argument(
+        "--strategy-direction",
+        choices=("long", "short"),
+        default=config.canonical_label_direction(default_direction),
+        help="Direction required from the archive and simulated by the strategy.",
+    )
     parser.add_argument("--rank", type=int, default=DEFAULT_RANK)
     parser.add_argument("--top-fraction", type=float, default=DEFAULT_TOP_FRACTION)
     parser.add_argument("--take-profit", type=float, default=DEFAULT_TAKE_PROFIT)
+    parser.add_argument(
+        "--filter-take-profit",
+        type=float,
+        default=DEFAULT_FILTER_TAKE_PROFIT,
+        help=(
+            "TP used only by H1 minute 1 look-ahead filtering. Defaults to "
+            "--take-profit when omitted."
+        ),
+    )
     parser.add_argument("--stop-loss", type=float, default=DEFAULT_STOP_LOSS)
     parser.add_argument("--trade-cost", type=float, default=DEFAULT_TRADE_COST)
+    parser.add_argument(
+        "--optimize-tp-start",
+        type=float,
+        default=DEFAULT_OPT_TP_START,
+    )
+    parser.add_argument(
+        "--optimize-tp-end",
+        type=float,
+        default=DEFAULT_OPT_TP_END,
+    )
+    parser.add_argument(
+        "--optimize-tp-step",
+        type=float,
+        default=DEFAULT_OPT_TP_STEP,
+    )
+    parser.add_argument(
+        "--optimize-sl-start",
+        type=float,
+        default=DEFAULT_OPT_SL_START,
+    )
+    parser.add_argument(
+        "--optimize-sl-end",
+        type=float,
+        default=DEFAULT_OPT_SL_END,
+    )
+    parser.add_argument(
+        "--optimize-sl-step",
+        type=float,
+        default=DEFAULT_OPT_SL_STEP,
+    )
     parser.add_argument(
         "--same-candle-policy",
         choices=("stop_first", "tp_first"),
@@ -952,19 +1148,50 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-start", default=config.TEST_START)
     parser.add_argument("--test-end", default=config.TEST_END)
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
+    parser.add_argument(
+        "--model-cache-dir",
+        default=str(DEFAULT_MODEL_CACHE_DIR),
+        help="Directory for persistent trained signal bundles.",
+    )
+    parser.add_argument(
+        "--no-model-cache",
+        action="store_true",
+        help="Do not read or write the persistent trained-model cache.",
+    )
+    parser.add_argument(
+        "--rebuild-model-cache",
+        action="store_true",
+        help="Retrain and overwrite the matching persistent cache entry.",
+    )
     return parser.parse_args()
 
 
-def main() -> None:
-    summary, h1_both, output_path = run(parse_args())
+def main(
+    default_archive: Path = DEFAULT_ARCHIVE,
+    default_direction: str = "long",
+) -> None:
+    summary, optimized_summary, output_path = run(
+        parse_args(
+            default_archive=default_archive,
+            default_direction=default_direction,
+        )
+    )
     print("\n=== Fixed TP/SL strategy ===")
     print(main_table(summary).to_string(index=False))
-    print("\n=== H1 touched both TP and SL ===")
-    print(both_table(h1_both).to_string(index=False))
-    print("\n=== H1 TP-only / SL-only close path ===")
-    print(one_side_detail_table(h1_both).to_string(index=False))
-    print("\n=== H1 TP-only / SL-only H2-H3 follow-through ===")
-    print(one_side_follow_through_table(h1_both).to_string(index=False))
+    optimized_tp = float(
+        optimized_summary.attrs.get("take_profit", np.nan)
+    )
+    optimized_sl = float(
+        optimized_summary.attrs.get("stop_loss", np.nan)
+    )
+    print("\n=== Val-optimized TP/SL strategy ===")
+    print(
+        optimized_table(
+            optimized_summary,
+            optimized_tp,
+            optimized_sl,
+        ).to_string(index=False)
+    )
     print(f"\nSaved: {output_path}")
 
 

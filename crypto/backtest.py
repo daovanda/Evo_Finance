@@ -164,6 +164,7 @@ class BundleSignals:
     test: SplitSignals
     val_horizons: tuple[SplitSignals, ...] = ()
     test_horizons: tuple[SplitSignals, ...] = ()
+    models: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -540,7 +541,7 @@ def _train_spec_bundle(
         purge_bars=purge_bars,
     )
 
-    horizon_results: list[tuple[int, SplitSignals, SplitSignals]] = []
+    horizon_results: list[tuple[int, SplitSignals, SplitSignals, Any]] = []
     for horizon in horizons:
         result = _train_one_horizon_signal(
             individual=individual,
@@ -552,7 +553,10 @@ def _train_spec_bundle(
             top_fraction=spec.top_fraction,
         )
         if result is not None:
-            horizon_results.append(result)
+            if len(result) == 3:
+                horizon_results.append((*result, None))
+            else:
+                horizon_results.append(result)
 
     if not horizon_results:
         raise ValueError(
@@ -565,13 +569,14 @@ def _train_spec_bundle(
         f"thr={spec.label_threshold:.4g} top={spec.top_fraction:.0%}"
     )
     if len(horizon_results) == 1:
-        _, val, test = horizon_results[0]
+        _, val, test, model = horizon_results[0]
         return BundleSignals(
             label=label,
             val=val,
             test=test,
             val_horizons=(val,),
             test_horizons=(test,),
+            models=(model,),
         )
 
     val_horizons = tuple(item[1] for item in horizon_results)
@@ -592,6 +597,7 @@ def _train_spec_bundle(
         test=test,
         val_horizons=val_horizons,
         test_horizons=test_horizons,
+        models=tuple(item[3] for item in horizon_results),
     )
 
 
@@ -603,7 +609,7 @@ def _train_one_horizon_signal(
     test_df: pd.DataFrame,
     feature_space: CryptoFeatureSpace,
     top_fraction: float,
-) -> tuple[int, SplitSignals, SplitSignals] | None:
+) -> tuple[int, SplitSignals, SplitSignals, Any] | None:
     label_col = f"label_h{horizon}"
     ret_col = f"future_return_h{horizon}"
     train = _valid_frame(train_df, label_col, ret_col)
@@ -641,7 +647,7 @@ def _train_one_horizon_signal(
         top_fraction=top_fraction,
         pred_threshold=val_signal.pred_threshold,
     )
-    return horizon, val_signal, test_signal
+    return horizon, val_signal, test_signal, booster
 
 
 def _split_signals(

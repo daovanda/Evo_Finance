@@ -51,27 +51,39 @@ def _resolve_env_path(path: str | Path) -> Path:
     return path
 
 
-def telegram_enabled() -> bool:
+def telegram_enabled(
+    enabled_env: str = trade_config.TELEGRAM_NOTIFY_ENV,
+) -> bool:
     load_env_file()
-    value = os.getenv(trade_config.TELEGRAM_NOTIFY_ENV, "1").strip().lower()
+    value = os.getenv(enabled_env, "1").strip().lower()
     return value not in {"0", "false", "no", "off"}
 
 
-def telegram_configured() -> bool:
+def telegram_configured(
+    token_env: str = trade_config.TELEGRAM_BOT_TOKEN_ENV,
+    chat_id_env: str = trade_config.TELEGRAM_CHAT_ID_ENV,
+) -> bool:
     load_env_file()
     return bool(
-        os.getenv(trade_config.TELEGRAM_BOT_TOKEN_ENV)
-        and os.getenv(trade_config.TELEGRAM_CHAT_ID_ENV)
+        os.getenv(token_env)
+        and os.getenv(chat_id_env)
     )
 
 
-def send_telegram_message(text: str, timeout: float = 15.0) -> dict[str, Any]:
+def send_telegram_message(
+    text: str,
+    timeout: float = 15.0,
+    *,
+    token_env: str = trade_config.TELEGRAM_BOT_TOKEN_ENV,
+    chat_id_env: str = trade_config.TELEGRAM_CHAT_ID_ENV,
+    enabled_env: str = trade_config.TELEGRAM_NOTIFY_ENV,
+) -> dict[str, Any]:
     load_env_file()
-    if not telegram_enabled():
+    if not telegram_enabled(enabled_env):
         return {"ok": False, "skipped": True, "reason": "disabled"}
 
-    token = os.getenv(trade_config.TELEGRAM_BOT_TOKEN_ENV)
-    chat_id = os.getenv(trade_config.TELEGRAM_CHAT_ID_ENV)
+    token = os.getenv(token_env)
+    chat_id = os.getenv(chat_id_env)
     if not token or not chat_id:
         return {"ok": False, "skipped": True, "reason": "missing_credentials"}
 

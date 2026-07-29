@@ -1118,3 +1118,127 @@ Payload luon co:
 
 Khong chay `crypto.prod.trader` trong che do nay. Backend chi doc du lieu
 thi truong va gui tin hieu, khong can Binance API key va khong dat lenh.
+
+## 18. Exness 5m Long/Short MFE, Telegram only
+
+Backend rieng:
+
+```text
+crypto/prod/backend_exness_5m.py
+```
+
+Backend nay chi dung du lieu Binance public, khong goi `trader.py`, khong can
+Binance API key va khong dat lenh. Telegram chi duoc gui khi model Long hoac
+Short co tin hieu. Nen khong co tin hieu van duoc ghi vao:
+
+```text
+crypto/prod/live/latest_exness_5m_signal.json
+```
+
+### Bien `.env`
+
+```dotenv
+TELEGRAM_BOT_TOKEN_EXNESS_5M=your_bot_token
+TELEGRAM_CHAT_ID_EXNESS_5M=your_chat_id
+```
+
+### Train model production Long va Short
+
+Nguong live lay top 40% tren Val va ap nguyen cutoff Val vao du lieu moi:
+
+```powershell
+python -m crypto.prod.train_model `
+  --archive crypto/results/crypto_btc_5m_long_mfe_h3_tp01_top40_seed1_8h.json `
+  --data data/crypto/BTCUSDT_5m.csv `
+  --rank 1 `
+  --label-mode mfe `
+  --label-direction Long `
+  --label-threshold 0.001 `
+  --trade-top-fraction 0.40 `
+  --run-name exness_5m_long_mfe_r1
+
+python -m crypto.prod.train_model `
+  --archive crypto/results/crypto_btc_short_mfe_h3_tp01_top40_seed1_8h.json `
+  --data data/crypto/BTCUSDT_5m.csv `
+  --rank 1 `
+  --label-mode mfe `
+  --label-direction Short `
+  --label-threshold 0.001 `
+  --trade-top-fraction 0.40 `
+  --run-name exness_5m_short_mfe_r1
+```
+
+Kiem tra hai manifest co:
+
+```text
+config.horizons = [3]
+config.trade_top_fraction = 0.40
+entries[0].label_mode = "mfe"
+models[0].trade_top_fraction = 0.40
+models[0].val_trade_threshold
+```
+
+### Test Telegram rieng
+
+```powershell
+python -m crypto.prod.backend_exness_5m --telegram-test --force-ipv4
+```
+
+### Chay mot lan local, khong gui Telegram
+
+```powershell
+python -m crypto.prod.backend_exness_5m `
+  --long-model-dir crypto/prod/model/exness_5m_long_mfe_r1 `
+  --short-model-dir crypto/prod/model/exness_5m_short_mfe_r1 `
+  --data data/crypto/BTCUSDT_5m.csv `
+  --base-url https://data-api.binance.vision `
+  --force-ipv4 `
+  --no-telegram
+```
+
+### Chay loop local
+
+```powershell
+python -m crypto.prod.backend_exness_5m `
+  --long-model-dir crypto/prod/model/exness_5m_long_mfe_r1 `
+  --short-model-dir crypto/prod/model/exness_5m_short_mfe_r1 `
+  --data data/crypto/BTCUSDT_5m.csv `
+  --base-url https://data-api.binance.vision `
+  --force-ipv4 `
+  --exness-price-offset 80 `
+  --loop `
+  --sleep-after-open 5
+```
+
+### Chay loop tren VM va ghi log
+
+```bash
+cd ~/Evo_Finance
+source .venv/bin/activate
+
+python -m crypto.prod.backend_exness_5m \
+  --long-model-dir crypto/prod/model/exness_5m_long_mfe_r1 \
+  --short-model-dir crypto/prod/model/exness_5m_short_mfe_r1 \
+  --data data/crypto/BTCUSDT_5m.csv \
+  --base-url https://data-api.binance.vision \
+  --force-ipv4 \
+  --exness-price-offset 80 \
+  --loop \
+  --sleep-after-open 5 \
+  2>&1 | tee crypto/prod/live/backend_exness_5m.log
+```
+
+Moi tin Telegram co:
+
+- score va trang thai signal Long/Short;
+- top fraction va label threshold cua tung model;
+- prediction threshold Val cua H3;
+- Binance open cua nen entry;
+- gia Exness uoc tinh bang gia Binance tru `--exness-price-offset` (mac dinh
+  `80`);
+- trigger Long/Short `0.025%` trong phut dau;
+- TP `1%`, SL `0%`;
+- xac nhan `Execution: disabled`.
+
+Backend gui mot ban cap nhat sau moi nen 5 phut, ke ca khi ket qua la
+`NO_SIGNAL`. Khoa chong trung dam bao cung mot nen chi duoc gui mot lan.

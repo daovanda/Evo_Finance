@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from crypto import config
+from crypto.analyze import _required_windows_for_entries
 from crypto.data import add_binary_labels, load_ohlcv, split_labeled_by_dates
 from crypto.expression import CryptoFeatureSpace
 from crypto.features import build_feature_frame, selectable_features
@@ -62,9 +63,11 @@ def train_from_archive(
     label_direction: str | None = None,
     label_threshold: float | None = None,
     exit_after_k: int | None = None,
+    trade_top_fraction: float = config.TRADE_TOP_FRACTION,
 ) -> Path:
     """Train one LightGBM model per selected individual and horizon."""
     config.validate_config()
+    trade_top_fraction = _validate_trade_top_fraction(trade_top_fraction)
     archive_path = Path(archive_path)
     horizons = _archive_horizons(archive_path)
     selected_entries = _filter_entries(
@@ -113,8 +116,17 @@ def train_from_archive(
         purge_bars,
     )
 
-    logger.info("Building crypto feature matrix; quality filter uses final train rows.")
-    feature_df = build_feature_frame(raw_df, quality_index=train_df.index)
+    required_windows = _required_windows_for_entries(selected_entries)
+    logger.info(
+        "Building crypto feature matrix; quality filter uses final train rows "
+        "| windows=%s",
+        required_windows,
+    )
+    feature_df = build_feature_frame(
+        raw_df,
+        windows=required_windows,
+        quality_index=train_df.index,
+    )
     feature_pool = selectable_features(feature_df)
     feature_space = CryptoFeatureSpace(feature_df, feature_pool)
 
@@ -134,6 +146,8 @@ def train_from_archive(
             label_threshold=float(label_threshold),
             exit_after_k=exit_after_k,
             horizons=horizons,
+            trade_top_fraction=trade_top_fraction,
+            feature_windows=required_windows,
         ),
         "entries": [],
     }
@@ -177,6 +191,7 @@ def train_from_archive(
                 val_df=val_df,
                 feature_space=feature_space,
                 model_dir=model_dir,
+                trade_top_fraction=trade_top_fraction,
             )
             entry_record["models"].append(model_record)
         manifest["entries"].append(entry_record)
@@ -202,11 +217,13 @@ def train_ensemble_from_specs(
     default_label_direction: str | None = None,
     default_label_threshold: float | None = None,
     default_exit_after_k: int | None = None,
+    trade_top_fraction: float = config.TRADE_TOP_FRACTION,
 ) -> Path:
     """Train one production model bundle from archive/rank specs."""
     if len(specs) < 1:
         raise ValueError("Need at least one ensemble individual spec.")
     config.validate_config()
+    trade_top_fraction = _validate_trade_top_fraction(trade_top_fraction)
     run_name = run_name or "crypto_ensemble"
     default_label_mode = config.canonical_label_mode(default_label_mode)
     default_exit_after_k = config.resolve_exit_after_k(
@@ -276,6 +293,7 @@ def train_ensemble_from_specs(
             label_direction=default_label_direction,
             label_threshold=default_label_threshold,
             exit_after_k=default_exit_after_k,
+            trade_top_fraction=trade_top_fraction,
         ),
         "entries": [],
         "ensemble": {
@@ -357,6 +375,7 @@ def train_ensemble_from_specs(
                 feature_space=feature_space,
                 model_dir=model_dir,
                 entry_id=entry_id,
+                trade_top_fraction=trade_top_fraction,
             )
             model_record["label_mode"] = label_mode
             model_record["label_direction"] = label_direction
@@ -383,6 +402,7 @@ def _train_one_horizon(
     feature_space: CryptoFeatureSpace,
     model_dir: Path,
     entry_id: str | None = None,
+    trade_top_fraction: float = config.TRADE_TOP_FRACTION,
 ) -> dict[str, Any]:
     label_col = f"label_h{horizon}"
     ret_col = f"future_return_h{horizon}"
@@ -407,7 +427,11 @@ def _train_one_horizon(
         if len(X_val)
         else pd.Series(dtype=float)
     )
-    val_trade_threshold = _top_prediction_threshold(val_pred)
+    trade_top_fraction = _validate_trade_top_fraction(trade_top_fraction)
+    val_trade_threshold = _top_prediction_threshold(
+        val_pred,
+        trade_top_fraction=trade_top_fraction,
+    )
     val_score_band_cutoffs = _score_band_cutoffs(val_pred)
     model_name = (
         f"{_safe_name(entry_id)}_h{horizon}.txt"
@@ -436,26 +460,37 @@ def _train_one_horizon(
         "val_trade_threshold": val_trade_threshold,
         "val_score_band_cutoffs": val_score_band_cutoffs,
         "score_band_fractions": list(SCORE_BAND_FRACTIONS),
-        "trade_top_fraction": float(config.TRADE_TOP_FRACTION),
+        "trade_top_fraction": float(trade_top_fraction),
         "min_trades_per_split": int(config.MIN_TRADES_PER_SPLIT),
         "best_iteration": int(booster.best_iteration or config.LGBM_NUM_BOOST_ROUND),
     }
 
 
-def _top_prediction_threshold(pred: pd.Series) -> float | None:
+def _top_prediction_threshold(
+    pred: pd.Series,
+    trade_top_fraction: float = config.TRADE_TOP_FRACTION,
+) -> float | None:
     pred = (
         pd.to_numeric(pred, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
     )
     if pred.empty:
         return None
+    trade_top_fraction = _validate_trade_top_fraction(trade_top_fraction)
     n_select = min(
         len(pred),
         max(
             int(config.MIN_TRADES_PER_SPLIT),
-            int(np.ceil(len(pred) * float(config.TRADE_TOP_FRACTION))),
+            int(np.ceil(len(pred) * float(trade_top_fraction))),
         ),
     )
     return float(pred.nlargest(n_select).min())
+
+
+def _validate_trade_top_fraction(value: float) -> float:
+    fraction = float(value)
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError("trade_top_fraction must be in (0, 1].")
+    return fraction
 
 
 def _score_band_cutoffs(pred: pd.Series) -> dict[str, float | None]:
@@ -630,6 +665,8 @@ def _config_snapshot(
     label_threshold: float,
     exit_after_k: int | None = None,
     horizons: list[int] | None = None,
+    trade_top_fraction: float = config.TRADE_TOP_FRACTION,
+    feature_windows: list[int] | None = None,
 ) -> dict[str, Any]:
     return {
         "horizons": list(horizons or config.HOLDING_HORIZONS),
@@ -648,12 +685,17 @@ def _config_snapshot(
         ),
         "safe_path_rule": config.SAFE_PATH_RULE,
         "precision_only": config.is_precision_only_label_mode(label_mode),
+        "trade_top_fraction": float(
+            _validate_trade_top_fraction(trade_top_fraction)
+        ),
         "trade_cost": float(config.TRADE_COST),
         "val_start": val_start,
         "test_start": test_start,
         "test_end": test_end,
         "purge_bars": int(purge_bars),
-        "feature_windows": list(config.WINDOWS),
+        "feature_windows": list(
+            config.WINDOWS if feature_windows is None else feature_windows
+        ),
         "feature_corr_threshold": float(config.FEATURE_CORR_THRESHOLD),
         "lgbm_params": dict(config.LGBM_PARAMS),
         "lgbm_num_boost_round": int(config.LGBM_NUM_BOOST_ROUND),
@@ -858,6 +900,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--trade-top-fraction",
+        type=float,
+        default=config.TRADE_TOP_FRACTION,
+        help=(
+            "Top fraction of Val predictions used to create the production "
+            "signal threshold. Stored in manifest.json."
+        ),
+    )
+    parser.add_argument(
         "--exit-after-k",
         type=int,
         default=None,
@@ -882,6 +933,7 @@ def main() -> None:
             default_label_direction=args.label_direction,
             default_label_threshold=args.label_threshold,
             default_exit_after_k=args.exit_after_k,
+            trade_top_fraction=args.trade_top_fraction,
         )
     else:
         if not args.archive:
@@ -902,6 +954,7 @@ def main() -> None:
             label_direction=args.label_direction,
             label_threshold=args.label_threshold,
             exit_after_k=args.exit_after_k,
+            trade_top_fraction=args.trade_top_fraction,
         )
     logger.info("Done. Manifest: %s", manifest_path)
 
