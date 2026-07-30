@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 from crypto.prod.live_backend import (
+    _atomic_write_csv,
     _entry_score_band_index,
     _lst_strategy_signal,
     _prediction_score_band_index,
@@ -17,6 +18,18 @@ from crypto.prod.train_model import (
 
 
 class ProductionScoreBandTests(unittest.TestCase):
+    def test_atomic_csv_write_replaces_complete_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "prices.csv"
+            path.write_text("old\n1\n", encoding="utf-8")
+            expected = pd.DataFrame({"date": ["2026-01-01"], "close": [100.0]})
+
+            _atomic_write_csv(path, expected)
+
+            actual = pd.read_csv(path)
+            pd.testing.assert_frame_equal(actual, expected)
+            self.assertEqual(list(Path(tmp).glob("*.tmp")), [])
+
     def test_score_band_cutoffs_match_disjoint_top_fractions(self):
         pred = pd.Series(range(1, 101), dtype=float)
 

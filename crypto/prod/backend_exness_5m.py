@@ -91,7 +91,10 @@ DEFAULT_NOTIFY_STATE_PATH = Path(
 DEFAULT_INTERVAL = "5m"
 DEFAULT_FILTER_TRIGGER = 0.00025
 DEFAULT_TAKE_PROFIT = 0.01
-DEFAULT_STOP_LOSS = 0.0
+DEFAULT_STOP_LOSS = 0.00025
+DEFAULT_PENDING_SECONDS = 60
+DEFAULT_RETRACE_SECONDS = 60
+DEFAULT_MAX_HOLD_SECONDS = 15 * 60
 DEFAULT_EXNESS_PRICE_OFFSET = 80.0
 TELEGRAM_TOKEN_ENV = "TELEGRAM_BOT_TOKEN_EXNESS_5M"
 TELEGRAM_CHAT_ID_ENV = "TELEGRAM_CHAT_ID_EXNESS_5M"
@@ -233,13 +236,17 @@ def run_once(
         "short_signal": short_signal,
         "strategy": {
             "filter_first_1m": float(filter_trigger),
+            "pending_seconds": DEFAULT_PENDING_SECONDS,
+            "retrace_seconds_after_trigger": DEFAULT_RETRACE_SECONDS,
+            "max_hold_seconds": DEFAULT_MAX_HOLD_SECONDS,
             "long_trigger_price": long_trigger_price,
             "long_trigger_price_exness": long_trigger_price - price_offset,
             "short_trigger_price": short_trigger_price,
             "short_trigger_price_exness": short_trigger_price - price_offset,
             "exness_price_offset": price_offset,
             "take_profit": float(take_profit),
-            "stop_loss": float(stop_loss),
+            "stop_loss_rule": "managed_by_executor_open_h1_directional_offset",
+            "legacy_stop_loss_arg_ignored_by_executor": float(stop_loss),
             "manual_execution": True,
         },
         "models": states,

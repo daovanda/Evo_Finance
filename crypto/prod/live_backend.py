@@ -546,6 +546,36 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
     raise last_exc if last_exc is not None else PermissionError(f"Could not replace {path}")
 
 
+def _atomic_write_csv(path: Path, frame: pd.DataFrame) -> None:
+    """Write a complete CSV before replacing the live data file.
+
+    Windows can transiently reject opening/replacing a large CSV while
+    another process, an editor, or antivirus software has a handle on it.
+    A PID-specific temporary file also prevents readers from seeing a
+    partially written OHLCV history.
+    """
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    frame.to_csv(tmp_path, index=False)
+    last_exc: OSError | None = None
+    try:
+        for attempt in range(20):
+            try:
+                tmp_path.replace(path)
+                return
+            except OSError as exc:
+                last_exc = exc
+                time.sleep(0.05 * (attempt + 1))
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+    raise last_exc if last_exc is not None else OSError(
+        f"Could not replace {path}"
+    )
+
+
 def _fmt_value(value: Any, digits: int) -> str:
     if value is None:
         return ""
@@ -594,7 +624,7 @@ def refresh_local_ohlcv(
     new_df = _completed_candles_only(new_df, interval=interval)
     merged = _merge_ohlcv(old_df, new_df)
     data_path.parent.mkdir(parents=True, exist_ok=True)
-    merged.to_csv(data_path, index=False)
+    _atomic_write_csv(data_path, merged)
 
     info = {
         "old_rows": int(len(old_df)),

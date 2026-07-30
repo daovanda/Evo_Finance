@@ -1237,8 +1237,77 @@ Moi tin Telegram co:
 - gia Exness uoc tinh bang gia Binance tru `--exness-price-offset` (mac dinh
   `80`);
 - trigger Long/Short `0.025%` trong phut dau;
-- TP `1%`, SL `0%`;
+- TP `1%`; executor dat SL Long tai `open H1 - 10` va SL Short tai
+  `open H1 + 10`;
 - xac nhan `Execution: disabled`.
 
 Backend gui mot ban cap nhat sau moi nen 5 phut, ke ca khi ket qua la
 `NO_SIGNAL`. Khoa chong trung dam bao cung mot nen chi duoc gui mot lan.
+
+## Exness MT5 5m executor (demo only)
+
+The MT5 executor is separate from `backend_exness_5m`. Keep the Exness MT5
+desktop terminal open and logged in on the same Windows machine.
+
+Required `.env` values:
+
+```dotenv
+EXNESS_MT5_TERMINAL_PATH=C:\Program Files\MetaTrader 5 EXNESS\terminal64.exe
+EXNESS_MT5_SYMBOL=BTCUSDm
+EXNESS_MT5_DEMO_ONLY=true
+EXNESS_MT5_EXECUTION_ENABLED=false
+EXNESS_MT5_LIVE_TRADING_ENABLED=false
+EXNESS_MT5_TEST_VOLUME=0.01
+EXNESS_MT5_MAGIC=5100501
+EXNESS_MT5_MAX_OPEN_POSITIONS=4
+```
+
+Start the signal producer:
+
+```powershell
+python -m crypto.prod.backend_exness_5m `
+  --long-model-dir crypto/prod/model/exness_5m_long_mfe_r1 `
+  --short-model-dir crypto/prod/model/exness_5m_short_mfe_r1 `
+  --data data/crypto/BTCUSDT_5m.csv `
+  --base-url https://data-api.binance.vision `
+  --force-ipv4 `
+  --loop `
+  --sleep-after-open 5
+```
+
+Run the executor in dry-run mode:
+
+```powershell
+python -m crypto.prod.exness_mt5_executor `
+  --volume 0.01 `
+  --trigger 0.00025 `
+  --max-entry-slippage 0.0001 `
+  --take-profit 0.01 `
+  --stop-loss-offset 10 `
+  --pending-seconds 60 `
+  --retrace-seconds 60 `
+  --max-hold-seconds 900 `
+  --poll-seconds 1 `
+  --loop
+```
+
+Demo orders require both `EXNESS_MT5_EXECUTION_ENABLED=true` and
+`--execute-demo`. The executor rejects live accounts. Long SL is the Exness
+open H1 minus `--stop-loss-offset`; Short SL is open H1 plus that offset.
+Execution is blocked
+when the open-H1-to-trigger distance is not wider than the current spread.
+The MT5 account must use Hedging mode. Netting accounts are rejected because
+they merge opposite and repeated positions, which is incompatible with the
+per-signal state machine. A process lock also prevents two executors from
+using the same state file at once.
+
+Entry never chases beyond the configured band. Before the trigger is crossed,
+the executor uses a Buy Stop or Sell Stop at the open-H1 trigger and sets the
+maximum accepted deviation to `0.01%` (about `0.035%` from open H1 when the
+trigger is `0.025%`). If the trigger was already crossed before the signal
+snapshot was read, it enters at market only while price is still inside that
+band. If price has already exceeded the cap, it waits with a Buy Limit or Sell
+Limit at the cap for a retrace. If no trigger is observed during the initial
+60 seconds, the order is cancelled. If the trigger is observed during those
+60 seconds but the entry remains unfilled, the order receives one additional
+60-second retrace window and is cancelled at second 120 if still unfilled.
