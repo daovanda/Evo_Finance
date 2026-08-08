@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from crypto.prod.exness_mt5_executor import (
     BrokerConfig,
+    EntryStopAlreadyBreached,
     Strategy,
     _assert_no_orphaned_managed_trades,
     _broker_reconcile_ready,
@@ -19,6 +20,7 @@ from crypto.prod.exness_mt5_executor import (
     _signal_sides,
     _tick_crossed_trigger,
     _trigger_price,
+    _validate_live_strategy,
 )
 
 
@@ -286,6 +288,72 @@ class ExnessMt5ExecutorTests(unittest.TestCase):
         self.assertEqual(request["type"], mt5.ORDER_TYPE_BUY_LIMIT)
         self.assertAlmostEqual(request["price"], cap, places=4)
 
+    def test_long_retrace_is_rejected_after_intended_stop_was_crossed(self):
+        strategy = Strategy(
+            volume=0.01,
+            trigger_pct=0.00025,
+            max_entry_slippage_pct=0.0001,
+            take_profit_pct=0.01,
+            stop_loss_price_offset=10.0,
+            pending_seconds=60,
+            retrace_seconds=60,
+            max_hold_seconds=900,
+            deviation_points=100,
+        )
+        broker = BrokerConfig("", "BTCUSDm", 1, True, False, False, 4)
+        with self.assertRaisesRegex(
+            EntryStopAlreadyBreached,
+            "market crossed SL",
+        ):
+            _retrace_request_for_tick(
+                SimpleNamespace(),
+                broker=broker,
+                strategy=strategy,
+                info=SimpleNamespace(
+                    digits=2,
+                    trade_tick_size=0.01,
+                    point=0.01,
+                ),
+                tick=SimpleNamespace(ask=89.0, bid=88.9),
+                side="long",
+                open_h1=100.0,
+                trigger=100.025,
+                comment="test",
+            )
+
+    def test_short_retrace_is_rejected_after_intended_stop_was_crossed(self):
+        strategy = Strategy(
+            volume=0.01,
+            trigger_pct=0.00025,
+            max_entry_slippage_pct=0.0001,
+            take_profit_pct=0.01,
+            stop_loss_price_offset=10.0,
+            pending_seconds=60,
+            retrace_seconds=60,
+            max_hold_seconds=900,
+            deviation_points=100,
+        )
+        broker = BrokerConfig("", "BTCUSDm", 1, True, False, False, 4)
+        with self.assertRaisesRegex(
+            EntryStopAlreadyBreached,
+            "market crossed SL",
+        ):
+            _retrace_request_for_tick(
+                SimpleNamespace(),
+                broker=broker,
+                strategy=strategy,
+                info=SimpleNamespace(
+                    digits=2,
+                    trade_tick_size=0.01,
+                    point=0.01,
+                ),
+                tick=SimpleNamespace(ask=111.0, bid=110.9),
+                side="short",
+                open_h1=100.0,
+                trigger=99.975,
+                comment="test",
+            )
+
     def test_entry_deal_reconciliation_matches_order_or_comment(self):
         now = datetime(2026, 7, 30, tzinfo=timezone.utc)
         matching = SimpleNamespace(
@@ -451,6 +519,102 @@ class ExnessMt5ExecutorTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Hedging"):
             _initialize(mt5, broker, execute_demo=True)
 
+    def test_live_execution_accepts_allowlisted_real_hedging_account(self):
+        terminal = SimpleNamespace(
+            connected=True,
+            trade_allowed=True,
+            tradeapi_disabled=False,
+        )
+        account = SimpleNamespace(
+            login=218674896,
+            trade_mode=2,
+            margin_mode=2,
+        )
+        mt5 = SimpleNamespace(
+            ACCOUNT_TRADE_MODE_REAL=2,
+            ACCOUNT_MARGIN_MODE_RETAIL_HEDGING=2,
+            initialize=lambda *args, **kwargs: True,
+            terminal_info=lambda: terminal,
+            account_info=lambda: account,
+            symbol_select=lambda *args, **kwargs: True,
+            last_error=lambda: (1, "Success"),
+        )
+        broker = BrokerConfig(
+            "",
+            "BTCUSDm",
+            1,
+            False,
+            True,
+            True,
+            4,
+            live_account_login=218674896,
+            live_max_volume=0.01,
+        )
+        self.assertIs(
+            _initialize(mt5, broker, execute_live=True),
+            account,
+        )
+
+    def test_live_execution_rejects_wrong_account_login(self):
+        terminal = SimpleNamespace(
+            connected=True,
+            trade_allowed=True,
+            tradeapi_disabled=False,
+        )
+        account = SimpleNamespace(
+            login=999,
+            trade_mode=2,
+            margin_mode=2,
+        )
+        mt5 = SimpleNamespace(
+            ACCOUNT_TRADE_MODE_REAL=2,
+            ACCOUNT_MARGIN_MODE_RETAIL_HEDGING=2,
+            initialize=lambda *args, **kwargs: True,
+            terminal_info=lambda: terminal,
+            account_info=lambda: account,
+            symbol_select=lambda *args, **kwargs: True,
+            last_error=lambda: (1, "Success"),
+        )
+        broker = BrokerConfig(
+            "",
+            "BTCUSDm",
+            1,
+            False,
+            True,
+            True,
+            4,
+            live_account_login=218674896,
+            live_max_volume=0.01,
+        )
+        with self.assertRaisesRegex(RuntimeError, "login mismatch"):
+            _initialize(mt5, broker, execute_live=True)
+
+    def test_live_volume_cannot_exceed_configured_ceiling(self):
+        broker = BrokerConfig(
+            "",
+            "BTCUSDm",
+            1,
+            False,
+            True,
+            True,
+            4,
+            live_account_login=218674896,
+            live_max_volume=0.01,
+        )
+        strategy = Strategy(
+            volume=0.02,
+            trigger_pct=0.00025,
+            max_entry_slippage_pct=0.0001,
+            take_profit_pct=0.01,
+            stop_loss_price_offset=10.0,
+            pending_seconds=60,
+            retrace_seconds=60,
+            max_hold_seconds=900,
+            deviation_points=100,
+        )
+        with self.assertRaisesRegex(RuntimeError, "exceeds"):
+            _validate_live_strategy(broker, strategy)
+
     def test_orphaned_managed_trade_is_rejected(self):
         position = SimpleNamespace(ticket=123, comment="evo5m_l_test")
         with self.assertRaisesRegex(RuntimeError, "orphan_positions"):
@@ -470,6 +634,29 @@ class ExnessMt5ExecutorTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_fresh_orphan_order_gets_short_reconciliation_grace(self):
+        now = datetime(2026, 7, 31, tzinfo=timezone.utc)
+        fresh_order = SimpleNamespace(
+            ticket=456,
+            comment="evo5m_l_pending",
+            type=4,
+            time_setup_msc=int(now.timestamp() * 1000),
+            time_done_msc=0,
+        )
+        _assert_no_orphaned_managed_trades(
+            positions=[],
+            orders=[fresh_order],
+            records=[],
+            now=now,
+        )
+        with self.assertRaisesRegex(RuntimeError, "orphan_orders"):
+            _assert_no_orphaned_managed_trades(
+                positions=[],
+                orders=[fresh_order],
+                records=[],
+                now=now + timedelta(seconds=3),
+            )
 
 
 if __name__ == "__main__":

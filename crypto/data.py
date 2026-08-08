@@ -111,6 +111,14 @@ def add_binary_labels(
     For two_sided_tp, label=1 means both the Long and Short TP are reached;
     future_return_h is the combined gross payoff of the two positions. Label
     direction is ignored for this direction-neutral mode.
+    For bear, label=1 marks candles strictly inside an offline confirmed
+    close-ZigZag peak-to-trough bear body. Peak and trough candles are 0. The
+    target may use later closes for confirmation, but model features at row t
+    are built independently from raw OHLCV available through t. Its
+    future_return_h is zero because bear is precision-only classification.
+    For bull, label=1 symmetrically marks candles strictly inside an offline
+    confirmed close-ZigZag trough-to-peak body. Its future_return_h is also
+    zero and its direction/horizon arguments do not alter the target.
     For exit_after_k, rows whose TP was already reached in H1..Hk are
     excluded. Label 1 means the remaining H(k+1)..Hh path reaches TP, while
     future_return_h is the executable gross payoff: threshold on a TP hit or
@@ -122,6 +130,11 @@ def add_binary_labels(
     label_return_fn = return_fn or config.get_label_return_fn(selected_mode)
     label_threshold = config.default_label_threshold(selected_mode, threshold)
     decision_k = config.resolve_exit_after_k(label_mode, exit_after_k)
+    body_labels = None
+    if selected_mode == "bear":
+        body_labels = config.bear_body_labels(labeled)
+    elif selected_mode == "bull":
+        body_labels = config.bull_body_labels(labeled)
     if decision_k is not None:
         invalid_horizons = [int(h) for h in horizons if int(h) <= decision_k]
         if invalid_horizons:
@@ -131,6 +144,18 @@ def add_binary_labels(
             )
     for h in horizons:
         h = int(h)
+        if selected_mode in {"bear", "bull"}:
+            assert body_labels is not None
+            explicit_label = body_labels
+            complete = explicit_label.notna()
+            labeled[f"future_return_h{h}"] = pd.Series(
+                0.0,
+                index=labeled.index,
+                dtype="float64",
+            ).where(complete)
+            labeled[f"label_h{h}"] = explicit_label
+            continue
+
         if selected_mode == "two_sided_tp":
             future_return, explicit_label = config.two_sided_tp_outcome(
                 labeled,

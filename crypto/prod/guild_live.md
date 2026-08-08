@@ -1244,7 +1244,7 @@ Moi tin Telegram co:
 Backend gui mot ban cap nhat sau moi nen 5 phut, ke ca khi ket qua la
 `NO_SIGNAL`. Khoa chong trung dam bao cung mot nen chi duoc gui mot lan.
 
-## Exness MT5 5m executor (demo only)
+## Exness MT5 5m executor
 
 The MT5 executor is separate from `backend_exness_5m`. Keep the Exness MT5
 desktop terminal open and logged in on the same Windows machine.
@@ -1257,6 +1257,8 @@ EXNESS_MT5_SYMBOL=BTCUSDm
 EXNESS_MT5_DEMO_ONLY=true
 EXNESS_MT5_EXECUTION_ENABLED=false
 EXNESS_MT5_LIVE_TRADING_ENABLED=false
+EXNESS_MT5_LIVE_ACCOUNT_LOGIN=
+EXNESS_MT5_LIVE_MAX_VOLUME=0.01
 EXNESS_MT5_TEST_VOLUME=0.01
 EXNESS_MT5_MAGIC=5100501
 EXNESS_MT5_MAX_OPEN_POSITIONS=4
@@ -1292,8 +1294,8 @@ python -m crypto.prod.exness_mt5_executor `
 ```
 
 Demo orders require both `EXNESS_MT5_EXECUTION_ENABLED=true` and
-`--execute-demo`. The executor rejects live accounts. Long SL is the Exness
-open H1 minus `--stop-loss-offset`; Short SL is open H1 plus that offset.
+`--execute-demo`. Long SL is the Exness open H1 minus
+`--stop-loss-offset`; Short SL is open H1 plus that offset.
 Execution is blocked
 when the open-H1-to-trigger distance is not wider than the current spread.
 The MT5 account must use Hedging mode. Netting accounts are rejected because
@@ -1311,3 +1313,40 @@ Limit at the cap for a retrace. If no trigger is observed during the initial
 60 seconds, the order is cancelled. If the trigger is observed during those
 60 seconds but the entry remains unfilled, the order receives one additional
 60-second retrace window and is cancelled at second 120 if still unfilled.
+
+### Live account execution
+
+Live execution is a separate explicit mode. It requires a REAL Hedging
+account, a dedicated state file, an account-login allowlist, and a volume
+ceiling. Configure `.env` only on the Windows machine running MT5:
+
+```dotenv
+EXNESS_MT5_DEMO_ONLY=false
+EXNESS_MT5_EXECUTION_ENABLED=true
+EXNESS_MT5_LIVE_TRADING_ENABLED=true
+EXNESS_MT5_LIVE_ACCOUNT_LOGIN=218674896
+EXNESS_MT5_LIVE_MAX_VOLUME=0.01
+```
+
+Start with the minimum configured volume:
+
+```powershell
+python -m crypto.prod.exness_mt5_executor `
+  --volume 0.01 `
+  --trigger 0.00025 `
+  --max-entry-slippage 0.0001 `
+  --take-profit 0.01 `
+  --stop-loss-offset 10 `
+  --pending-seconds 60 `
+  --retrace-seconds 60 `
+  --max-hold-seconds 900 `
+  --poll-seconds 1 `
+  --loop `
+  --execute-live `
+  --confirm-live-login 218674896
+```
+
+Without `--state`, live mode automatically uses
+`crypto/prod/live/exness_mt5_live_trade_state.json`. It refuses the demo state
+file, a different account login, Netting mode, volume above the configured
+ceiling, or live execution without every authorization flag.

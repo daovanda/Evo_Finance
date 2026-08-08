@@ -1236,6 +1236,144 @@ class CryptoPipelineTests(unittest.TestCase):
         self.assertTrue(config.is_precision_only_label_mode("high_exit"))
         self.assertFalse(config.is_precision_only_label_mode("close_exit"))
 
+    def test_bear_labels_only_confirmed_peak_to_trough_body_and_zero_return(self):
+        idx = pd.date_range("2024-01-01", periods=12, freq="5min")
+        close = [
+            100.0,
+            100.4,
+            100.8,  # confirmed peak after the following reversal
+            100.4,
+            100.0,
+            99.6,
+            99.2,
+            98.4,   # confirmed trough after the following rebound
+            98.8,
+            99.2,
+            99.0,
+            99.1,
+        ]
+        frame = pd.DataFrame(
+            {
+                "open": close,
+                "high": np.asarray(close) + 0.1,
+                "low": np.asarray(close) - 0.1,
+                "close": close,
+                "volume": [10.0] * len(close),
+                "trade_count": [10] * len(close),
+                "taker_buy_base_volume": [5.0] * len(close),
+                "taker_buy_quote_volume": [500.0] * len(close),
+            },
+            index=idx,
+        )
+
+        with (
+            patch.object(config, "BEAR_ZIGZAG_TOLERANCE", 0.003),
+            patch.object(config, "BEAR_MIN_DROP", 0.004),
+            patch.object(config, "BEAR_MIN_BARS", 5),
+        ):
+            long_labeled = add_binary_labels(
+                frame,
+                horizons=[1, 3],
+                label_mode="bear",
+                label_direction="Long",
+            )
+            short_labeled = add_binary_labels(
+                frame,
+                horizons=[3],
+                label_mode="bear",
+                label_direction="Short",
+            )
+
+        expected = pd.Series(
+            [0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+            index=idx,
+            dtype="float64",
+        )
+        pd.testing.assert_series_equal(
+            long_labeled["label_h1"], expected, check_names=False
+        )
+        pd.testing.assert_series_equal(
+            long_labeled["label_h3"], expected, check_names=False
+        )
+        pd.testing.assert_series_equal(
+            short_labeled["label_h3"], expected, check_names=False
+        )
+        self.assertTrue((long_labeled["future_return_h1"] == 0.0).all())
+        self.assertTrue((long_labeled["future_return_h3"] == 0.0).all())
+        self.assertIs(config.get_label_return_fn("bear"), config.bear_future_return)
+        self.assertTrue(config.is_precision_only_label_mode("bear"))
+        self.assertTrue(config.is_direction_neutral_label_mode("bear"))
+        self.assertEqual(config.default_label_threshold("bear"), 0.0)
+
+    def test_bull_labels_only_confirmed_trough_to_peak_body_and_zero_return(self):
+        idx = pd.date_range("2024-01-01", periods=12, freq="5min")
+        close = [
+            100.0,
+            99.6,
+            99.2,   # confirmed trough after the following rebound
+            99.6,
+            100.0,
+            100.4,
+            100.8,
+            101.2,  # confirmed peak after the following reversal
+            100.8,
+            100.4,
+            100.6,
+            100.5,
+        ]
+        frame = pd.DataFrame(
+            {
+                "open": close,
+                "high": np.asarray(close) + 0.1,
+                "low": np.asarray(close) - 0.1,
+                "close": close,
+                "volume": [10.0] * len(close),
+                "trade_count": [10] * len(close),
+                "taker_buy_base_volume": [5.0] * len(close),
+                "taker_buy_quote_volume": [500.0] * len(close),
+            },
+            index=idx,
+        )
+
+        with (
+            patch.object(config, "BULL_ZIGZAG_TOLERANCE", 0.003),
+            patch.object(config, "BULL_MIN_RISE", 0.004),
+            patch.object(config, "BULL_MIN_BARS", 5),
+        ):
+            long_labeled = add_binary_labels(
+                frame,
+                horizons=[1, 3],
+                label_mode="bull",
+                label_direction="Long",
+            )
+            short_labeled = add_binary_labels(
+                frame,
+                horizons=[3],
+                label_mode="bull",
+                label_direction="Short",
+            )
+
+        expected = pd.Series(
+            [0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+            index=idx,
+            dtype="float64",
+        )
+        pd.testing.assert_series_equal(
+            long_labeled["label_h1"], expected, check_names=False
+        )
+        pd.testing.assert_series_equal(
+            long_labeled["label_h3"], expected, check_names=False
+        )
+        pd.testing.assert_series_equal(
+            short_labeled["label_h3"], expected, check_names=False
+        )
+        self.assertTrue((long_labeled["future_return_h1"] == 0.0).all())
+        self.assertTrue((long_labeled["future_return_h3"] == 0.0).all())
+        self.assertIs(config.get_label_return_fn("bull"), config.bull_future_return)
+        self.assertTrue(config.is_precision_only_label_mode("bull"))
+        self.assertTrue(config.is_direction_neutral_label_mode("bull"))
+        self.assertEqual(config.default_label_threshold("bull"), 0.0)
+
     def test_slope_slowdown_uses_high_and_aligns_expanded_window_to_t(self):
         idx = pd.date_range("2024-01-01", periods=12, freq="15min")
 
@@ -1805,6 +1943,43 @@ class CryptoPipelineTests(unittest.TestCase):
             label_direction="long",
             label_threshold=0.004,
         )
+
+    def test_resume_metadata_checks_bull_definition_and_ignores_direction(self):
+        metadata = {
+            "horizons": [1],
+            "label_mode": "bull",
+            "label_direction": "short",
+            "label_threshold": 0.0,
+            "bull_zigzag_tolerance": config.BULL_ZIGZAG_TOLERANCE,
+            "bull_min_rise": config.BULL_MIN_RISE,
+            "bull_min_bars": config.BULL_MIN_BARS,
+            "bull_label_rule": config.BULL_LABEL_RULE,
+            "fitness_horizon_mode": config.FITNESS_HORIZON_MODE,
+            "trade_top_fraction": config.TRADE_TOP_FRACTION,
+            "trade_cost": config.TRADE_COST,
+        }
+        archive = CryptoArchive(metadata=metadata)
+        _validate_resume_metadata(
+            archive=archive,
+            resume_path=Path("bull.json"),
+            horizons=[1],
+            label_mode="bull",
+            label_direction="long",
+            label_threshold=0.0,
+        )
+
+        mismatched = CryptoArchive(
+            metadata={**metadata, "bull_min_rise": config.BULL_MIN_RISE + 0.001}
+        )
+        with self.assertRaisesRegex(ValueError, "bull_min_rise"):
+            _validate_resume_metadata(
+                archive=mismatched,
+                resume_path=Path("bull.json"),
+                horizons=[1],
+                label_mode="bull",
+                label_direction="long",
+                label_threshold=0.0,
+            )
 
     def test_resume_metadata_checks_slope_slowdown_definition(self):
         archive = CryptoArchive(

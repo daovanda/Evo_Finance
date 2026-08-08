@@ -684,6 +684,14 @@ def _config_snapshot(
             else float(config.SAFE_ADVERSE_FLOOR)
         ),
         "safe_path_rule": config.SAFE_PATH_RULE,
+        "bear_zigzag_tolerance": float(config.BEAR_ZIGZAG_TOLERANCE),
+        "bear_min_drop": float(config.BEAR_MIN_DROP),
+        "bear_min_bars": int(config.BEAR_MIN_BARS),
+        "bear_label_rule": config.BEAR_LABEL_RULE,
+        "bull_zigzag_tolerance": float(config.BULL_ZIGZAG_TOLERANCE),
+        "bull_min_rise": float(config.BULL_MIN_RISE),
+        "bull_min_bars": int(config.BULL_MIN_BARS),
+        "bull_label_rule": config.BULL_LABEL_RULE,
         "precision_only": config.is_precision_only_label_mode(label_mode),
         "trade_top_fraction": float(
             _validate_trade_top_fraction(trade_top_fraction)

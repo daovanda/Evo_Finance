@@ -1,4 +1,4 @@
-"""Execute Exness MT5 demo orders from the 5-minute signal snapshot.
+"""Execute Exness MT5 orders from the 5-minute signal snapshot.
 
 The signal producer and broker executor are intentionally separate:
 
@@ -10,6 +10,10 @@ The signal producer and broker executor are intentionally separate:
 
     # Demo execution (also requires EXNESS_MT5_EXECUTION_ENABLED=true).
     python -m crypto.prod.exness_mt5_executor --loop --execute-demo
+
+Live execution uses a separate --execute-live gate, account-login allowlist,
+volume ceiling, and state file. It is disabled unless every live environment
+authorization is explicitly configured.
 
 For each LONG/SHORT signal, the executor uses the current Exness M5 candle
 open as open H1. LONG arms at open*(1+trigger), SHORT at
@@ -52,6 +56,9 @@ logger = logging.getLogger("crypto.prod.exness_mt5_executor")
 
 DEFAULT_SIGNAL_PATH = Path("crypto/prod/live/latest_exness_5m_signal.json")
 DEFAULT_STATE_PATH = Path("crypto/prod/live/exness_mt5_trade_state.json")
+DEFAULT_LIVE_STATE_PATH = Path(
+    "crypto/prod/live/exness_mt5_live_trade_state.json"
+)
 DEFAULT_POLL_SECONDS = 1.0
 DEFAULT_TRIGGER_PCT = 0.00025
 DEFAULT_MAX_ENTRY_SLIPPAGE_PCT = 0.0001  # 0.01% beyond the 0.025% trigger
@@ -72,6 +79,11 @@ TERMINAL_RECORD_STATUSES = {
     "failed",
 }
 
+
+class EntryStopAlreadyBreached(RuntimeError):
+    """The intended SL was crossed before a retrace entry could be opened."""
+
+
 ENV_TERMINAL_PATH = "EXNESS_MT5_TERMINAL_PATH"
 ENV_SYMBOL = "EXNESS_MT5_SYMBOL"
 ENV_DEMO_ONLY = "EXNESS_MT5_DEMO_ONLY"
@@ -80,6 +92,8 @@ ENV_LIVE_ENABLED = "EXNESS_MT5_LIVE_TRADING_ENABLED"
 ENV_VOLUME = "EXNESS_MT5_TEST_VOLUME"
 ENV_MAGIC = "EXNESS_MT5_MAGIC"
 ENV_MAX_POSITIONS = "EXNESS_MT5_MAX_OPEN_POSITIONS"
+ENV_LIVE_ACCOUNT_LOGIN = "EXNESS_MT5_LIVE_ACCOUNT_LOGIN"
+ENV_LIVE_MAX_VOLUME = "EXNESS_MT5_LIVE_MAX_VOLUME"
 
 
 @dataclass(frozen=True)
@@ -104,6 +118,8 @@ class BrokerConfig:
     execution_enabled: bool
     live_enabled: bool
     max_open_positions: int
+    live_account_login: int | None = None
+    live_max_volume: float = 0.01
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -115,6 +131,7 @@ def _bool_env(name: str, default: bool = False) -> bool:
 
 def _load_broker_config() -> BrokerConfig:
     load_env_file()
+    live_login_raw = os.getenv(ENV_LIVE_ACCOUNT_LOGIN, "").strip()
     return BrokerConfig(
         terminal_path=os.getenv(
             ENV_TERMINAL_PATH,
@@ -126,6 +143,10 @@ def _load_broker_config() -> BrokerConfig:
         execution_enabled=_bool_env(ENV_EXECUTION_ENABLED, False),
         live_enabled=_bool_env(ENV_LIVE_ENABLED, False),
         max_open_positions=max(int(os.getenv(ENV_MAX_POSITIONS, "4")), 1),
+        live_account_login=(
+            int(live_login_raw) if live_login_raw else None
+        ),
+        live_max_volume=float(os.getenv(ENV_LIVE_MAX_VOLUME, "0.01")),
     )
 
 
@@ -138,6 +159,24 @@ def _load_mt5() -> Any:
             "running the Exness MT5 terminal."
         ) from exc
     return mt5
+
+
+def _validate_live_strategy(
+    broker: BrokerConfig,
+    strategy: Strategy,
+) -> None:
+    if (
+        not math.isfinite(broker.live_max_volume)
+        or broker.live_max_volume <= 0.0
+    ):
+        raise RuntimeError(
+            "EXNESS_MT5_LIVE_MAX_VOLUME must be finite and positive."
+        )
+    if strategy.volume > broker.live_max_volume + 1e-12:
+        raise RuntimeError(
+            f"Live volume {strategy.volume} exceeds "
+            f"EXNESS_MT5_LIVE_MAX_VOLUME={broker.live_max_volume}."
+        )
 
 
 def _utc_now() -> datetime:
@@ -366,7 +405,16 @@ def _entry_record(
     }
 
 
-def _initialize(mt5: Any, broker: BrokerConfig, execute_demo: bool) -> Any:
+def _initialize(
+    mt5: Any,
+    broker: BrokerConfig,
+    *,
+    execute_demo: bool = False,
+    execute_live: bool = False,
+) -> Any:
+    if execute_demo and execute_live:
+        raise RuntimeError("Demo and live execution cannot be enabled together.")
+    execute = execute_demo or execute_live
     if not mt5.initialize(broker.terminal_path, timeout=120000):
         raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
     terminal = mt5.terminal_info()
@@ -375,29 +423,47 @@ def _initialize(mt5: Any, broker: BrokerConfig, execute_demo: bool) -> Any:
         raise RuntimeError(f"Cannot read MT5 terminal/account: {mt5.last_error()}")
     if not terminal.connected:
         raise RuntimeError("MT5 terminal is not connected.")
-    if execute_demo and (not terminal.trade_allowed or terminal.tradeapi_disabled):
+    if execute and (not terminal.trade_allowed or terminal.tradeapi_disabled):
         raise RuntimeError(
             "MT5 Python trading is disabled in Tools > Options > Expert Advisors."
         )
     # ACCOUNT_TRADE_MODE_DEMO is 0 in the MT5 Python API.
     is_demo = int(account.trade_mode) == 0
+    real_mode = int(getattr(mt5, "ACCOUNT_TRADE_MODE_REAL", 2))
+    is_real = int(account.trade_mode) == real_mode
     if execute_demo and broker.demo_only and not is_demo:
         raise RuntimeError("Execution blocked: EXNESS_MT5_DEMO_ONLY=true.")
-    if execute_demo and not broker.execution_enabled:
+    if execute and not broker.execution_enabled:
         raise RuntimeError(
             "Execution blocked: set EXNESS_MT5_EXECUTION_ENABLED=true."
         )
     if execute_demo and not is_demo:
+        raise RuntimeError(
+            "Demo execution requires an MT5 demo account."
+        )
+    if execute_live:
+        if broker.demo_only:
+            raise RuntimeError(
+                "Live execution blocked: set EXNESS_MT5_DEMO_ONLY=false."
+            )
         if not broker.live_enabled:
             raise RuntimeError(
-                "Live execution blocked: EXNESS_MT5_LIVE_TRADING_ENABLED=false."
+                "Live execution blocked: set "
+                "EXNESS_MT5_LIVE_TRADING_ENABLED=true."
             )
-        raise RuntimeError(
-            "This executor currently refuses live accounts. Validate the "
-            "strategy on demo first."
-        )
+        if not is_real:
+            raise RuntimeError("Live execution requires an MT5 real account.")
+        if broker.live_account_login is None:
+            raise RuntimeError(
+                "Live execution blocked: set EXNESS_MT5_LIVE_ACCOUNT_LOGIN."
+            )
+        if int(account.login) != int(broker.live_account_login):
+            raise RuntimeError(
+                "Live account login mismatch: connected="
+                f"{account.login}, allowed={broker.live_account_login}."
+            )
     hedging_mode = int(getattr(mt5, "ACCOUNT_MARGIN_MODE_RETAIL_HEDGING", 2))
-    if execute_demo and int(account.margin_mode) != hedging_mode:
+    if execute and int(account.margin_mode) != hedging_mode:
         raise RuntimeError(
             "Execution requires an MT5 Hedging account because the strategy "
             "can hold multiple and opposite BTCUSDm positions. The connected "
@@ -462,7 +528,8 @@ def _preflight(
         message = (
             f"Distance from open H1 to trigger {strategy.trigger_pct:.4%} is "
             f"not wider than current spread {spread_pct:.4%}. An SL fixed at "
-            "open H1 may be rejected or close immediately."
+            "a small directional offset from open H1 may be rejected or "
+            "close immediately."
         )
         if enforce_executable_stop:
             raise RuntimeError(message)
@@ -712,6 +779,22 @@ def _retrace_request_for_tick(
         side == "short" and market_price >= entry_limit
     )
     if inside_slippage_cap:
+        stop_price = (
+            open_h1 - strategy.stop_loss_price_offset
+            if side == "long"
+            else open_h1 + strategy.stop_loss_price_offset
+        )
+        stop_breached = (
+            side == "long" and float(tick.bid) <= stop_price
+        ) or (
+            side == "short" and float(tick.ask) >= stop_price
+        )
+        if stop_breached:
+            raise EntryStopAlreadyBreached(
+                f"{side} retrace entry rejected because market crossed SL "
+                f"before entry: bid={float(tick.bid):.8f}, "
+                f"ask={float(tick.ask):.8f}, sl={stop_price:.8f}"
+            )
         request = _market_entry_request(
             mt5,
             broker=broker,
@@ -1052,14 +1135,16 @@ def _assert_no_orphaned_managed_trades(
     positions: Iterable[Any],
     orders: Iterable[Any],
     records: list[dict[str, Any]],
-) -> None:
+    now: datetime | None = None,
+) -> bool:
+    checked_at = now or _utc_now()
     active_records = [
         record
         for record in records
         if str(record.get("status") or "") not in TERMINAL_RECORD_STATUSES
     ]
     orphan_positions = [
-        int(position.ticket)
+        position
         for position in positions
         if not any(
             _position_for_record([position], record) is not None
@@ -1067,19 +1152,95 @@ def _assert_no_orphaned_managed_trades(
         )
     ]
     orphan_orders = [
-        int(order.ticket)
+        order
         for order in orders
         if not any(
             _order_for_record([order], record) is not None
             for record in active_records
         )
     ]
-    if orphan_positions or orphan_orders:
+
+    def age_seconds(item: Any, *, position: bool) -> float | None:
+        millisecond_fields = (
+            ("time_msc", "time_update_msc")
+            if position
+            else ("time_setup_msc", "time_done_msc")
+        )
+        second_fields = (
+            ("time", "time_update")
+            if position
+            else ("time_setup", "time_done")
+        )
+        for field in millisecond_fields:
+            value = int(getattr(item, field, 0) or 0)
+            if value > 0:
+                return checked_at.timestamp() - (value / 1000.0)
+        for field in second_fields:
+            value = int(getattr(item, field, 0) or 0)
+            if value > 0:
+                return checked_at.timestamp() - float(value)
+        return None
+
+    fresh_positions = [
+        position
+        for position in orphan_positions
+        if (
+            (age := age_seconds(position, position=True)) is not None
+            and -1.0 <= age < DEFAULT_BROKER_RECONCILE_SECONDS
+        )
+    ]
+    fresh_orders = [
+        order
+        for order in orphan_orders
+        if (
+            (age := age_seconds(order, position=False)) is not None
+            and -1.0 <= age < DEFAULT_BROKER_RECONCILE_SECONDS
+        )
+    ]
+    stale_positions = [
+        position
+        for position in orphan_positions
+        if position not in fresh_positions
+    ]
+    stale_orders = [
+        order for order in orphan_orders if order not in fresh_orders
+    ]
+    if fresh_positions or fresh_orders:
+        logger.warning(
+            "New broker trade is not in executor state yet; allowing %.1fs "
+            "for reconciliation. positions=%s orders=%s",
+            DEFAULT_BROKER_RECONCILE_SECONDS,
+            [int(item.ticket) for item in fresh_positions],
+            [int(item.ticket) for item in fresh_orders],
+        )
+    if stale_positions or stale_orders:
+        position_details = [
+            {
+                "ticket": int(item.ticket),
+                "comment": str(getattr(item, "comment", "") or ""),
+                "type": int(getattr(item, "type", -1)),
+                "time_msc": int(getattr(item, "time_msc", 0) or 0),
+            }
+            for item in stale_positions
+        ]
+        order_details = [
+            {
+                "ticket": int(item.ticket),
+                "comment": str(getattr(item, "comment", "") or ""),
+                "type": int(getattr(item, "type", -1)),
+                "time_setup_msc": int(
+                    getattr(item, "time_setup_msc", 0) or 0
+                ),
+            }
+            for item in stale_orders
+        ]
         raise RuntimeError(
             "Managed MT5 trades are missing from active executor state; "
             "refusing new trades. "
-            f"orphan_positions={orphan_positions}, orphan_orders={orphan_orders}"
+            f"orphan_positions={position_details}, "
+            f"orphan_orders={order_details}"
         )
+    return bool(fresh_positions or fresh_orders)
 
 
 def _process_existing(
@@ -1090,13 +1251,14 @@ def _process_existing(
     records: list[dict[str, Any]],
     execute: bool,
     now: datetime,
-) -> None:
+) -> bool:
     orders = _managed_orders(mt5, broker)
     positions = _managed_positions(mt5, broker)
-    _assert_no_orphaned_managed_trades(
+    broker_reconciling = _assert_no_orphaned_managed_trades(
         positions=positions,
         orders=orders,
         records=records,
+        now=now,
     )
     for record in records:
         status = str(record.get("status") or "")
@@ -1232,6 +1394,17 @@ def _process_existing(
                             retrace=True,
                             execute=execute,
                         )
+                    except EntryStopAlreadyBreached as exc:
+                        record["status"] = "expired"
+                        record["closed_reason"] = (
+                            "stop_already_breached_before_retrace_entry"
+                        )
+                        record["recovery_error"] = str(exc)
+                        logger.warning(
+                            "%s retrace entry expired: %s",
+                            str(record["side"]).upper(),
+                            exc,
+                        )
                     except Exception as exc:
                         record["recovery_error"] = str(exc)
                         logger.exception(
@@ -1305,6 +1478,17 @@ def _process_existing(
                     retrace=trigger_observed,
                     execute=execute,
                 )
+            except EntryStopAlreadyBreached as exc:
+                record["status"] = "expired"
+                record["closed_reason"] = (
+                    "stop_already_breached_before_retrace_entry"
+                )
+                record["recovery_error"] = str(exc)
+                logger.warning(
+                    "%s retrace entry expired: %s",
+                    str(record.get("side") or "").upper(),
+                    exc,
+                )
             except Exception as exc:
                 record["recovery_error"] = str(exc)
                 logger.exception(
@@ -1342,6 +1526,7 @@ def _process_existing(
             if entry_deal is not None:
                 record["entry_deal_ticket"] = int(entry_deal.ticket)
             record["updated_at"] = _iso(now)
+    return broker_reconciling
 
 
 def _place_signal(
@@ -1567,45 +1752,92 @@ def run_cycle(
     signal_path: str | Path = DEFAULT_SIGNAL_PATH,
     state_path: str | Path = DEFAULT_STATE_PATH,
     execute_demo: bool = False,
+    execute_live: bool = False,
     strategy: Strategy,
 ) -> dict[str, Any]:
+    if execute_demo and execute_live:
+        raise ValueError("Choose only one of demo or live execution.")
+    execute_orders = execute_demo or execute_live
+    execution_mode = (
+        "LIVE_EXECUTION"
+        if execute_live
+        else "DEMO_EXECUTION"
+        if execute_demo
+        else "DRY_RUN"
+    )
     broker = _load_broker_config()
+    if execute_live:
+        _validate_live_strategy(broker, strategy)
     mt5 = _load_mt5()
     state_file = Path(state_path)
+    if execute_live and state_file.resolve() == DEFAULT_STATE_PATH.resolve():
+        raise RuntimeError(
+            "Live execution must use a separate state file; use "
+            f"--state {DEFAULT_LIVE_STATE_PATH}."
+        )
     state = _read_json(state_file)
+    stored_mode = str(state.get("mode") or "")
+    if (
+        execute_live
+        and state
+        and stored_mode
+        and stored_mode != execution_mode
+    ):
+        raise RuntimeError(
+            f"State mode mismatch: file contains {stored_mode}, "
+            f"requested {execution_mode}."
+        )
     records = state.get("records")
     if not isinstance(records, list):
         records = []
     now = _utc_now()
     try:
-        account = _initialize(mt5, broker, execute_demo)
+        account = _initialize(
+            mt5,
+            broker,
+            execute_demo=execute_demo,
+            execute_live=execute_live,
+        )
+        stored_login = state.get("account_login")
+        if (
+            stored_login not in (None, "")
+            and int(stored_login) != int(account.login)
+        ):
+            raise RuntimeError(
+                "State account mismatch: file belongs to login "
+                f"{stored_login}, connected login is {account.login}."
+            )
         _preflight(
             mt5,
             broker,
             strategy,
-            enforce_executable_stop=execute_demo,
+            enforce_executable_stop=execute_orders,
         )
-        _process_existing(
+        broker_reconciling = _process_existing(
             mt5,
             broker=broker,
             strategy=strategy,
             records=records,
-            execute=execute_demo,
+            execute=execute_orders,
             now=now,
         )
-        payload = _read_json(Path(signal_path))
-        created = _place_signal(
-            mt5,
-            payload=payload,
-            broker=broker,
-            strategy=strategy,
-            records=records,
-            execute=execute_demo,
-            now=now,
-        )
+        if broker_reconciling:
+            created = []
+        else:
+            payload = _read_json(Path(signal_path))
+            created = _place_signal(
+                mt5,
+                payload=payload,
+                broker=broker,
+                strategy=strategy,
+                records=records,
+                execute=execute_orders,
+                now=now,
+            )
         state = {
             "updated_at": _iso(now),
-            "mode": "DEMO_EXECUTION" if execute_demo else "DRY_RUN",
+            "mode": execution_mode,
+            "account_login": int(account.login),
             "account_trade_mode": int(account.trade_mode),
             "symbol": broker.symbol,
             "magic": broker.magic,
@@ -1621,6 +1853,7 @@ def run_cycle(
                 "max_hold_seconds": strategy.max_hold_seconds,
             },
             "created_this_cycle": len(created),
+            "broker_reconciling": broker_reconciling,
             "records": records[-1000:],
         }
         _write_json(state_file, state)
@@ -1633,7 +1866,14 @@ def parse_args() -> argparse.Namespace:
     load_env_file()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--signal", default=str(DEFAULT_SIGNAL_PATH))
-    parser.add_argument("--state", default=str(DEFAULT_STATE_PATH))
+    parser.add_argument(
+        "--state",
+        default=None,
+        help=(
+            "Executor state path. Defaults to a dedicated live state for "
+            "--execute-live and the standard state otherwise."
+        ),
+    )
     parser.add_argument(
         "--volume",
         type=float,
@@ -1692,10 +1932,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--poll-seconds", type=float, default=DEFAULT_POLL_SECONDS)
     parser.add_argument("--loop", action="store_true")
-    parser.add_argument(
+    execution_group = parser.add_mutually_exclusive_group()
+    execution_group.add_argument(
         "--execute-demo",
         action="store_true",
         help="Send orders only to an MT5 demo account after env authorization.",
+    )
+    execution_group.add_argument(
+        "--execute-live",
+        action="store_true",
+        help=(
+            "Send real orders only after all live env gates and login "
+            "confirmation pass."
+        ),
+    )
+    parser.add_argument(
+        "--confirm-live-login",
+        type=int,
+        default=None,
+        help="Required with --execute-live; must match the env allowlist.",
     )
     return parser.parse_args()
 
@@ -1751,13 +2006,37 @@ def _strategy_from_args(args: argparse.Namespace) -> Strategy:
 def main() -> None:
     args = parse_args()
     strategy = _strategy_from_args(args)
-    with _single_instance_lock(Path(args.state)):
+    if args.execute_live:
+        broker = _load_broker_config()
+        if args.confirm_live_login is None:
+            raise SystemExit(
+                "--execute-live requires --confirm-live-login ACCOUNT_LOGIN."
+            )
+        if (
+            broker.live_account_login is None
+            or int(args.confirm_live_login)
+            != int(broker.live_account_login)
+        ):
+            raise SystemExit(
+                "--confirm-live-login must match "
+                "EXNESS_MT5_LIVE_ACCOUNT_LOGIN."
+            )
+    state_path = Path(
+        args.state
+        or (
+            DEFAULT_LIVE_STATE_PATH
+            if args.execute_live
+            else DEFAULT_STATE_PATH
+        )
+    )
+    with _single_instance_lock(state_path):
         while True:
             try:
                 state = run_cycle(
                     signal_path=args.signal,
-                    state_path=args.state,
+                    state_path=state_path,
                     execute_demo=bool(args.execute_demo),
+                    execute_live=bool(args.execute_live),
                     strategy=strategy,
                 )
                 logger.info(

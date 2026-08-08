@@ -132,6 +132,32 @@ label = first_hit_h ton tai va moi close_return tu H1 den truoc first_hit_h > la
 
 Mode nay dung adverse extreme theo quy tac stop-first. Voi Long, `low` duoc kiem tra truoc `high`; voi Short, `high` duoc kiem tra truoc `low`. Neu mot nen cham ca stop va TP thi label=0. Neu khong truyen `--label-threshold`, mode nay tu dung `SAFE_ADVERSE_FLOOR`; `TP_SAFE_PATH` la muc TP rieng, vi du `0.004` la `0.4%`.
 
+`LABEL_MODE="bear"`:
+
+- Tao target offline bang ZigZag tren `close` voi cac bien
+  `BEAR_ZIGZAG_TOLERANCE`, `BEAR_MIN_DROP`, `BEAR_MIN_BARS` trong
+  `crypto/config.py`.
+- `label=1` chi cho cac nen nam giua peak va trough cua mot swing giam hop le;
+  chinh peak va trough co label 0.
+- Day la mode direction-neutral va precision-only: `future_return=0`, khong tru
+  `TRADE_COST`, va `--label-direction` khong anh huong target.
+- ZigZag dung gia tuong lai de xac nhan target huan luyen. Feature tai dong `t`
+  van chi duoc build tu raw OHLCV den het `t`; live prediction khong doc nen
+  tuong lai.
+- Horizon khong doi target bear, vi vay chi nen truyen mot horizon, vi du
+  `--horizons 1`.
+
+`LABEL_MODE="bull"`:
+
+- Doi xung voi `bear`: ZigZag van dung `close`, nhung `label=1` cho cac nen nam
+  giua trough va peak cua mot swing tang hop le.
+- Cau hinh rieng gom `BULL_ZIGZAG_TOLERANCE`, `BULL_MIN_RISE` va
+  `BULL_MIN_BARS` trong `crypto/config.py`.
+- Trough va peak co label 0. Mode nay cung direction-neutral, precision-only,
+  `future_return=0`, va chi nen chay mot horizon.
+- Target duoc xac nhan offline bang cac nen sau; feature khi predict tai `t`
+  van chi dung OHLCV den het nen `t`.
+
 Co the override label mode bang CLI, khong can sua file config:
 
 ```powershell

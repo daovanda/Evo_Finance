@@ -29,7 +29,7 @@ LABEL_DIRECTION: str = (
 PAYOFF_TP: float = 0.004  # legacy payoff archives were evolved with TP=0.40%
 # Effectively disables the newer adverse-path filter for legacy payoff archives.
 PAYOFF_ADVERSE_FLOOR: float = -999.0
-TP_SAFE_PATH: float = 0.003  # TP used by LABEL_MODE="safe_path_mfe"
+TP_SAFE_PATH: float = 0.001  # TP used by LABEL_MODE="safe_path_mfe"
 SAFE_ADVERSE_FLOOR: float = -0.0015  # stop-first low/high floor for safe_path_mfe
 SAFE_PATH_RULE: str = "adverse_stop_first_v1"
 SLOPE_LOOKBACK: int = 2
@@ -37,6 +37,19 @@ SLOPE_SLOWDOWN_THRESHOLD: float = 0.0002  # 0.03% log-OLS slope per candle
 SLOPE_MIN_INITIAL: float = 0.0001  # 0.02% log-OLS slope per candle
 SLOPE_PRICE_COLUMN: str = "high"
 SLOPE_SLOWDOWN_RULE: str = "eligible_initial_slope_only_v2"
+# Offline close-ZigZag target used by LABEL_MODE="bear". A candle is positive
+# only when it lies strictly between a confirmed peak and trough whose decline
+# satisfies both the duration and drop filters. These future-confirmed labels
+# are targets only; feature construction still receives raw data up to row t.
+BEAR_ZIGZAG_TOLERANCE: float = 0.003
+BEAR_MIN_DROP: float = 0.004
+BEAR_MIN_BARS: int = 5
+BEAR_LABEL_RULE: str = "confirmed_close_zigzag_body_v1"
+# Symmetric trough-to-peak body target used by LABEL_MODE="bull".
+BULL_ZIGZAG_TOLERANCE: float = 0.003
+BULL_MIN_RISE: float = 0.004
+BULL_MIN_BARS: int = 5
+BULL_LABEL_RULE: str = "confirmed_close_zigzag_body_v1"
 # Decision candle for LABEL_MODE="exit_after_k". For a base trade whose entry
 # is open H1, k=1 evaluates after H1 closes, k=2 after H2 closes, and so on.
 EXIT_AFTER_K: int = 1
@@ -583,6 +596,135 @@ def two_sided_tp_future_return(
     return payoff
 
 
+def _confirmed_close_zigzag_pivots(
+    df: Any,
+    tolerance: float,
+) -> tuple[np.ndarray, list[tuple[int, float, str]]]:
+    """Return close prices and reversal-confirmed ZigZag pivots."""
+    close = pd.to_numeric(df["close"], errors="coerce")
+    prices = close.to_numpy(dtype="float64")
+    if len(prices) < 2:
+        return prices, []
+
+    pivots: list[tuple[int, float, str]] = []
+    direction: str | None = None
+    anchor_price = float(prices[0])
+    candidate_idx = 0
+    candidate_price = anchor_price
+
+    for idx in range(1, len(prices)):
+        price = float(prices[idx])
+        if not isfinite(price):
+            continue
+
+        if direction is None:
+            relative_move = price / anchor_price - 1.0
+            if relative_move >= tolerance:
+                direction = "up"
+                candidate_idx, candidate_price = idx, price
+            elif relative_move <= -tolerance:
+                direction = "down"
+                candidate_idx, candidate_price = idx, price
+            continue
+
+        if direction == "up":
+            if price >= candidate_price:
+                candidate_idx, candidate_price = idx, price
+            elif price <= candidate_price * (1.0 - tolerance):
+                pivots.append((candidate_idx, candidate_price, "peak"))
+                direction = "down"
+                candidate_idx, candidate_price = idx, price
+        else:
+            if price <= candidate_price:
+                candidate_idx, candidate_price = idx, price
+            elif price >= candidate_price * (1.0 + tolerance):
+                pivots.append((candidate_idx, candidate_price, "trough"))
+                direction = "up"
+                candidate_idx, candidate_price = idx, price
+
+    return prices, pivots
+
+
+def _confirmed_zigzag_body_labels(
+    df: Any,
+    *,
+    tolerance: float,
+    min_move: float,
+    min_bars: int,
+    start_kind: str,
+) -> pd.Series:
+    """Label bars strictly inside valid confirmed peak/trough swing bodies."""
+    prices, pivots = _confirmed_close_zigzag_pivots(df, float(tolerance))
+    labels = np.zeros(len(prices), dtype="float64")
+    end_kind = "trough" if start_kind == "peak" else "peak"
+
+    for start, end in zip(pivots, pivots[1:]):
+        if start[2] != start_kind or end[2] != end_kind:
+            continue
+        bars = int(end[0] - start[0])
+        if start_kind == "peak":
+            move = float((start[1] - end[1]) / start[1])
+        else:
+            move = float((end[1] - start[1]) / start[1])
+        if bars >= int(min_bars) and move >= float(min_move):
+            labels[start[0] + 1 : end[0]] = 1.0
+
+    labels[~np.isfinite(prices)] = np.nan
+    return pd.Series(labels, index=df.index, dtype="float64")
+
+
+def bear_body_labels(df: Any) -> pd.Series:
+    """Return the offline confirmed peak-to-trough ZigZag body target.
+
+    Future closes confirm the supervised target only. Model features at row t
+    are built separately from raw OHLCV available through t. Peak/trough bars
+    remain 0, and the unfinished final ZigZag leg is not emitted as a pivot.
+    """
+    return _confirmed_zigzag_body_labels(
+        df,
+        tolerance=float(BEAR_ZIGZAG_TOLERANCE),
+        min_move=float(BEAR_MIN_DROP),
+        min_bars=int(BEAR_MIN_BARS),
+        start_kind="peak",
+    )
+
+
+def bull_body_labels(df: Any) -> pd.Series:
+    """Return the offline confirmed trough-to-peak ZigZag body target.
+
+    Label 1 is assigned strictly between each adjacent trough and peak whose
+    rise and duration meet ``BULL_MIN_RISE`` and ``BULL_MIN_BARS``. The target
+    is future-confirmed, while prediction features at t remain causal.
+    """
+    return _confirmed_zigzag_body_labels(
+        df,
+        tolerance=float(BULL_ZIGZAG_TOLERANCE),
+        min_move=float(BULL_MIN_RISE),
+        min_bars=int(BULL_MIN_BARS),
+        start_kind="trough",
+    )
+
+
+def bear_future_return(
+    df: Any,
+    horizon: int,
+    direction: str | None = None,
+) -> pd.Series:
+    """Registry adapter; bear labels are horizon- and direction-neutral."""
+    del horizon, direction
+    return bear_body_labels(df)
+
+
+def bull_future_return(
+    df: Any,
+    horizon: int,
+    direction: str | None = None,
+) -> pd.Series:
+    """Registry adapter; bull labels are horizon- and direction-neutral."""
+    del horizon, direction
+    return bull_body_labels(df)
+
+
 LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
     "close_exit": close_exit_future_return,
     "high_exit": high_exit_future_return,
@@ -595,6 +737,8 @@ LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
     "payoff": payoff_future_return,
     "two_sided_tp": two_sided_tp_future_return,
     "exit_after_k": exit_after_k_future_return,
+    "bear": bear_future_return,
+    "bull": bull_future_return,
 }
 
 LABEL_MODE_ALIASES: dict[str, str] = {
@@ -626,10 +770,12 @@ def resolve_exit_after_k(
 
 
 PRECISION_ONLY_LABEL_MODES: frozenset[str] = frozenset(
-    {"adverse_floor", "high_exit", "slope_slowdown"}
+    {"adverse_floor", "bear", "bull", "high_exit", "slope_slowdown"}
 )
 
-DIRECTION_NEUTRAL_LABEL_MODES: frozenset[str] = frozenset({"two_sided_tp"})
+DIRECTION_NEUTRAL_LABEL_MODES: frozenset[str] = frozenset(
+    {"bear", "bull", "two_sided_tp"}
+)
 
 
 def is_precision_only_label_mode(mode: str | None = None) -> bool:
@@ -657,6 +803,8 @@ def default_label_threshold(
         return float(SAFE_ADVERSE_FLOOR)
     if selected_mode == "slope_slowdown":
         return float(SLOPE_SLOWDOWN_THRESHOLD)
+    if selected_mode in {"bear", "bull"}:
+        return 0.0
     return float(LABEL_THRESHOLD)
 
 
@@ -786,6 +934,34 @@ def validate_config() -> None:
         raise ValueError("SLOPE_MIN_INITIAL must be finite and non-negative.")
     if SLOPE_PRICE_COLUMN != "high":
         raise ValueError("SLOPE_PRICE_COLUMN must be 'high'.")
+    if (
+        not isfinite(float(BEAR_ZIGZAG_TOLERANCE))
+        or BEAR_ZIGZAG_TOLERANCE <= 0
+        or BEAR_ZIGZAG_TOLERANCE >= 1
+    ):
+        raise ValueError("BEAR_ZIGZAG_TOLERANCE must be finite and in (0, 1).")
+    if (
+        not isfinite(float(BEAR_MIN_DROP))
+        or BEAR_MIN_DROP < 0
+        or BEAR_MIN_DROP >= 1
+    ):
+        raise ValueError("BEAR_MIN_DROP must be finite and in [0, 1).")
+    if int(BEAR_MIN_BARS) < 1:
+        raise ValueError("BEAR_MIN_BARS must be at least 1.")
+    if (
+        not isfinite(float(BULL_ZIGZAG_TOLERANCE))
+        or BULL_ZIGZAG_TOLERANCE <= 0
+        or BULL_ZIGZAG_TOLERANCE >= 1
+    ):
+        raise ValueError("BULL_ZIGZAG_TOLERANCE must be finite and in (0, 1).")
+    if (
+        not isfinite(float(BULL_MIN_RISE))
+        or BULL_MIN_RISE < 0
+        or BULL_MIN_RISE >= 1
+    ):
+        raise ValueError("BULL_MIN_RISE must be finite and in [0, 1).")
+    if int(BULL_MIN_BARS) < 1:
+        raise ValueError("BULL_MIN_BARS must be at least 1.")
     if int(EXIT_AFTER_K) < 1:
         raise ValueError("EXIT_AFTER_K must be at least 1.")
     if FEATURE_MIN < 1 or FEATURE_MAX < FEATURE_MIN:

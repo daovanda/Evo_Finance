@@ -390,6 +390,14 @@ def _save_archive(
             "slope_min_initial": config.SLOPE_MIN_INITIAL,
             "slope_price_column": config.SLOPE_PRICE_COLUMN,
             "slope_slowdown_rule": config.SLOPE_SLOWDOWN_RULE,
+            "bear_zigzag_tolerance": config.BEAR_ZIGZAG_TOLERANCE,
+            "bear_min_drop": config.BEAR_MIN_DROP,
+            "bear_min_bars": config.BEAR_MIN_BARS,
+            "bear_label_rule": config.BEAR_LABEL_RULE,
+            "bull_zigzag_tolerance": config.BULL_ZIGZAG_TOLERANCE,
+            "bull_min_rise": config.BULL_MIN_RISE,
+            "bull_min_bars": config.BULL_MIN_BARS,
+            "bull_label_rule": config.BULL_LABEL_RULE,
             "fitness_horizon_mode": config.FITNESS_HORIZON_MODE,
             "fitness": config.FITNESS_WEIGHTS,
             "trade_top_fraction": config.TRADE_TOP_FRACTION,
@@ -513,6 +521,60 @@ def _validate_resume_metadata(
                 ),
             ]
         )
+    if label_mode == "bear" and archive_label_mode == "bear":
+        archive_rule = metadata.get("bear_label_rule")
+        if archive_rule != config.BEAR_LABEL_RULE:
+            raise ValueError(
+                "Resume archive uses an incompatible bear labeling rule. "
+                f"Archive={resume_path}, archive rule={archive_rule!r}, "
+                f"required rule={config.BEAR_LABEL_RULE!r}. Start a new archive."
+            )
+        checks.extend(
+            [
+                (
+                    "bear_zigzag_tolerance",
+                    metadata.get("bear_zigzag_tolerance"),
+                    float(config.BEAR_ZIGZAG_TOLERANCE),
+                ),
+                (
+                    "bear_min_drop",
+                    metadata.get("bear_min_drop"),
+                    float(config.BEAR_MIN_DROP),
+                ),
+                (
+                    "bear_min_bars",
+                    metadata.get("bear_min_bars"),
+                    int(config.BEAR_MIN_BARS),
+                ),
+            ]
+        )
+    if label_mode == "bull" and archive_label_mode == "bull":
+        archive_rule = metadata.get("bull_label_rule")
+        if archive_rule != config.BULL_LABEL_RULE:
+            raise ValueError(
+                "Resume archive uses an incompatible bull labeling rule. "
+                f"Archive={resume_path}, archive rule={archive_rule!r}, "
+                f"required rule={config.BULL_LABEL_RULE!r}. Start a new archive."
+            )
+        checks.extend(
+            [
+                (
+                    "bull_zigzag_tolerance",
+                    metadata.get("bull_zigzag_tolerance"),
+                    float(config.BULL_ZIGZAG_TOLERANCE),
+                ),
+                (
+                    "bull_min_rise",
+                    metadata.get("bull_min_rise"),
+                    float(config.BULL_MIN_RISE),
+                ),
+                (
+                    "bull_min_bars",
+                    metadata.get("bull_min_bars"),
+                    int(config.BULL_MIN_BARS),
+                ),
+            ]
+        )
 
     mismatches: list[str] = []
     for name, archive_value, current_value in checks:
@@ -607,6 +669,7 @@ def main() -> None:
             "this is the minimum high-price OLS slope change per candle; its "
             "mode default is config.SLOPE_SLOWDOWN_THRESHOLD. For "
             "two_sided_tp it is the positive absolute TP used on both sides."
+            " It is ignored by bear/bull, whose ZigZag settings come from config."
         ),
     )
     parser.add_argument(
@@ -623,7 +686,8 @@ def main() -> None:
         default=config.LABEL_DIRECTION,
         help=(
             "Label direction. Long means price up is favorable; Short means "
-            "price down is favorable. It is ignored by two_sided_tp. "
+            "price down is favorable. It is ignored by bear, bull, and "
+            "two_sided_tp. "
             f"Default: {config.LABEL_DIRECTION}."
         ),
     )

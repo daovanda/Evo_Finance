@@ -3,7 +3,10 @@
 Flow:
 1. Train one selected Long MFE archive rank.
 2. Learn its top-fraction cutoff on Final Val and apply it unchanged to Test.
-3. Enter Long at open H1 for every selected timestamp.
+3. Without the 1m trigger filter, enter at open H1. With the filter enabled,
+   enter exactly at the configured trigger touched during H1 minute 1. Since
+   minute-1 OHLC has no intrabar ordering, TP/SL evaluation starts at minute 2.
+   If minute 2 opens beyond SL, exit at that open instead of the better SL.
 4. Keep one fixed TP and SL active through H1, H2, and H3.
 5. If neither barrier is reached, exit at close H3.
 
@@ -27,7 +30,7 @@ PowerShell:
       --data data/crypto/BTCUSDT_5m.csv `
       --out-dir temp/output
 
-Oracle look-ahead variant (for diagnostic use only):
+One-minute trigger-entry variant:
     python -m temp.backtest_5m_long_mfe_fixed_tp_sl_h3 `
       --archive crypto/results/crypto_btc_5m_long_mfe_h3_tp01_top40_seed1_8h.json `
       --rank 1 `
@@ -345,15 +348,15 @@ def simulate_fixed_tp_sl(
     same_candle_policy: str,
 ) -> pd.DataFrame:
     """Simulate fixed barriers in chronological H1-H3 order."""
-    required = [
-        "high_h1",
-        "low_h1",
-        "high_h2",
-        "low_h2",
-        "high_h3",
-        "low_h3",
-        "close_h3",
+    minute_columns = [
+        column
+        for minute_offset in range(2, 6)
+        for column in (f"high_m1_{minute_offset}", f"low_m1_{minute_offset}")
     ]
+    minute_columns.append("open_m1_2")
+    has_minute_path = all(column in selected_path.columns for column in minute_columns)
+    required = ["high_h2", "low_h2", "high_h3", "low_h3", "close_h3"]
+    required += minute_columns if has_minute_path else ["high_h1", "low_h1"]
     result = selected_path.dropna(subset=required).copy()
     tp = float(take_profit)
     sl = float(stop_loss)
@@ -369,13 +372,38 @@ def simulate_fixed_tp_sl(
     exit_h = np.full(n, 3, dtype=int)
     outcome = np.full(n, "close_h3", dtype=object)
 
-    for step in range(1, 4):
-        high = pd.to_numeric(
-            result[f"high_h{step}"], errors="coerce"
-        ).to_numpy()
-        low = pd.to_numeric(
-            result[f"low_h{step}"], errors="coerce"
-        ).to_numpy()
+    execution_steps: list[tuple[str, str, str | None, int]] = []
+    if has_minute_path:
+        execution_steps.extend(
+            (
+                f"high_m1_{minute_offset}",
+                f"low_m1_{minute_offset}",
+                "open_m1_2" if minute_offset == 2 else None,
+                1,
+            )
+            for minute_offset in range(2, 6)
+        )
+    else:
+        execution_steps.append(("high_h1", "low_h1", None, 1))
+    execution_steps.extend(
+        [
+            ("high_h2", "low_h2", None, 2),
+            ("high_h3", "low_h3", None, 3),
+        ]
+    )
+
+    for high_column, low_column, open_column, step in execution_steps:
+        high = pd.to_numeric(result[high_column], errors="coerce").to_numpy()
+        low = pd.to_numeric(result[low_column], errors="coerce").to_numpy()
+        if open_column is not None:
+            open_return = pd.to_numeric(
+                result[open_column], errors="coerce"
+            ).to_numpy()
+            gap_sl_exit = active & (open_return <= -sl)
+            gross[gap_sl_exit] = open_return[gap_sl_exit]
+            exit_h[gap_sl_exit] = step
+            outcome[gap_sl_exit] = "sl_open_m1_2"
+            active[gap_sl_exit] = False
         tp_hit = high >= tp
         sl_hit = low <= -sl
         if policy == "stop_first":
@@ -414,11 +442,7 @@ def simulate_next_1m_tp_oracle(
     same_candle_policy: str,
     direction: str = "long",
 ) -> pd.DataFrame:
-    """Filter on H1 minute 1, then trade from H1 minutes 2-5 onward.
-
-    This deliberately uses future information and is therefore an oracle
-    diagnostic, not a causal strategy suitable for live trading.
-    """
+    """Enter at the minute-1 trigger; execute barriers from minute 2."""
     filter_tp = float(filter_take_profit)
     tp = float(take_profit)
     sl = float(stop_loss)
@@ -463,81 +487,64 @@ def simulate_next_1m_tp_oracle(
             "The first H1 1m open does not match the 5m H1 entry open."
         )
 
-    if config.canonical_label_direction(direction) == "short":
-        high_return = 1.0 - low_values / entry_open[:, None]
-        low_return = 1.0 - high_values / entry_open[:, None]
+    is_short = config.canonical_label_direction(direction) == "short"
+    if is_short:
+        trigger_touch = 1.0 - low_values[:, 0] / entry_open
+        trigger_factor = 1.0 - filter_tp
     else:
-        high_return = high_values / entry_open[:, None] - 1.0
-        low_return = low_values / entry_open[:, None] - 1.0
-    keep = high_return[:, 0] >= filter_tp
+        trigger_touch = high_values[:, 0] / entry_open - 1.0
+        trigger_factor = 1.0 + filter_tp
+    keep = trigger_touch >= filter_tp
     result = selected_path.iloc[np.flatnonzero(keep)].copy()
-    kept_high = high_return[keep]
-    kept_low = low_return[keep]
+    kept_open_h1 = entry_open[keep]
+    trigger_entry = kept_open_h1 * trigger_factor
 
-    # Minute 1 is filter-only. H1 execution starts at minutes 2 through 5.
-    result["high_h1"] = np.max(kept_high[:, 1:5], axis=1)
-    result["low_h1"] = np.min(kept_low[:, 1:5], axis=1)
-    n = len(result)
-    active = np.ones(n, dtype=bool)
-    gross = np.full(n, np.nan, dtype=float)
-    exit_h = np.full(n, 3, dtype=int)
-    outcome = np.full(n, "close_h3", dtype=object)
+    result["open_h1_original"] = kept_open_h1
+    result["trigger_entry"] = trigger_entry
+    result["entry_open"] = trigger_entry
 
-    for minute_offset in range(1, 5):
-        tp_hit = kept_high[:, minute_offset] >= tp
-        sl_hit = kept_low[:, minute_offset] <= -sl
-        if policy == "stop_first":
-            sl_exit = active & sl_hit
-            tp_exit = active & ~sl_hit & tp_hit
-        else:
-            tp_exit = active & tp_hit
-            sl_exit = active & ~tp_hit & sl_hit
+    # Rebase every future 5m return from open H1 to the executable trigger.
+    for step in range(1, 4):
+        for column in ("open", "high", "low", "close"):
+            name = f"{column}_h{step}"
+            if name not in result.columns:
+                continue
+            old_return = pd.to_numeric(result[name], errors="coerce")
+            if is_short:
+                result[name] = 1.0 - (1.0 - old_return) / trigger_factor
+            else:
+                result[name] = (1.0 + old_return) / trigger_factor - 1.0
 
-        gross[sl_exit] = -sl
-        outcome[sl_exit] = "sl_h1"
-        exit_h[sl_exit] = 1
-        active[sl_exit] = False
+    kept_high_values = high_values[keep]
+    kept_low_values = low_values[keep]
+    kept_open_values = open_values[keep]
+    if is_short:
+        minute_open_return = 1.0 - kept_open_values / trigger_entry[:, None]
+        minute_high_return = 1.0 - kept_low_values / trigger_entry[:, None]
+        minute_low_return = 1.0 - kept_high_values / trigger_entry[:, None]
+    else:
+        minute_open_return = kept_open_values / trigger_entry[:, None] - 1.0
+        minute_high_return = kept_high_values / trigger_entry[:, None] - 1.0
+        minute_low_return = kept_low_values / trigger_entry[:, None] - 1.0
 
-        gross[tp_exit] = tp
-        outcome[tp_exit] = "tp_h1"
-        exit_h[tp_exit] = 1
-        active[tp_exit] = False
+    # Minute 1 establishes the trigger fill. Its OHLC cannot reveal whether an
+    # adverse extreme happened before or after entry, so execution starts at
+    # minute 2 rather than falsely treating a pre-trigger low/high as a stop.
+    for minute_offset in range(5):
+        number = minute_offset + 1
+        result[f"open_m1_{number}"] = minute_open_return[:, minute_offset]
+        result[f"high_m1_{number}"] = minute_high_return[:, minute_offset]
+        result[f"low_m1_{number}"] = minute_low_return[:, minute_offset]
+    result["high_h1"] = np.max(minute_high_return[:, 1:5], axis=1)
+    result["low_h1"] = np.min(minute_low_return[:, 1:5], axis=1)
 
-    for step in (2, 3):
-        high = pd.to_numeric(
-            result[f"high_h{step}"], errors="coerce"
-        ).to_numpy(dtype=float)
-        low = pd.to_numeric(
-            result[f"low_h{step}"], errors="coerce"
-        ).to_numpy(dtype=float)
-        tp_hit = high >= tp
-        sl_hit = low <= -sl
-        if policy == "stop_first":
-            sl_exit = active & sl_hit
-            tp_exit = active & ~sl_hit & tp_hit
-        else:
-            tp_exit = active & tp_hit
-            sl_exit = active & ~tp_hit & sl_hit
-
-        gross[sl_exit] = -sl
-        outcome[sl_exit] = f"sl_h{step}"
-        exit_h[sl_exit] = step
-        active[sl_exit] = False
-
-        gross[tp_exit] = tp
-        outcome[tp_exit] = f"tp_h{step}"
-        exit_h[tp_exit] = step
-        active[tp_exit] = False
-
-    close_h3 = pd.to_numeric(
-        result["close_h3"], errors="coerce"
-    ).to_numpy(dtype=float)
-    gross[active] = close_h3[active]
-    result["outcome"] = outcome
-    result["exit_h"] = exit_h
-    result["gross_return"] = gross
-    result["net_return"] = gross - float(trade_cost)
-    return result
+    return simulate_fixed_tp_sl(
+        selected_path=result,
+        take_profit=tp,
+        stop_loss=sl,
+        trade_cost=float(trade_cost),
+        same_candle_policy=policy,
+    )
 
 
 def _parameter_grid(start: float, end: float, step: float) -> np.ndarray:
@@ -1047,7 +1054,7 @@ def run(
         f"SL=-{float(args.stop_loss):.2%}, "
         f"same-candle={args.same_candle_policy}, "
         f"cost={float(args.trade_cost):.3%}, "
-        f"next-1m TP oracle={'ON' if args.next_1m_tp_filter else 'OFF'}"
+        f"next-1m trigger entry={'ON' if args.next_1m_tp_filter else 'OFF'}"
         + (
             f", filter TP={filter_take_profit:.2%}"
             if args.next_1m_tp_filter
@@ -1093,8 +1100,8 @@ def parse_args(
         type=float,
         default=DEFAULT_FILTER_TAKE_PROFIT,
         help=(
-            "TP used only by H1 minute 1 look-ahead filtering. Defaults to "
-            "--take-profit when omitted."
+            "Entry trigger distance from open H1, required during H1 minute "
+            "1 when --next-1m-tp-filter is enabled."
         ),
     )
     parser.add_argument("--stop-loss", type=float, default=DEFAULT_STOP_LOSS)
@@ -1140,8 +1147,8 @@ def parse_args(
         "--next-1m-tp-filter",
         action="store_true",
         help=(
-            "Oracle diagnostic: use H1 minute 1 only to require a TP touch, "
-            "then evaluate H1 TP/SL from minutes 2-5 before H2-H3."
+            "Require H1 minute 1 to touch the trigger, enter exactly at that "
+            "trigger, then evaluate TP/SL from minute 2 through H3."
         ),
     )
     parser.add_argument("--val-start", default=config.VAL_START)
