@@ -45,7 +45,11 @@ from crypto.backtest import (
     _train_spec_bundle,
 )
 import matplotlib.pyplot as plt
-from crypto.main import _validate_resume_metadata
+from crypto.main import (
+    _make_fitness_evaluator,
+    _save_archive,
+    _validate_resume_metadata,
+)
 from crypto.data import CryptoFold, add_binary_labels, split_labeled_by_dates
 from crypto.evolution import CryptoArchive, CryptoIndividual, CryptoMutator
 from crypto.expression import CryptoFeatureSpace
@@ -60,6 +64,22 @@ from crypto.fitness import (
     _classification_trade_metrics,
     _internal_early_stop_split,
 )
+from crypto.quantile_fitness import (
+    QuantileFitnessEvaluator,
+    _internal_quantile_stop_split,
+)
+from crypto.meta_targets import (
+    MetaLearnerBase,
+    align_meta_feature_frame,
+    attach_meta_targets,
+    build_meta_feature_alignment,
+    build_meta_learner_data,
+    build_observed_mfe,
+    build_post_observation_mfe,
+    load_meta_base,
+    make_meta_fold,
+    required_feature_windows,
+)
 from crypto.prod.live_backend import (
     SCORE_BAND_COUNT,
     _prediction_score_band_index,
@@ -70,6 +90,815 @@ from crypto.prod.train_model import SCORE_BAND_FRACTIONS, _score_band_cutoffs
 
 
 class CryptoPipelineTests(unittest.TestCase):
+    def test_meta_learner_dynamic_tp_target_uses_hit_or_close_return(self):
+        index = pd.date_range("2022-01-01", periods=4, freq="5min")
+        frame = pd.DataFrame(
+            {
+                "quantile_up_mfe_h3": [0.0030, 0.0010, 0.0040, 0.0020],
+                "quantile_close_return_h3": [-0.0020, 0.0004, -0.0010, 0.0001],
+            },
+            index=index,
+        )
+        prediction = pd.Series([0.0020, 0.0020, 0.0002, np.nan], index=index)
+
+        targeted = attach_meta_targets(
+            frame,
+            prediction,
+            horizon=3,
+            min_prediction=0.0002,
+        )
+
+        self.assertEqual(targeted.loc[index[0], "label_h3"], 1.0)
+        self.assertAlmostEqual(targeted.loc[index[0], "future_return_h3"], 0.0020)
+        self.assertEqual(targeted.loc[index[1], "label_h3"], 0.0)
+        self.assertAlmostEqual(targeted.loc[index[1], "future_return_h3"], 0.0004)
+        self.assertTrue(pd.isna(targeted.loc[index[2], "label_h3"]))
+        self.assertTrue(pd.isna(targeted.loc[index[3], "future_return_h3"]))
+
+    def test_meta_learner_tp_offset_changes_target_and_hit_return(self):
+        index = pd.date_range("2022-01-01", periods=2, freq="5min")
+        frame = pd.DataFrame(
+            {
+                "quantile_up_mfe_h3": [0.0024, 0.0026],
+                "quantile_close_return_h3": [-0.0010, -0.0020],
+            },
+            index=index,
+        )
+        prediction = pd.Series(0.0020, index=index)
+
+        targeted = attach_meta_targets(
+            frame,
+            prediction,
+            horizon=3,
+            min_prediction=0.0002,
+            tp_offset=0.0005,
+        )
+
+        self.assertAlmostEqual(
+            targeted.loc[index[0], "meta_dynamic_tp_h3"], 0.0025
+        )
+        self.assertEqual(targeted.loc[index[0], "label_h3"], 0.0)
+        self.assertAlmostEqual(
+            targeted.loc[index[0], "future_return_h3"], -0.0010
+        )
+        self.assertEqual(targeted.loc[index[1], "label_h3"], 1.0)
+        self.assertAlmostEqual(
+            targeted.loc[index[1], "future_return_h3"], 0.0025
+        )
+
+    def test_meta_close_exit_labels_final_direction_but_keeps_tp_or_close_return(self):
+        index = pd.date_range("2022-01-01", periods=3, freq="5min")
+        frame = pd.DataFrame(
+            {
+                "quantile_up_mfe_h3": [0.0030, 0.0030, 0.0010],
+                "quantile_close_return_h3": [-0.0010, 0.0006, 0.0004],
+            },
+            index=index,
+        )
+        prediction = pd.Series(0.0020, index=index)
+
+        targeted = attach_meta_targets(
+            frame,
+            prediction,
+            horizon=3,
+            min_prediction=0.0002,
+            target_mode="meta_close_exit",
+            label_threshold=0.0005,
+        )
+
+        self.assertEqual(targeted.loc[index[0], "label_h3"], 0.0)
+        self.assertAlmostEqual(targeted.loc[index[0], "future_return_h3"], 0.0020)
+        self.assertEqual(targeted.loc[index[1], "label_h3"], 1.0)
+        self.assertAlmostEqual(targeted.loc[index[1], "future_return_h3"], 0.0020)
+        self.assertEqual(targeted.loc[index[2], "label_h3"], 0.0)
+        self.assertAlmostEqual(targeted.loc[index[2], "future_return_h3"], 0.0004)
+
+    def test_meta_strategy_profit_labels_tp_or_close_payoff(self):
+        index = pd.date_range("2022-01-01", periods=3, freq="5min")
+        frame = pd.DataFrame(
+            {
+                "quantile_up_mfe_h3": [0.0030, 0.0010, 0.0010],
+                "quantile_close_return_h3": [-0.0010, 0.0004, 0.0001],
+            },
+            index=index,
+        )
+        prediction = pd.Series(0.0020, index=index)
+
+        targeted = attach_meta_targets(
+            frame,
+            prediction,
+            horizon=3,
+            min_prediction=0.0002,
+            target_mode="meta_strategy_profit",
+            label_threshold=0.0002,
+        )
+
+        self.assertEqual(targeted["label_h3"].tolist(), [1.0, 1.0, 0.0])
+        np.testing.assert_allclose(
+            targeted["future_return_h3"].to_numpy(),
+            np.array([0.0020, 0.0004, 0.0001]),
+        )
+
+    def test_meta_mode_registry_and_default_thresholds(self):
+        self.assertTrue(config.is_meta_learner_label_mode("meta_learner"))
+        self.assertTrue(config.is_meta_learner_label_mode("meta_close_exit"))
+        self.assertTrue(config.is_meta_learner_label_mode("meta_strategy_profit"))
+        self.assertFalse(config.meta_prediction_is_feature("meta_learner"))
+        self.assertTrue(config.meta_prediction_is_feature("meta_close_exit"))
+        self.assertTrue(config.meta_prediction_is_feature("meta_strategy_profit"))
+        self.assertAlmostEqual(
+            config.default_label_threshold("meta_close_exit"), 0.0
+        )
+        self.assertAlmostEqual(
+            config.default_label_threshold("meta_strategy_profit"),
+            config.TRADE_COST,
+        )
+
+    def test_meta_learner_fold_is_chronological_and_purged(self):
+        index = pd.date_range("2022-01-01", periods=100, freq="5min")
+        frame = pd.DataFrame({"label_h3": 1.0}, index=index)
+
+        fold = make_meta_fold(
+            "wf_01",
+            frame,
+            val_fraction=0.20,
+            purge_bars=4,
+        )
+
+        self.assertEqual(len(fold.train_df), 76)
+        self.assertEqual(len(fold.val_df), 20)
+        self.assertEqual(fold.train_df.index[-1], index[75])
+        self.assertEqual(fold.val_df.index[0], index[80])
+        self.assertTrue(fold.train_df.index.max() < fold.val_df.index.min())
+
+    def test_meta_learner_base_archive_requires_mfe_quantile_and_matching_horizon(self):
+        archive = CryptoArchive()
+        archive.try_add(CryptoIndividual(features=["ret"], score=0.1))
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "base.json"
+            archive.save(
+                path,
+                metadata={
+                    "label_mode": "quantile_trade",
+                    "quantile_target": "mfe",
+                    "quantile_alpha": 0.20,
+                    "horizons": [3],
+                },
+            )
+            base = load_meta_base(path, rank=1, horizons=[3])
+            self.assertEqual(base.horizon, 3)
+            self.assertAlmostEqual(base.quantile, 0.20)
+            self.assertEqual(len(base.archive_sha256), 64)
+
+            with self.assertRaisesRegex(ValueError, "exactly match"):
+                load_meta_base(path, rank=1, horizons=[1])
+
+    def test_meta_learner_uses_binary_fitness(self):
+        for mode in config.META_LEARNER_LABEL_MODES:
+            with self.subTest(mode=mode):
+                self.assertIsInstance(
+                    _make_fitness_evaluator(mode, [3]),
+                    CryptoFitnessEvaluator,
+                )
+
+    def test_meta_learner_collects_base_formula_windows(self):
+        individual = CryptoIndividual(
+            features=[
+                "ts_rank(ret_z_4, 6)",
+                "(trade_count_ratio_3 + realized_vol_z_15)",
+            ]
+        )
+        self.assertEqual(required_feature_windows(individual), [3, 4, 6, 15])
+
+    def test_meta_learner_archive_records_multi_timeframe_feature_policy(self):
+        base_archive = CryptoArchive()
+        base_archive.try_add(CryptoIndividual(features=["ret"], score=0.1))
+        meta_archive = CryptoArchive()
+        meta_archive.try_add(CryptoIndividual(features=["ret"], score=0.2))
+
+        with TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir) / "base.json"
+            output_path = Path(tmpdir) / "meta.json"
+            base_archive.save(
+                base_path,
+                metadata={
+                    "label_mode": "quantile_trade",
+                    "quantile_target": "mfe",
+                    "quantile_alpha": 0.20,
+                    "horizons": [3],
+                },
+            )
+            with patch.multiple(
+                config,
+                META_LEARNER_BASE_ARCHIVE=base_path,
+                META_LEARNER_BASE_RANK=1,
+                META_LEARNER_MIN_PREDICTION=0.0002,
+                META_LEARNER_META_VAL_FRACTION=0.20,
+                META_LEARNER_FEATURE_DATA=Path("data/crypto/BTCUSDT_1m.csv"),
+                META_LEARNER_FEATURE_LOOKAHEAD_BARS=1,
+                META_LEARNER_FEATURE_INCLUDE_H1=False,
+                META_LEARNER_FEATURE_ALIGNMENT_RULE=(
+                    "target_open_plus_lower_timeframe_lookahead_v1"
+                ),
+                META_LEARNER_TARGET_START_STEP=1,
+                META_LEARNER_TARGET_INTERVAL_SECONDS=300.0,
+                META_LEARNER_FEATURE_INTERVAL_SECONDS=60.0,
+                TRADE_TOP_FRACTION=0.80,
+            ):
+                _save_archive(
+                    meta_archive,
+                    output_path,
+                    horizons=[3],
+                    label_threshold=0.0,
+                    label_mode="meta_learner",
+                    label_direction="long",
+                    exit_after_k=None,
+                )
+                loaded = CryptoArchive.load(output_path)
+                _validate_resume_metadata(
+                    loaded,
+                    output_path,
+                    horizons=[3],
+                    label_mode="meta_learner",
+                    label_direction="long",
+                    label_threshold=0.0,
+                )
+
+                self.assertEqual(
+                    loaded.metadata["meta_feature_data"],
+                    "data/crypto/BTCUSDT_1m.csv",
+                )
+                self.assertEqual(
+                    loaded.metadata["meta_target_interval_seconds"], 300.0
+                )
+                self.assertEqual(
+                    loaded.metadata["meta_feature_interval_seconds"], 60.0
+                )
+                self.assertEqual(loaded.metadata["meta_feature_lookahead_bars"], 1)
+                self.assertEqual(
+                    loaded.metadata["meta_target_path_rule"],
+                    "observed_feature_inclusive_original_mfe_target_v3",
+                )
+
+                with patch.object(
+                    config,
+                    "META_LEARNER_FEATURE_DATA",
+                    Path("data/crypto/OTHER_1m.csv"),
+                ):
+                    with self.assertRaisesRegex(ValueError, "meta_feature_data"):
+                        _validate_resume_metadata(
+                            loaded,
+                            output_path,
+                            horizons=[3],
+                            label_mode="meta_learner",
+                            label_direction="long",
+                            label_threshold=0.0,
+                        )
+
+    def test_meta_variant_archives_record_distinct_target_rules(self):
+        base_archive = CryptoArchive()
+        base_archive.try_add(CryptoIndividual(features=["ret"], score=0.1))
+        result_archive = CryptoArchive()
+        result_archive.try_add(CryptoIndividual(features=["ret"], score=0.2))
+
+        with TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir) / "base.json"
+            base_archive.save(
+                base_path,
+                metadata={
+                    "label_mode": "quantile_trade",
+                    "quantile_target": "mfe",
+                    "quantile_alpha": 0.20,
+                    "horizons": [3],
+                },
+            )
+            with patch.multiple(
+                config,
+                META_LEARNER_BASE_ARCHIVE=base_path,
+                META_LEARNER_BASE_RANK=1,
+                META_LEARNER_FEATURE_DATA=None,
+                META_LEARNER_FEATURE_LOOKAHEAD_BARS=0,
+                META_LEARNER_FEATURE_INCLUDE_H1=False,
+                META_LEARNER_FEATURE_ALIGNMENT_RULE=(
+                    "target_open_plus_target_interval_minus_feature_interval_v1"
+                ),
+                META_LEARNER_TARGET_START_STEP=1,
+                META_LEARNER_TARGET_INTERVAL_SECONDS=None,
+                META_LEARNER_FEATURE_INTERVAL_SECONDS=None,
+            ):
+                for mode, threshold in (
+                    ("meta_close_exit", 0.0005),
+                    ("meta_strategy_profit", config.TRADE_COST),
+                ):
+                    with self.subTest(mode=mode):
+                        output_path = Path(tmpdir) / f"{mode}.json"
+                        _save_archive(
+                            result_archive,
+                            output_path,
+                            horizons=[3],
+                            label_threshold=threshold,
+                            label_mode=mode,
+                            label_direction="long",
+                            exit_after_k=None,
+                        )
+                        loaded = CryptoArchive.load(output_path)
+                        self.assertEqual(loaded.metadata["meta_target_mode"], mode)
+                        self.assertTrue(
+                            loaded.metadata["meta_prediction_is_feature"]
+                        )
+                        self.assertEqual(
+                            loaded.metadata["meta_learner_rule"],
+                            config.meta_learner_rule(mode),
+                        )
+                        _validate_resume_metadata(
+                            loaded,
+                            output_path,
+                            horizons=[3],
+                            label_mode=mode,
+                            label_direction="long",
+                            label_threshold=threshold,
+                        )
+
+    def test_meta_learner_base_predictions_are_strictly_oof(self):
+        index = pd.date_range("2021-01-01", periods=120, freq="5min")
+        labeled = pd.DataFrame(
+            {
+                "quantile_up_mfe_h3": 0.002,
+                "quantile_close_return_h3": -0.001,
+            },
+            index=index,
+        )
+        feature_space = CryptoFeatureSpace(
+            pd.DataFrame({"ret": np.arange(120, dtype=float)}, index=index),
+            ["ret"],
+        )
+        original_fold = CryptoFold(
+            name="wf_01",
+            train_df=labeled.iloc[:40],
+            val_df=labeled.iloc[45:70],
+            train_start=index[0],
+            train_end=index[40],
+            val_start=index[45],
+            val_end=index[70],
+        )
+        base = MetaLearnerBase(
+            archive_path=Path("base.json"),
+            archive_sha256="a" * 64,
+            rank=1,
+            horizon=3,
+            quantile=0.20,
+            individual=CryptoIndividual(features=["ret"]),
+            metadata={},
+        )
+        calls: list[tuple[pd.Index, pd.Index]] = []
+
+        def fake_base_prediction(*args, train_df, predict_df, **kwargs):
+            del args, kwargs
+            calls.append((train_df.index.copy(), predict_df.index.copy()))
+            return pd.Series(0.001, index=predict_df.index)
+
+        with patch(
+            "crypto.meta_targets._base_prediction",
+            side_effect=fake_base_prediction,
+        ):
+            result = build_meta_learner_data(
+                base_labeled_df=labeled,
+                original_folds=[original_fold],
+                final_train_df=labeled.iloc[:70],
+                final_val_df=labeled.iloc[75:90],
+                final_test_df=labeled.iloc[95:115],
+                feature_space=feature_space,
+                base=base,
+                min_prediction=0.0002,
+                meta_val_fraction=0.20,
+                target_start_step=1,
+                purge_bars=2,
+                test_start=index[95],
+            )
+
+        self.assertEqual(len(calls), 3)
+        for train_index, prediction_index in calls:
+            self.assertLess(train_index.max(), prediction_index.min())
+        self.assertEqual(calls[0][0].max(), index[39])
+        self.assertEqual(calls[0][1].min(), index[45])
+        self.assertEqual(calls[1][0].max(), index[69])
+        self.assertEqual(calls[1][1].min(), index[75])
+        self.assertEqual(calls[2][0].max(), index[92])
+        self.assertEqual(calls[2][1].min(), index[95])
+        self.assertEqual(result.train_df.index.min(), index[45])
+        self.assertEqual(result.train_df.index.max(), index[69])
+        self.assertNotIn("meta_dynamic_tp_h3", feature_space.base_df.columns)
+
+    def test_meta_feature_alignment_uses_last_closed_one_minute_candle(self):
+        target_index = pd.date_range("2024-01-01", periods=3, freq="5min")
+        feature_index = pd.date_range("2024-01-01", periods=15, freq="1min")
+
+        alignment = build_meta_feature_alignment(target_index, feature_index)
+
+        expected_source = pd.DatetimeIndex(
+            [feature_index[4], feature_index[9], feature_index[14]]
+        ).astype("datetime64[ns]")
+        pd.testing.assert_index_equal(alignment.source_index, expected_source)
+        self.assertEqual(alignment.target_interval, pd.Timedelta(minutes=5))
+        self.assertEqual(alignment.feature_interval, pd.Timedelta(minutes=1))
+
+        sampled = pd.DataFrame(
+            {"micro": [4.0, 9.0, 14.0]},
+            index=expected_source,
+        )
+        aligned = align_meta_feature_frame(sampled, alignment)
+        self.assertEqual(aligned.index.tolist(), target_index.tolist())
+        self.assertEqual(aligned["micro"].tolist(), [4.0, 9.0, 14.0])
+
+    def test_meta_feature_alignment_can_observe_complete_h1(self):
+        target_index = pd.date_range("2024-01-01", periods=3, freq="5min")
+        feature_index = pd.date_range("2024-01-01", periods=20, freq="1min")
+
+        alignment = build_meta_feature_alignment(
+            target_index,
+            feature_index,
+            include_h1=True,
+        )
+
+        expected_source = pd.DatetimeIndex(
+            [feature_index[9], feature_index[14], feature_index[19]]
+        ).astype("datetime64[ns]")
+        pd.testing.assert_index_equal(alignment.source_index, expected_source)
+
+    def test_meta_feature_alignment_can_observe_only_first_h1_minute(self):
+        target_index = pd.date_range("2024-01-01", periods=3, freq="5min")
+        feature_index = pd.date_range("2024-01-01", periods=20, freq="1min")
+
+        alignment = build_meta_feature_alignment(
+            target_index,
+            feature_index,
+            lookahead_bars=1,
+        )
+
+        expected_source = pd.DatetimeIndex(
+            [feature_index[5], feature_index[10], feature_index[15]]
+        ).astype("datetime64[ns]")
+        pd.testing.assert_index_equal(alignment.source_index, expected_source)
+        self.assertEqual(alignment.lookahead_bars, 1)
+
+    def test_post_observation_mfe_excludes_observed_first_minute(self):
+        target_index = pd.date_range("2024-01-01", periods=4, freq="5min")
+        feature_index = pd.date_range("2024-01-01", periods=30, freq="1min")
+        target = pd.DataFrame({"open": 100.0}, index=target_index)
+        feature = pd.DataFrame({"high": 100.0}, index=feature_index)
+        feature.loc[feature_index[5], "high"] = 110.0
+        feature.loc[feature_index[6], "high"] = 102.0
+        alignment = build_meta_feature_alignment(
+            target_index,
+            feature_index,
+            lookahead_bars=1,
+        )
+
+        mfe = build_post_observation_mfe(
+            target,
+            feature,
+            alignment,
+            horizon=3,
+        )
+
+        self.assertAlmostEqual(mfe.iloc[0], 0.02)
+
+        observed = build_observed_mfe(target, feature, alignment)
+        self.assertAlmostEqual(observed.iloc[0], 0.10)
+
+    def test_meta_target_drops_tp_hits_during_observation(self):
+        index = pd.date_range("2024-01-01", periods=2, freq="5min")
+        frame = pd.DataFrame(
+            {
+                "post_mfe": [0.0030, 0.0030],
+                "observed_mfe": [0.0025, 0.0010],
+                "quantile_close_return_h3": [-0.0010, -0.0010],
+            },
+            index=index,
+        )
+        prediction = pd.Series(0.0020, index=index)
+
+        targeted = attach_meta_targets(
+            frame,
+            prediction,
+            horizon=3,
+            min_prediction=0.0002,
+            path_mfe_column="post_mfe",
+            observed_mfe_column="observed_mfe",
+        )
+
+        self.assertTrue(pd.isna(targeted.loc[index[0], "label_h3"]))
+        self.assertTrue(pd.isna(targeted.loc[index[0], "future_return_h3"]))
+        self.assertEqual(targeted.loc[index[1], "label_h3"], 1.0)
+
+    def test_meta_h1_features_target_hits_start_at_h2(self):
+        index = pd.date_range("2024-01-01", periods=3, freq="5min")
+        frame = pd.DataFrame(
+            {
+                "quantile_up_s2": [0.0010, 0.0030, 0.0010],
+                "quantile_up_s3": [0.0015, 0.0010, 0.0040],
+                "quantile_close_return_h3": [-0.0010, 0.0005, 0.0010],
+            },
+            index=index,
+        )
+        prediction = pd.Series(0.0020, index=index)
+
+        targeted = attach_meta_targets(
+            frame,
+            prediction,
+            horizon=3,
+            min_prediction=0.0002,
+            target_start_step=2,
+        )
+
+        self.assertEqual(targeted["label_h3"].tolist(), [0.0, 1.0, 1.0])
+        self.assertAlmostEqual(targeted.loc[index[0], "future_return_h3"], -0.0010)
+        self.assertAlmostEqual(targeted.loc[index[1], "future_return_h3"], 0.0020)
+
+    def test_feature_builder_sampling_matches_full_one_minute_features(self):
+        frame = _synthetic_crypto_frame(40)
+        frame.index = pd.date_range("2024-01-01", periods=40, freq="1min")
+        output_index = frame.index[[4, 9, 14, 19, 24, 29, 34, 39]]
+
+        full = build_feature_frame(
+            frame,
+            windows=[3, 5],
+            quality_filter=False,
+        )
+        sampled = build_feature_frame(
+            frame,
+            windows=[3, 5],
+            quality_filter=False,
+            output_index=output_index,
+        )
+
+        pd.testing.assert_frame_equal(sampled, full.loc[output_index])
+
+    def test_main_selects_quantile_fitness_only_for_quantile_trade_mode(self):
+        self.assertIsInstance(
+            _make_fitness_evaluator("quantile_trade", [1]),
+            QuantileFitnessEvaluator,
+        )
+        self.assertIsInstance(
+            _make_fitness_evaluator("mfe", [3]),
+            CryptoFitnessEvaluator,
+        )
+
+    def test_quantile_trade_archive_records_and_validates_its_policy(self):
+        archive = CryptoArchive()
+        archive.try_add(CryptoIndividual(features=["ret"], score=0.1))
+        with TemporaryDirectory() as tmpdir:
+            quantile_path = Path(tmpdir) / "quantile.json"
+            binary_path = Path(tmpdir) / "binary.json"
+            _save_archive(
+                archive,
+                quantile_path,
+                horizons=[1],
+                label_threshold=0.0,
+                label_mode="quantile_trade",
+                label_direction="long",
+                exit_after_k=None,
+            )
+            _save_archive(
+                archive,
+                binary_path,
+                horizons=[3],
+                label_threshold=0.001,
+                label_mode="mfe",
+                label_direction="long",
+                exit_after_k=None,
+            )
+            loaded = CryptoArchive.load(quantile_path)
+            binary = CryptoArchive.load(binary_path)
+
+        self.assertEqual(
+            loaded.metadata["quantile_trade_rule"], config.QUANTILE_TRADE_RULE
+        )
+        self.assertEqual(
+            loaded.metadata["quantile_target"],
+            config.QUANTILE_TARGET,
+        )
+        self.assertEqual(loaded.metadata["quantile_alpha"], config.QUANTILE_ALPHA)
+        self.assertEqual(loaded.metadata["fitness_horizon_mode"], "mean")
+        self.assertEqual(
+            loaded.metadata["split_policy"]["wf_end"],
+            pd.Timestamp(config.VAL_START).isoformat(),
+        )
+        self.assertNotIn("trade_top_fraction", loaded.metadata)
+        self.assertNotIn("trade_cost", loaded.metadata)
+        self.assertNotIn("quantile_trade_rule", binary.metadata)
+        _validate_resume_metadata(
+            archive=loaded,
+            resume_path=Path("quantile.json"),
+            horizons=[1],
+            label_mode="quantile_trade",
+            label_direction="short",
+            label_threshold=0.0,
+        )
+        with patch.object(
+            config,
+            "QUANTILE_ALPHA",
+            config.QUANTILE_ALPHA - 0.1,
+        ):
+            with self.assertRaisesRegex(ValueError, "quantile_alpha"):
+                _validate_resume_metadata(
+                    archive=loaded,
+                    resume_path=Path("quantile.json"),
+                    horizons=[1],
+                    label_mode="quantile_trade",
+                    label_direction="long",
+                    label_threshold=0.0,
+                )
+        with self.assertRaisesRegex(ValueError, "split_policy"):
+            _validate_resume_metadata(
+                archive=loaded,
+                resume_path=Path("quantile.json"),
+                horizons=[1],
+                label_mode="quantile_trade",
+                label_direction="long",
+                label_threshold=0.0,
+                wf_end=config.TEST_START,
+            )
+
+    def test_quantile_trade_targets_use_open_h1_and_complete_future_path(self):
+        idx = pd.date_range("2024-01-01", periods=5, freq="15min")
+        df = pd.DataFrame(
+            {
+                "open": [90.0, 100.0, 100.0, 100.0, 100.0],
+                "high": [91.0, 101.0, 102.0, 103.0, 104.0],
+                "low": [89.0, 99.0, 98.0, 97.0, 96.0],
+                "close": [90.0, 100.5, 101.0, 99.0, 100.0],
+                "volume": [10.0] * 5,
+                "trade_count": [10] * 5,
+                "taker_buy_base_volume": [5.0] * 5,
+                "taker_buy_quote_volume": [500.0] * 5,
+            },
+            index=idx,
+        )
+
+        labeled = add_binary_labels(
+            df,
+            horizons=[2],
+            label_mode="quantile_trade",
+            label_direction="Short",
+            threshold=123.0,
+        )
+
+        self.assertAlmostEqual(labeled.loc[idx[0], "quantile_up_s1"], 0.01)
+        self.assertAlmostEqual(labeled.loc[idx[0], "quantile_down_s1"], 0.01)
+        self.assertAlmostEqual(labeled.loc[idx[0], "quantile_up_mfe_h2"], 0.02)
+        self.assertAlmostEqual(labeled.loc[idx[0], "quantile_down_mfe_h2"], 0.02)
+        self.assertAlmostEqual(labeled.loc[idx[0], "quantile_close_return_h2"], 0.01)
+        self.assertTrue(labeled["quantile_up_mfe_h2"].iloc[-2:].isna().all())
+        self.assertNotIn("label_h2", labeled.columns)
+        self.assertTrue(config.is_direction_neutral_label_mode("quantile_trade"))
+
+    def test_quantile_trade_selects_mfe_mae_or_close_target(self):
+        self.assertEqual(
+            QuantileFitnessEvaluator([3], "mfe", 0.8).target_column(3),
+            "quantile_up_mfe_h3",
+        )
+        self.assertEqual(
+            QuantileFitnessEvaluator([3], "mae", 0.2).target_column(3),
+            "quantile_down_mfe_h3",
+        )
+        self.assertEqual(
+            QuantileFitnessEvaluator([3], "close", 0.5).target_column(3),
+            "quantile_close_return_h3",
+        )
+
+    def test_quantile_trade_fitness_runs_walk_forward_and_final_splits(self):
+        df = _synthetic_crypto_frame(900)
+        labeled = add_binary_labels(df, horizons=[1], label_mode="quantile_trade")
+        feature_df = pd.DataFrame(
+            {"ret": df["close"].pct_change().fillna(0.0)}, index=df.index
+        )
+        feature_space = CryptoFeatureSpace(feature_df, ["ret"])
+        individual = CryptoIndividual(features=["ret"])
+        fold = CryptoFold(
+            name="wf_01",
+            train_df=labeled.iloc[:600],
+            val_df=labeled.iloc[620:750],
+            train_start=labeled.index[0],
+            train_end=labeled.index[599],
+            val_start=labeled.index[620],
+            val_end=labeled.index[749],
+        )
+        params = {
+            "objective": "quantile",
+            "metric": "quantile",
+            "learning_rate": 0.05,
+            "num_leaves": 7,
+            "max_depth": 3,
+            "min_data_in_leaf": 20,
+            "force_col_wise": True,
+            "verbose": -1,
+            "seed": 31,
+        }
+        evaluator = QuantileFitnessEvaluator(
+            horizons=[1],
+            target="mfe",
+            quantile=0.8,
+            lgbm_params=params,
+            num_boost_round=3,
+            early_stopping_rounds=0,
+        )
+
+        score = evaluator.evaluate_walk_forward(individual, [fold], feature_space)
+        final = evaluator.evaluate_final(
+            individual=individual,
+            train_df=labeled.iloc[:600],
+            val_df=labeled.iloc[620:750],
+            test_df=labeled.iloc[760:890],
+            feature_data=feature_space,
+        )
+
+        self.assertTrue(np.isfinite(score))
+        self.assertEqual(individual.metrics["fitness_type"], "quantile_accuracy")
+        self.assertNotIn("trade_return_score", individual.metrics)
+        self.assertIn("quantile_pinball_score", individual.metrics)
+        self.assertIn("quantile_baseline_pinball_score", individual.metrics)
+        self.assertIn("quantile_pinball_skill", individual.metrics)
+        self.assertIn("quantile_pinball_skill_std", individual.metrics)
+        self.assertIn("quantile_coverage_error", individual.metrics)
+        self.assertIn("quantile_spearman_ic", individual.metrics)
+        self.assertIn("quantile_mae", individual.metrics)
+        self.assertIn("quantile_rmse", individual.metrics)
+        self.assertIn("quantile_prediction_mean", individual.metrics)
+        self.assertIn("quantile_target_quantile", individual.metrics)
+        self.assertIn("quantile_target_mean", individual.metrics)
+        self.assertEqual(final["final_fitness_type"], "quantile_accuracy")
+        self.assertIn("final_val_quantile_pinball_skill", final)
+        self.assertIn("final_test_quantile_pinball_skill", final)
+        self.assertIn("final_val_quantile_prediction_mean", final)
+        self.assertIn("final_val_quantile_target_quantile", final)
+        self.assertIn("final_test_quantile_prediction_mean", final)
+        self.assertIn("final_test_quantile_target_quantile", final)
+        self.assertEqual(final["final_train_rows"], 600.0)
+        self.assertEqual(final["final_val_rows"], 130.0)
+        self.assertEqual(final["final_test_rows"], 130.0)
+
+    def test_quantile_trade_accepts_arbitrary_positive_horizons(self):
+        evaluator = QuantileFitnessEvaluator(horizons=[1, 3, 5])
+        self.assertEqual(evaluator.horizons, [1, 3, 5])
+        with self.assertRaisesRegex(ValueError, "positive integers"):
+            QuantileFitnessEvaluator(horizons=[0])
+
+    def test_quantile_spearman_ic_preserves_index_alignment_and_rank(self):
+        index = pd.Index(["a", "b", "c", "d"])
+        actual = pd.Series([1.0, 2.0, 3.0, 4.0], index=index)
+        prediction = pd.Series(
+            [4.0, 2.0, 1.0, 3.0],
+            index=pd.Index(["d", "b", "a", "c"]),
+        )
+        evaluator = QuantileFitnessEvaluator([1], target="close", quantile=0.5)
+
+        aligned = evaluator._accuracy(actual, prediction, baseline_value=2.5)
+        reversed_rank = evaluator._accuracy(
+            actual,
+            pd.Series([4.0, 3.0, 2.0, 1.0], index=index),
+            baseline_value=2.5,
+        )
+
+        self.assertAlmostEqual(aligned.spearman_ic, 1.0)
+        self.assertAlmostEqual(reversed_rank.spearman_ic, -1.0)
+        self.assertAlmostEqual(aligned.target_quantile, 2.5)
+
+    def test_quantile_close_direction_accuracy_uses_return_sign(self):
+        index = pd.RangeIndex(5)
+        actual = pd.Series([-0.02, -0.01, 0.0, 0.01, 0.02], index=index)
+        prediction = pd.Series([-0.03, 0.01, 0.0, -0.01, 0.03], index=index)
+        evaluator = QuantileFitnessEvaluator([1], target="close", quantile=0.5)
+
+        metrics = evaluator._accuracy(actual, prediction, baseline_value=0.0)
+
+        self.assertAlmostEqual(metrics.direction_accuracy, 3.0 / 5.0)
+        self.assertAlmostEqual(metrics.direction_baseline, 3.0 / 5.0)
+        self.assertAlmostEqual(metrics.direction_edge, 0.0)
+        self.assertEqual(
+            config.quantile_trade_fitness_weights("close"),
+            config.quantile_trade_fitness_weights("mfe"),
+        )
+
+    def test_quantile_internal_stop_split_embargoes_future_target_bars(self):
+        index = pd.RangeIndex(100)
+        X = pd.DataFrame({"feature": np.arange(100, dtype=float)}, index=index)
+        y = pd.Series(np.arange(100, dtype=float), index=index)
+
+        with patch.object(config, "EARLY_STOP_VALID_FRACTION", 0.20), patch.object(
+            config, "EARLY_STOP_MIN_VALID_SAMPLES", 1
+        ):
+            split = _internal_quantile_stop_split(X, y, purge_bars=5)
+
+        self.assertIsNotNone(split)
+        X_fit, y_fit, X_stop, y_stop = split
+        self.assertEqual(X_fit.index[-1], 74)
+        self.assertEqual(y_fit.index[-1], 74)
+        self.assertEqual(X_stop.index[0], 80)
+        self.assertEqual(y_stop.index[0], 80)
+        self.assertTrue(set(range(75, 80)).isdisjoint(X_fit.index))
+        self.assertTrue(set(range(75, 80)).isdisjoint(X_stop.index))
+
     def test_prod_score_bands_cover_full_val_distribution(self):
         pred = pd.Series(np.arange(1, 101, dtype=float))
         cutoffs = _score_band_cutoffs(pred)
@@ -101,7 +930,9 @@ class CryptoPipelineTests(unittest.TestCase):
         def horizon_split(split, pred):
             data = pd.DataFrame({"label": 0.0, "pred": pred}, index=idx)
             selected = data.nlargest(50, "pred").index
-            return SplitSignals(split, data, selected, float(pred.loc[selected].min()), 0.05)
+            return SplitSignals(
+                split, data, selected, float(pred.loc[selected].min()), 0.05
+            )
 
         val_h1 = horizon_split("val", pred_h1)
         val_h2 = horizon_split("val", pred_h2)
@@ -155,9 +986,7 @@ class CryptoPipelineTests(unittest.TestCase):
             thresholds=[0.001],
         )
         raw = pd.DataFrame(rows)
-        band_count = int(
-            round(BASE_FRACTION_BAND_MAX / BASE_FRACTION_BAND_STEP)
-        )
+        band_count = int(round(BASE_FRACTION_BAND_MAX / BASE_FRACTION_BAND_STEP))
 
         for split in ("val", "test"):
             split_rows = raw[
@@ -221,7 +1050,9 @@ class CryptoPipelineTests(unittest.TestCase):
             ["split", "base signal", "avg trades/day", "TP_threshold"],
         )
         self.assertEqual(rendered_overview["base signal"].tolist(), ["20", "20"])
-        self.assertEqual(rendered_overview["avg trades/day"].tolist(), ["10.00", "10.00"])
+        self.assertEqual(
+            rendered_overview["avg trades/day"].tolist(), ["10.00", "10.00"]
+        )
 
         trade_path = _two_sided_score_band_trade_path(
             base_bundle=bundle,
@@ -473,9 +1304,7 @@ class CryptoPipelineTests(unittest.TestCase):
         self.assertEqual(metrics["cutloss"], 0)
         self.assertEqual(metrics["close_h5"], 1)
         self.assertEqual(metrics["high_h1_below_threshold"], 6)
-        self.assertAlmostEqual(
-            metrics["high_h1_below_threshold_rate"], 6 / 7
-        )
+        self.assertAlmostEqual(metrics["high_h1_below_threshold_rate"], 6 / 7)
         self.assertAlmostEqual(
             metrics["high_h1_below_threshold_high_h2_mean"],
             0.007 / 6,
@@ -876,9 +1705,7 @@ class CryptoPipelineTests(unittest.TestCase):
         self.assertEqual(summary["base_low_h1_le_neg005"], 3)
         self.assertAlmostEqual(summary["base_low_h1_le_neg005_rate"], 1.0)
         tp_sweep = pd.DataFrame(tp_rows)
-        exit2_no_selected = tp_sweep[
-            tp_sweep["group"] == "p2_exit_k2_no_selected"
-        ]
+        exit2_no_selected = tp_sweep[tp_sweep["group"] == "p2_exit_k2_no_selected"]
         self.assertAlmostEqual(
             float(exit2_no_selected["close_h2_return_mean"].iloc[0]),
             -0.002,
@@ -1246,7 +2073,7 @@ class CryptoPipelineTests(unittest.TestCase):
             100.0,
             99.6,
             99.2,
-            98.4,   # confirmed trough after the following rebound
+            98.4,  # confirmed trough after the following rebound
             98.8,
             99.2,
             99.0,
@@ -1310,7 +2137,7 @@ class CryptoPipelineTests(unittest.TestCase):
         close = [
             100.0,
             99.6,
-            99.2,   # confirmed trough after the following rebound
+            99.2,  # confirmed trough after the following rebound
             99.6,
             100.0,
             100.4,
@@ -1396,16 +2223,19 @@ class CryptoPipelineTests(unittest.TestCase):
         long_high = [100, 101, 102, 103, 104, 103, 101, 99, 100, 100, 100, 100]
         short_high = [104, 103, 102, 101, 100, 101, 103, 105, 104, 104, 104, 104]
 
-        long_source = config.slope_slowdown_future_return(
-            frame_with_high(long_high),
-            horizon=3,
-            direction="Long",
-        )
-        short_source = config.slope_slowdown_future_return(
-            frame_with_high(short_high),
-            horizon=3,
-            direction="Short",
-        )
+        # This test verifies the documented five-candle example independently
+        # from the user's active SLOPE_LOOKBACK experiment in config.py.
+        with patch.object(config, "SLOPE_LOOKBACK", 5):
+            long_source = config.slope_slowdown_future_return(
+                frame_with_high(long_high),
+                horizon=3,
+                direction="Long",
+            )
+            short_source = config.slope_slowdown_future_return(
+                frame_with_high(short_high),
+                horizon=3,
+                direction="Short",
+            )
 
         x5 = np.arange(5, dtype=float)
         x8 = np.arange(8, dtype=float)
@@ -1492,6 +2322,150 @@ class CryptoPipelineTests(unittest.TestCase):
                 label_mode="slope_slowdown",
                 threshold=0.0,
             )
+
+    def test_slope_slowdown_all_uses_every_complete_initial_slope(self):
+        idx = pd.date_range("2024-01-01", periods=10, freq="1min")
+        frame = pd.DataFrame(
+            {
+                "open": [100.0] * len(idx),
+                "high": [100, 100, 100, 100, 100, 99, 98, 97, 97, 97],
+                "low": [90.0] * len(idx),
+                "close": [99.0] * len(idx),
+                "volume": [10.0] * len(idx),
+                "trade_count": [10] * len(idx),
+                "taker_buy_base_volume": [5.0] * len(idx),
+                "taker_buy_quote_volume": [500.0] * len(idx),
+            },
+            index=idx,
+        )
+        gated = add_binary_labels(
+            frame,
+            horizons=[2],
+            label_mode="slope_slowdown",
+            label_direction="Long",
+            threshold=0.0002,
+        )
+        all_slopes = add_binary_labels(
+            frame,
+            horizons=[2],
+            label_mode="slope_slowdown_all",
+            label_direction="Long",
+            threshold=0.0002,
+        )
+
+        self.assertTrue(pd.isna(gated["label_h2"].iloc[4]))
+        self.assertEqual(all_slopes["label_h2"].iloc[4], 1.0)
+        self.assertEqual(all_slopes["future_return_h2"].iloc[4], 0.0)
+        self.assertIs(
+            config.get_label_return_fn("slope_slowdown_all"),
+            config.slope_slowdown_all_future_return,
+        )
+        self.assertTrue(config.is_precision_only_label_mode("slope_slowdown_all"))
+        self.assertEqual(
+            config.default_label_threshold("slope_slowdown_all"),
+            config.SLOPE_SLOWDOWN_THRESHOLD,
+        )
+
+    def test_ma_slope_reversal_labels_long_short_and_zeroes_fitness_return(self):
+        idx = pd.date_range("2024-01-01", periods=26, freq="5min")
+        close = [
+            100,
+            101,
+            102,
+            103,
+            104,
+            103,
+            102,
+            101,
+            100,
+            99,
+            98,
+            99,
+            100,
+            101,
+            102,
+            101,
+            100,
+            99,
+            98,
+            97,
+            98,
+            99,
+            100,
+            101,
+            100,
+            99,
+        ]
+        frame = pd.DataFrame(
+            {
+                "open": close,
+                "high": np.asarray(close) + 0.1,
+                "low": np.asarray(close) - 0.1,
+                "close": close,
+                "volume": [10.0] * len(close),
+                "trade_count": [10] * len(close),
+                "taker_buy_base_volume": [5.0] * len(close),
+                "taker_buy_quote_volume": [500.0] * len(close),
+            },
+            index=idx,
+        )
+
+        with (
+            patch.object(config, "MA_SLOPE_FAST_WINDOW", 3),
+            patch.object(config, "MA_SLOPE_FAST_SHIFT", 2),
+            patch.object(config, "MA_SLOPE_FUTURE_SHIFT", 2),
+        ):
+            long_labeled = add_binary_labels(
+                frame,
+                horizons=[1, 3],
+                label_mode="ma_slope_reversal",
+                label_direction="Long",
+                # This mode must ignore an ordinary binary threshold.
+                threshold=0.75,
+            )
+            short_labeled = add_binary_labels(
+                frame,
+                horizons=[3],
+                label_mode="ma3_slope_reversal",
+                label_direction="Short",
+            )
+
+        close_series = frame["close"]
+        ma3 = close_series.rolling(3).mean()
+        ma3_slope = ma3 - ma3.shift(2)
+        future_slope = ma3_slope.shift(-2)
+        complete = ma3_slope.notna() & future_slope.notna()
+        expected_long = (
+            (ma3_slope > 0) & (future_slope < 0)
+        ).astype("float64").where(complete)
+        expected_short = (
+            (ma3_slope < 0) & (future_slope > 0)
+        ).astype("float64").where(complete)
+        pd.testing.assert_series_equal(
+            long_labeled["label_h1"], expected_long, check_names=False
+        )
+        pd.testing.assert_series_equal(
+            short_labeled["label_h3"], expected_short, check_names=False
+        )
+        pd.testing.assert_series_equal(
+            long_labeled["label_h1"],
+            long_labeled["label_h3"],
+            check_names=False,
+        )
+        self.assertTrue(long_labeled["label_h1"].iloc[:4].isna().all())
+        self.assertTrue(long_labeled["label_h1"].iloc[-2:].isna().all())
+        self.assertTrue((long_labeled["future_return_h1"].dropna() == 0.0).all())
+        self.assertTrue((short_labeled["future_return_h3"].dropna() == 0.0).all())
+        self.assertIs(
+            config.get_label_return_fn("slope_reversal"),
+            config.ma_slope_reversal_future_return,
+        )
+        self.assertTrue(config.is_precision_only_label_mode("ma_slope_reversal"))
+        self.assertFalse(config.is_direction_neutral_label_mode("ma_slope_reversal"))
+        self.assertEqual(config.default_label_threshold("ma_slope_reversal"), 0.0)
+        evaluator = _make_fitness_evaluator("ma_slope_reversal", [1])
+        self.assertIsInstance(evaluator, CryptoFitnessEvaluator)
+        self.assertTrue(evaluator.precision_only)
 
     def test_precision_only_metrics_do_not_charge_trade_cost_on_zero_return(self):
         y = pd.Series([1, 0, 1, 0])
@@ -1829,7 +2803,9 @@ class CryptoPipelineTests(unittest.TestCase):
             index=idx,
             name="label_h1",
         )
-        pd.testing.assert_series_equal(long_labeled["future_return_h1"], expected_return)
+        pd.testing.assert_series_equal(
+            long_labeled["future_return_h1"], expected_return
+        )
         pd.testing.assert_series_equal(long_labeled["label_h1"], expected_label)
         pd.testing.assert_series_equal(
             short_labeled["future_return_h1"], long_labeled["future_return_h1"]
@@ -1841,8 +2817,12 @@ class CryptoPipelineTests(unittest.TestCase):
     def test_two_sided_tp_requires_positive_threshold(self):
         idx = pd.date_range("2024-01-01", periods=3, freq="15min")
         df = pd.DataFrame(
-            {"open": [100.0] * 3, "high": [101.0] * 3,
-             "low": [99.0] * 3, "close": [100.0] * 3},
+            {
+                "open": [100.0] * 3,
+                "high": [101.0] * 3,
+                "low": [99.0] * 3,
+                "close": [100.0] * 3,
+            },
             index=idx,
         )
         with self.assertRaisesRegex(ValueError, "finite and positive"):
@@ -2034,6 +3014,46 @@ class CryptoPipelineTests(unittest.TestCase):
                 label_threshold=config.SLOPE_SLOWDOWN_THRESHOLD,
             )
 
+    def test_resume_metadata_checks_ma_slope_reversal_definition(self):
+        metadata = {
+            "horizons": [1],
+            "label_mode": "ma_slope_reversal",
+            "label_direction": "long",
+            "label_threshold": 0.0,
+            "ma_slope_fast_window": config.MA_SLOPE_FAST_WINDOW,
+            "ma_slope_fast_shift": config.MA_SLOPE_FAST_SHIFT,
+            "ma_slope_future_shift": config.MA_SLOPE_FUTURE_SHIFT,
+            "ma_slope_reversal_rule": config.MA_SLOPE_REVERSAL_RULE,
+            "fitness_horizon_mode": config.FITNESS_HORIZON_MODE,
+            "trade_top_fraction": config.TRADE_TOP_FRACTION,
+            "trade_cost": config.TRADE_COST,
+        }
+        archive = CryptoArchive(metadata=metadata)
+        _validate_resume_metadata(
+            archive=archive,
+            resume_path=Path("ma_slope.json"),
+            horizons=[1],
+            label_mode="ma_slope_reversal",
+            label_direction="long",
+            label_threshold=0.0,
+        )
+
+        mismatched = CryptoArchive(
+            metadata={
+                **metadata,
+                "ma_slope_future_shift": config.MA_SLOPE_FUTURE_SHIFT + 1,
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "ma_slope_future_shift"):
+            _validate_resume_metadata(
+                archive=mismatched,
+                resume_path=Path("ma_slope.json"),
+                horizons=[1],
+                label_mode="ma_slope_reversal",
+                label_direction="long",
+                label_threshold=0.0,
+            )
+
     def test_resume_metadata_mismatch_checks_safe_path_tp(self):
         old_tp = config.TP_SAFE_PATH
         try:
@@ -2187,6 +3207,10 @@ class CryptoPipelineTests(unittest.TestCase):
 
     def test_crypto_mutator_c2_changes_window(self):
         pool = [f"alpha_{window}" for window in config.WINDOWS]
+        pool.extend(
+            f"filler_{idx}"
+            for idx in range(max(config.FEATURE_MIN - len(pool), 0))
+        )
         idx, feature_df = _synthetic_feature_space(pool, rows=2000)
         mutator = CryptoMutator(pool, feature_df, idx, seed=3)
         individual = mutator.seed_individual()
@@ -2277,6 +3301,57 @@ class CryptoPipelineTests(unittest.TestCase):
             rtol=1e-12,
             atol=1e-12,
         )
+
+    def test_generated_expression_values_are_causal_under_future_truncation(self):
+        df = _synthetic_crypto_frame(300)
+        formulas = [
+            "shift(ret_close_1, 3)",
+            "slope(close_pos_in_range, 10)",
+            "ts_corr(ret_close_1, range_pct, 20)",
+            "cross_above(ret_close_1, rolling_ret_mean_3)",
+        ]
+        full_base = build_feature_frame(
+            df,
+            windows=[3, 10, 20],
+            quality_filter=False,
+        )
+        prefix_base = build_feature_frame(
+            df.iloc[:220],
+            windows=[3, 10, 20],
+            quality_filter=False,
+        )
+        full_space = CryptoFeatureSpace(full_base, selectable_features(full_base))
+        prefix_space = CryptoFeatureSpace(
+            prefix_base, selectable_features(prefix_base)
+        )
+
+        pd.testing.assert_frame_equal(
+            full_space.matrix(formulas, prefix_base.index),
+            prefix_space.matrix(formulas),
+            check_exact=False,
+            rtol=1e-12,
+            atol=1e-12,
+        )
+
+    def test_quantile_split_purge_keeps_future_path_before_validation(self):
+        df = _synthetic_crypto_frame(40)
+        horizon = 5
+        purge = config.purge_bars_for_horizons([horizon])
+        labeled = add_binary_labels(
+            df,
+            horizons=[horizon],
+            label_mode="quantile_trade",
+        )
+        train, val, _ = split_labeled_by_dates(
+            labeled,
+            val_start=str(df.index[20]),
+            test_start=str(df.index[30]),
+            purge_bars=purge,
+        )
+
+        last_train_pos = df.index.get_loc(train.index[-1])
+        first_val_pos = df.index.get_loc(val.index[0])
+        self.assertLess(last_train_pos + horizon, first_val_pos)
 
     def test_test_end_split_purges_tail_labels(self):
         df = _synthetic_crypto_frame(12)

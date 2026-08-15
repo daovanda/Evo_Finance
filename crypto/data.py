@@ -108,6 +108,10 @@ def add_binary_labels(
     the observable initial-slope gate are excluded as NaN rather than treated
     as label 0. Its future_return_h is zero because slope change is not an
     executable trading return.
+    For ma_slope_reversal, Long labels a positive MA3 close slope at t whose
+    slope is negative after config.MA_SLOPE_FUTURE_SHIFT candles; Short uses
+    the sign-symmetric reversal. This target is horizon-neutral and
+    future_return_h is zero for precision-only fitness.
     For two_sided_tp, label=1 means both the Long and Short TP are reached;
     future_return_h is the combined gross payoff of the two positions. Label
     direction is ignored for this direction-neutral mode.
@@ -119,6 +123,12 @@ def add_binary_labels(
     For bull, label=1 symmetrically marks candles strictly inside an offline
     confirmed close-ZigZag trough-to-peak body. Its future_return_h is also
     zero and its direction/horizon arguments do not alter the target.
+    For quantile_trade, no binary label is created. Each horizon receives
+    upward-MFE and downward-MFE columns. Its dedicated evaluator selects the
+    configured target: MFE is the maximum upward high excursion, MAE is the
+    maximum downward low excursion, and close is the signed close-H return
+    from open H1. Direction is ignored. It predicts one configured quantile
+    and evaluates accuracy only; no trade is simulated.
     For exit_after_k, rows whose TP was already reached in H1..Hk are
     excluded. Label 1 means the remaining H(k+1)..Hh path reaches TP, while
     future_return_h is the executable gross payoff: threshold on a TP hit or
@@ -144,6 +154,10 @@ def add_binary_labels(
             )
     for h in horizons:
         h = int(h)
+        if selected_mode == "quantile_trade":
+            _add_quantile_trade_horizon_targets(labeled, h)
+            continue
+
         if selected_mode in {"bear", "bull"}:
             assert body_labels is not None
             explicit_label = body_labels
@@ -187,9 +201,7 @@ def add_binary_labels(
             )
             entry_open = labeled["open"].shift(decision_k - 1)
             hit_price = (
-                labeled["low"]
-                if selected_direction == "short"
-                else labeled["high"]
+                labeled["low"] if selected_direction == "short" else labeled["high"]
             )
             prior_hit = pd.Series(False, index=labeled.index, dtype=bool)
             for offset in range(decision_k - 1, -1, -1):
@@ -227,18 +239,29 @@ def add_binary_labels(
             labeled[f"label_h{h}"] = explicit_label
             continue
 
-        if selected_mode in {"high_exit", "slope_slowdown"}:
-            if selected_mode == "slope_slowdown" and float(label_threshold) <= 0.0:
+        if selected_mode in {
+            "high_exit",
+            "slope_slowdown",
+            "slope_slowdown_all",
+            "ma_slope_reversal",
+        }:
+            if (
+                selected_mode in {"slope_slowdown", "slope_slowdown_all"}
+                and float(label_threshold) <= 0.0
+            ):
                 raise ValueError(
-                    "slope_slowdown label_threshold must be positive; "
+                    f"{selected_mode} label_threshold must be positive; "
                     "for example 0.0003 means 0.03% slope change per candle."
                 )
             complete = future_return.notna()
-            explicit_label = (
-                future_return.gt(float(label_threshold))
-                .astype("float64")
-                .where(complete)
-            )
+            if selected_mode == "ma_slope_reversal":
+                explicit_label = future_return.astype("float64").where(complete)
+            else:
+                explicit_label = (
+                    future_return.gt(float(label_threshold))
+                    .astype("float64")
+                    .where(complete)
+                )
             labeled[f"future_return_h{h}"] = pd.Series(
                 0.0,
                 index=labeled.index,
@@ -290,6 +313,51 @@ def add_binary_labels(
         )
         labeled.loc[future_return.isna(), f"label_h{h}"] = np.nan
     return labeled
+
+
+def _add_quantile_trade_horizon_targets(
+    labeled: pd.DataFrame,
+    horizon: int,
+) -> None:
+    """Add complete-path distributional targets for one trading horizon."""
+    h = int(horizon)
+    if h < 1:
+        raise ValueError("quantile_trade horizon must be positive.")
+
+    entry_open = labeled["open"].shift(-1)
+    up_steps: list[pd.Series] = []
+    down_steps: list[pd.Series] = []
+    for step in range(1, h + 1):
+        up = labeled["high"].shift(-step).div(entry_open).sub(1.0)
+        down = 1.0 - labeled["low"].shift(-step).div(entry_open)
+        up_steps.append(up)
+        down_steps.append(down)
+
+    close_return = labeled["close"].shift(-h).div(entry_open).sub(1.0)
+    complete = (
+        entry_open.notna()
+        & pd.concat(up_steps, axis=1).notna().all(axis=1)
+        & pd.concat(down_steps, axis=1).notna().all(axis=1)
+        & close_return.notna()
+    )
+    for step, (up, down) in enumerate(zip(up_steps, down_steps, strict=True), start=1):
+        # Path steps are shared across horizons. This avoids duplicating H1..H5
+        # again for H7/H10/etc. when quantile_trade uses an ensemble.
+        up_col = f"quantile_up_s{step}"
+        down_col = f"quantile_down_s{step}"
+        step_complete = entry_open.notna() & up.notna() & down.notna()
+        if up_col not in labeled.columns:
+            labeled[up_col] = up.where(step_complete)
+        if down_col not in labeled.columns:
+            labeled[down_col] = down.where(step_complete)
+
+    labeled[f"quantile_up_mfe_h{h}"] = (
+        pd.concat(up_steps, axis=1).max(axis=1, skipna=False).where(complete)
+    )
+    labeled[f"quantile_down_mfe_h{h}"] = (
+        pd.concat(down_steps, axis=1).max(axis=1, skipna=False).where(complete)
+    )
+    labeled[f"quantile_close_return_h{h}"] = close_return.where(complete)
 
 
 def _call_label_return_fn(

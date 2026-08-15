@@ -1,0 +1,144 @@
+{
+  "metadata": {
+    "pipeline": "crypto",
+    "horizons": [
+      3
+    ],
+    "label_mode": "meta_learner",
+    "label_direction": "long",
+    "exit_after_k": null,
+    "direction_neutral": false,
+    "label_threshold": 0.0,
+    "payoff_tp": 0.004,
+    "payoff_adverse_floor": -999.0,
+    "tp_safe_path": 0.001,
+    "safe_adverse_floor": -0.0015,
+    "safe_path_rule": "adverse_stop_first_v1",
+    "slope_lookback": 2,
+    "slope_min_initial": 0.0001,
+    "slope_price_column": "high",
+    "slope_slowdown_rule": "eligible_initial_slope_only_v2",
+    "slope_slowdown_all_rule": "all_initial_slopes_expanded_path_v1",
+    "ma_slope_fast_window": 3,
+    "ma_slope_fast_shift": 2,
+    "ma_slope_future_shift": 2,
+    "ma_slope_reversal_rule": "ma3_sign_reversal_future_shift_v2",
+    "bear_zigzag_tolerance": 0.003,
+    "bear_min_drop": 0.004,
+    "bear_min_bars": 5,
+    "bear_label_rule": "confirmed_close_zigzag_body_v1",
+    "bull_zigzag_tolerance": 0.003,
+    "bull_min_rise": 0.004,
+    "bull_min_bars": 5,
+    "bull_label_rule": "confirmed_close_zigzag_body_v1",
+    "fitness_horizon_mode": "ensemble",
+    "fitness": {
+      "auc_edge": 0.2,
+      "precision_excess": 0.5,
+      "trade_return_score": 0.2,
+      "auc_std": -0.3,
+      "overfit_gap": -0.25,
+      "bad_fold_ratio": -0.3
+    },
+    "trade_top_fraction": 0.2,
+    "trade_cost": 0.0002,
+    "return_score_scale": 0.01,
+    "precision_only": false,
+    "split_policy": {
+      "val_start": "2024-01-01T00:00:00",
+      "test_start": "2025-01-01T00:00:00",
+      "test_end": null,
+      "wf_end": "2024-01-01T00:00:00",
+      "wf_min_train_months": 36,
+      "wf_val_months": 6,
+      "wf_step_months": 6
+    },
+    "meta_learner_rule": "oof_mfe_dynamic_tp_binary_v1",
+    "meta_base_archive": "crypto\\results\\crypto_btc_5m_quantile_mfe_q20_h3_seed1_1h.json",
+    "meta_base_archive_sha256": "04ee7fdc60bd15277b3b2f97aaf5b74ca926a314ca97a3022fef0d42528a1b12",
+    "meta_base_rank": 1,
+    "meta_base_horizon": 3,
+    "meta_base_quantile": 0.2,
+    "meta_min_prediction": 0.0002,
+    "meta_val_fraction": 0.2,
+    "meta_prediction_is_feature": false
+  },
+  "entries": [
+    {
+      "rank": 1,
+      "score": -0.31371314332015515,
+      "n_features": 4,
+      "generation": 0,
+      "metrics": {
+        "score": -0.31371314332015515,
+        "mean_auc": 0.5077781755183143,
+        "auc_edge": 0.007778175518314325,
+        "precision_at_trade": 0.7869492882384109,
+        "base_rate": 0.7815473141048082,
+        "precision_excess": 0.005401974133602827,
+        "trade_return_mean": -0.0002765727881084672,
+        "trade_return_score": -0.02765727881084672,
+        "auc_std": 0.009628166639514631,
+        "overfit_gap": 0.03819943894638281,
+        "bad_fold_ratio": 1.0,
+        "n_fold_horizon_scores": 6.0,
+        "n_horizons": 1.0,
+        "h3_auc": 0.5077781755183143,
+        "h3_precision_excess": 0.005401974133602827,
+        "h3_trade_return_score": -0.02765727881084672
+      },
+      "final_eval": {
+        "n_horizon_scores": 1.0,
+        "train_rows": 285056.0
+      },
+      "final_val_metrics": {
+        "rows": 95174.0,
+        "mean_auc": 0.5072359086112321,
+        "auc_edge": 0.007235908611232134,
+        "precision_at_trade": 0.7836616758602574,
+        "base_rate": 0.779404038918192,
+        "precision_excess": 0.004257636942065379,
+        "trade_return_mean": -0.0002997255605806514,
+        "trade_return_score": -0.029972556058065137,
+        "auc_std": 0.0,
+        "bad_ratio": 1.0,
+        "overfit_gap": 0.0073979820430502,
+        "horizons": {
+          "h3": {
+            "auc": 0.5072359086112321,
+            "precision_excess": 0.004257636942065379,
+            "trade_return_score": -0.029972556058065137,
+            "trade_return_mean": -0.0002997255605806514
+          }
+        }
+      },
+      "test_metrics": {
+        "rows": 129301.0,
+        "mean_auc": 0.5061308758062277,
+        "auc_edge": 0.006130875806227731,
+        "precision_at_trade": 0.7835737210471366,
+        "base_rate": 0.774294088986164,
+        "precision_excess": 0.009279632060972598,
+        "trade_return_mean": -0.00029640857218353597,
+        "trade_return_score": -0.029640857218353595,
+        "auc_std": 0.0,
+        "bad_ratio": 1.0,
+        "overfit_gap": 0.008503014848054602,
+        "horizons": {
+          "h3": {
+            "auc": 0.5061308758062277,
+            "precision_excess": 0.009279632060972598,
+            "trade_return_score": -0.029640857218353595,
+            "trade_return_mean": -0.00029640857218353597
+          }
+        }
+      },
+      "features": [
+        "taker_buy_base_volume_log_z_4",
+        "realized_vol_z_5",
+        "imbalance_divergence_5",
+        "imbalance_return_corr_3"
+      ]
+    }
+  ]
+}

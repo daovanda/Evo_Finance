@@ -37,6 +37,13 @@ SLOPE_SLOWDOWN_THRESHOLD: float = 0.0002  # 0.03% log-OLS slope per candle
 SLOPE_MIN_INITIAL: float = 0.0001  # 0.02% log-OLS slope per candle
 SLOPE_PRICE_COLUMN: str = "high"
 SLOPE_SLOWDOWN_RULE: str = "eligible_initial_slope_only_v2"
+SLOPE_SLOWDOWN_ALL_RULE: str = "all_initial_slopes_expanded_path_v1"
+# Fast moving-average slope reversal target. The current MA3 slope compares
+# MA3(t) with MA3(t-2); its future value is observed two candles later.
+MA_SLOPE_FAST_WINDOW: int = 3
+MA_SLOPE_FAST_SHIFT: int = 2
+MA_SLOPE_FUTURE_SHIFT: int = 2
+MA_SLOPE_REVERSAL_RULE: str = "ma3_sign_reversal_future_shift_v2"
 # Offline close-ZigZag target used by LABEL_MODE="bear". A candle is positive
 # only when it lies strictly between a confirmed peak and trough whose decline
 # satisfies both the duration and drop filters. These future-confirmed labels
@@ -50,6 +57,94 @@ BULL_ZIGZAG_TOLERANCE: float = 0.003
 BULL_MIN_RISE: float = 0.004
 BULL_MIN_BARS: int = 5
 BULL_LABEL_RULE: str = "confirmed_close_zigzag_body_v1"
+
+# Pure quantile-regression target used by LABEL_MODE="quantile_trade".
+# MFE is the maximum upward excursion, MAE the maximum downward excursion, and
+# close is the signed final close return over each configured horizon.
+# This mode predicts one selected quantile and does not turn
+# that prediction into TP/SL, direction, EV, or a trading decision.
+QUANTILE_TARGET: str = "mfe"  # "mfe", "mae", or "close"
+QUANTILE_ALPHA: float = 0.80  # any finite quantile strictly between 0 and 1
+QUANTILE_TRADE_RULE: str = "mfe_mae_close_shared_quantile_fitness_purged_stop_v11"
+QUANTILE_BAD_COVERAGE_ERROR: float = 0.10
+QUANTILE_BAD_SPEARMAN_IC: float = 0.0
+
+# OOF dynamic-TP classification targets used by the three meta label modes.
+# The base archive is retrained inside every original walk-forward train fold;
+# its MFE quantile prediction on the corresponding OOF validation rows becomes
+# the per-row TP. The prediction is a target-construction input only and is not
+# exposed as a feature to the evolved meta model.
+META_LEARNER_BASE_ARCHIVE: Path = (
+    RESULTS_DIR / "crypto_btc_5m_quantile_mfe_q20_h3_seed1_1h.json"
+)
+META_LEARNER_BASE_RANK: int = 1
+META_LEARNER_MIN_PREDICTION: float = 0.0002
+# Fixed return added to every base MFE prediction before constructing the
+# dynamic TP label and hit return. Zero preserves the original behavior.
+META_LEARNER_TP_OFFSET: float = 0.0
+META_LEARNER_META_VAL_FRACTION: float = 0.20
+META_LEARNER_RULE: str = "oof_mfe_dynamic_tp_binary_v1"
+META_CLOSE_EXIT_RULE: str = "oof_mfe_dynamic_tp_close_exit_binary_v1"
+META_STRATEGY_PROFIT_RULE: str = "oof_mfe_dynamic_tp_strategy_profit_binary_v1"
+META_LEARNER_LABEL_MODES: frozenset[str] = frozenset(
+    {"meta_learner", "meta_close_exit", "meta_strategy_profit"}
+)
+META_PREDICTION_FEATURE_MODES: frozenset[str] = frozenset(
+    {"meta_close_exit", "meta_strategy_profit"}
+)
+# Optional lower-timeframe feature source. None keeps the original behavior
+# where base targets and meta features use the same OHLCV file.
+META_LEARNER_FEATURE_DATA: Path | None = None
+# Number of lower-timeframe candles observed after open H1 before prediction.
+# Their highs remain part of the original H1..H target in this test mode.
+META_LEARNER_FEATURE_LOOKAHEAD_BARS: int = 0
+# Observe all lower-timeframe candles inside H1; TP-hit targets then start at H2.
+META_LEARNER_FEATURE_INCLUDE_H1: bool = False
+META_LEARNER_FEATURE_ALIGNMENT_RULE: str = (
+    "target_open_plus_target_interval_minus_feature_interval_v1"
+)
+META_LEARNER_TARGET_START_STEP: int = 1
+META_LEARNER_TARGET_INTERVAL_SECONDS: float | None = None
+META_LEARNER_FEATURE_INTERVAL_SECONDS: float | None = None
+
+
+def canonical_quantile_target(target: str | None = None) -> str:
+    selected = str(target or QUANTILE_TARGET).strip().lower()
+    if selected not in {"mfe", "mae", "close"}:
+        raise ValueError("QUANTILE_TARGET must be 'mfe', 'mae', or 'close'.")
+    return selected
+
+
+def validate_quantile_alpha(alpha: float | None = None) -> float:
+    selected = float(QUANTILE_ALPHA if alpha is None else alpha)
+    if not isfinite(selected) or not 0.0 < selected < 1.0:
+        raise ValueError("QUANTILE_ALPHA must be finite and strictly between 0 and 1.")
+    return selected
+
+
+def is_meta_learner_label_mode(mode: str | None = None) -> bool:
+    """Return whether a mode uses the OOF dynamic-TP meta pipeline."""
+    return canonical_label_mode(mode) in META_LEARNER_LABEL_MODES
+
+
+def meta_learner_rule(mode: str | None = None) -> str:
+    """Return the target-construction policy recorded in archive metadata."""
+    selected = canonical_label_mode(mode)
+    rules = {
+        "meta_learner": META_LEARNER_RULE,
+        "meta_close_exit": META_CLOSE_EXIT_RULE,
+        "meta_strategy_profit": META_STRATEGY_PROFIT_RULE,
+    }
+    if selected not in rules:
+        raise ValueError(f"LABEL_MODE={selected!r} does not use the meta pipeline.")
+    return rules[selected]
+
+
+def meta_prediction_is_feature(mode: str | None = None) -> bool:
+    """Return whether the leakage-safe OOF dynamic TP is a model feature."""
+    return canonical_label_mode(mode) in META_PREDICTION_FEATURE_MODES
+
+
 # Decision candle for LABEL_MODE="exit_after_k". For a base trade whose entry
 # is open H1, k=1 evaluates after H1 closes, k=2 after H2 closes, and so on.
 EXIT_AFTER_K: int = 1
@@ -209,6 +304,86 @@ def slope_slowdown_future_return(
         strength = initial_slope - expanded_at_t
 
     return strength.where(eligible & complete)
+
+
+def slope_slowdown_all_future_return(
+    df: Any,
+    horizon: int,
+    direction: str | None = None,
+) -> pd.Series:
+    """Slope change over the expanded future path without an initial gate.
+
+    Long measures ``initial_slope - expanded_slope`` and therefore labels a
+    sufficiently large downward pull in slope. Short uses the symmetric
+    ``expanded_slope - initial_slope`` change. Unlike ``slope_slowdown``, all
+    rows with complete lookback and future data remain eligible regardless of
+    the sign or magnitude of the observable initial slope.
+    """
+    h = int(horizon)
+    lookback = int(SLOPE_LOOKBACK)
+    if h < 1:
+        raise ValueError("horizon must be positive for slope_slowdown_all.")
+    if lookback < 2:
+        raise ValueError("SLOPE_LOOKBACK must be at least 2.")
+    if SLOPE_PRICE_COLUMN != "high":
+        raise ValueError("SLOPE_PRICE_COLUMN must remain 'high'.")
+
+    high = pd.to_numeric(df[SLOPE_PRICE_COLUMN], errors="coerce")
+    initial_slope = _rolling_log_ols_slope(high, lookback)
+    expanded_at_end = _rolling_log_ols_slope(high, lookback + h)
+    expanded_at_t = expanded_at_end.shift(-h)
+    complete = initial_slope.notna() & expanded_at_t.notna()
+    if canonical_label_direction(direction) == "short":
+        strength = expanded_at_t - initial_slope
+    else:
+        strength = initial_slope - expanded_at_t
+    return strength.where(complete)
+
+
+def ma_slope_reversal_labels(
+    df: Any,
+    direction: str | None = None,
+) -> pd.Series:
+    """Label a future sign reversal of the fast close-MA slope.
+
+    Long follows the requested peak-style definition::
+
+        fast_slope(t) > 0
+        fast_slope(t + future_shift) < 0
+
+    Short is its sign-symmetric counterpart. Moving averages and slopes use
+    only close prices; future data is used solely by this supervised target.
+    Warm-up rows and rows without the complete future shift remain NaN.
+    """
+    fast_window = int(MA_SLOPE_FAST_WINDOW)
+    fast_shift = int(MA_SLOPE_FAST_SHIFT)
+    future_shift = int(MA_SLOPE_FUTURE_SHIFT)
+    if fast_window < 1:
+        raise ValueError("MA slope fast window must be positive.")
+    if min(fast_shift, future_shift) < 1:
+        raise ValueError("MA slope shifts must be positive.")
+
+    close = pd.to_numeric(df["close"], errors="coerce")
+    fast_ma = close.rolling(fast_window, min_periods=fast_window).mean()
+    fast_slope = fast_ma - fast_ma.shift(fast_shift)
+    future_fast_slope = fast_slope.shift(-future_shift)
+    complete = fast_slope.notna() & future_fast_slope.notna()
+
+    if canonical_label_direction(direction) == "short":
+        reversal = fast_slope.lt(0.0) & future_fast_slope.gt(0.0)
+    else:
+        reversal = fast_slope.gt(0.0) & future_fast_slope.lt(0.0)
+    return reversal.astype("float64").where(complete)
+
+
+def ma_slope_reversal_future_return(
+    df: Any,
+    horizon: int,
+    direction: str | None = None,
+) -> pd.Series:
+    """Registry adapter for the horizon-neutral MA slope-reversal target."""
+    del horizon
+    return ma_slope_reversal_labels(df, direction=direction)
 
 
 def mfe_future_return(
@@ -725,10 +900,45 @@ def bull_future_return(
     return bull_body_labels(df)
 
 
+def quantile_trade_future_return(
+    df: Any,
+    horizon: int,
+    direction: str | None = None,
+) -> pd.Series:
+    """Registry adapter for the non-binary quantile_trade pipeline.
+
+    The dedicated data branch creates all distributional targets. Returning
+    close H here keeps the mode registry's callable contract intact; the
+    binary fitness evaluator never consumes this adapter for quantile_trade.
+    """
+    del direction
+    entry_open = df["open"].shift(-1)
+    return df["close"].shift(-int(horizon)).div(entry_open).sub(1.0)
+
+
+def meta_learner_future_return(
+    df: Any,
+    horizon: int,
+    direction: str | None = None,
+) -> pd.Series:
+    """Registry adapter for the OOF-only meta data paths.
+
+    Direct label construction is intentionally rejected: this target requires
+    predictions from a separately trained base quantile-MFE archive.
+    """
+    del df, horizon, direction
+    raise ValueError(
+        "Meta labels require OOF base-MFE predictions and must be constructed "
+        "through crypto.main with a meta label mode."
+    )
+
+
 LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
     "close_exit": close_exit_future_return,
     "high_exit": high_exit_future_return,
     "slope_slowdown": slope_slowdown_future_return,
+    "slope_slowdown_all": slope_slowdown_all_future_return,
+    "ma_slope_reversal": ma_slope_reversal_future_return,
     "close_path_mean": close_path_mean_future_return,
     "mfe": mfe_future_return,
     "mfe_ahead": mfe_ahead_future_return,
@@ -739,11 +949,17 @@ LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
     "exit_after_k": exit_after_k_future_return,
     "bear": bear_future_return,
     "bull": bull_future_return,
+    "quantile_trade": quantile_trade_future_return,
+    "meta_learner": meta_learner_future_return,
+    "meta_close_exit": meta_learner_future_return,
+    "meta_strategy_profit": meta_learner_future_return,
 }
 
 LABEL_MODE_ALIASES: dict[str, str] = {
     "first_hit_safe_close": "safe_path_mfe",
     "safe_close": "safe_path_mfe",
+    "ma3_slope_reversal": "ma_slope_reversal",
+    "slope_reversal": "ma_slope_reversal",
 }
 
 
@@ -770,11 +986,19 @@ def resolve_exit_after_k(
 
 
 PRECISION_ONLY_LABEL_MODES: frozenset[str] = frozenset(
-    {"adverse_floor", "bear", "bull", "high_exit", "slope_slowdown"}
+    {
+        "adverse_floor",
+        "bear",
+        "bull",
+        "high_exit",
+        "slope_slowdown",
+        "slope_slowdown_all",
+        "ma_slope_reversal",
+    }
 )
 
 DIRECTION_NEUTRAL_LABEL_MODES: frozenset[str] = frozenset(
-    {"bear", "bull", "two_sided_tp"}
+    {"bear", "bull", "quantile_trade", "two_sided_tp"}
 )
 
 
@@ -801,10 +1025,19 @@ def default_label_threshold(
         return float(TRADE_COST)
     if selected_mode == "safe_path_mfe":
         return float(SAFE_ADVERSE_FLOOR)
-    if selected_mode == "slope_slowdown":
+    if selected_mode in {"slope_slowdown", "slope_slowdown_all"}:
         return float(SLOPE_SLOWDOWN_THRESHOLD)
-    if selected_mode in {"bear", "bull"}:
+    if selected_mode in {
+        "bear",
+        "bull",
+        "ma_slope_reversal",
+        "quantile_trade",
+        "meta_learner",
+        "meta_close_exit",
+    }:
         return 0.0
+    if selected_mode == "meta_strategy_profit":
+        return float(TRADE_COST)
     return float(LABEL_THRESHOLD)
 
 
@@ -815,8 +1048,9 @@ VAL_START: str = "2024-01-01"
 TEST_START: str = "2025-01-01"
 TEST_END: str | None = None
 
-# Walk-forward folds used during evolution. WF_END defaults to TEST_START.
-WF_END: str = TEST_START
+# Walk-forward folds used during evolution stop before the final validation
+# period. This keeps VAL_START..TEST_START independent from feature evolution.
+WF_END: str = VAL_START
 WF_MIN_TRAIN_MONTHS: int = 36
 WF_VAL_MONTHS: int = 6
 WF_STEP_MONTHS: int = 6
@@ -825,8 +1059,8 @@ WF_PURGE_BARS: int | None = None  # None => max(HOLDING_HORIZONS) + 1
 # Safe feature construction. All features are time-series/ratio normalized;
 # raw price/volume scale columns are intentionally not selectable.
 # WINDOWS: list[int] = [1,2,3,4,5,7,10,14,20,30,40,50,60,80,120,160,240,320,400,480,600,800,960,1200,1440,]
-WINDOWS: list[int] = [1,2,3,4,5,6]
-#WINDOWS: list[int] = [2, 5, 7, 15, 25, 30]
+# WINDOWS: list[int] = [1, 2, 3, 5, 7]
+WINDOWS: list[int] = [2, 3, 5, 7, 9, 15, 30, 60]
 FEATURE_MIN_VALID_RATIO: float = 0.70
 FEATURE_MAX_DOMINANT_VALUE_RATIO: float = 0.985
 FEATURE_CORR_THRESHOLD: float = 0.70
@@ -860,12 +1094,12 @@ FITNESS_HORIZON_MODE: str = (
 TRADE_TOP_FRACTION: float = 0.05
 
 MIN_TRADES_PER_SPLIT: int = 20
-TRADE_COST: float = 0.0005  # 0.1% Futures round-trip fee plus slippage allowance
+TRADE_COST: float = 0.0002  # 0.1% Futures round-trip fee plus slippage allowance
 RETURN_SCORE_SCALE: float = 0.01
 BAD_AUC_THRESHOLD: float = 0.50
 
 FITNESS_WEIGHTS: dict[str, float] = {
-    "auc_edge": 0.20, # old: 0.40
+    "auc_edge": 0.20,  # old: 0.40
     "precision_excess": 0.50,  # old: 0.30
     "trade_return_score": 0.20,  # old: 0.20
     "auc_std": -0.30,  # old: -0.20
@@ -873,8 +1107,49 @@ FITNESS_WEIGHTS: dict[str, float] = {
     "bad_fold_ratio": -0.30,  # old: -0.30
 }
 
-# Binary LightGBM. These are deliberately conservative because evolution itself
-# is an optimizer and BTC 15m data is noisy.
+# quantile_trade is prediction-only. Pinball skill compares the model against
+# the constant train-fold quantile baseline; coverage measures calibration and
+# Spearman IC measures rank information.
+# MAE/RMSE are reported for diagnosis but deliberately excluded from fitness,
+# because optimizing them would pull non-median quantiles toward the mean.
+QUANTILE_TRADE_FITNESS_WEIGHTS: dict[str, float] = {
+    "quantile_pinball_skill": 0.55,
+    "quantile_coverage_error": -0.20,
+    "quantile_spearman_ic": 0.15,
+    "quantile_pinball_skill_std": -0.10,
+    "overfit_gap": -0.20,
+    "bad_fold_ratio": -0.20,
+}
+
+def quantile_trade_fitness_weights(target: str | None = None) -> dict[str, float]:
+    # Validate the target but deliberately use one shared quantile objective.
+    # Direction metrics for CLOSE remain diagnostic and do not affect fitness.
+    canonical_quantile_target(target)
+    return dict(QUANTILE_TRADE_FITNESS_WEIGHTS)
+
+QUANTILE_TRADE_LGBM_PARAMS: dict = {
+    "objective": "quantile",
+    "metric": "quantile",
+    "learning_rate": 0.03,
+    "num_leaves": 15,
+    "max_depth": 4,
+    "feature_fraction": 0.70,
+    "bagging_fraction": 0.80,
+    "bagging_freq": 1,
+    "min_data_in_leaf": 300,
+    "lambda_l1": 2.0,
+    "lambda_l2": 10.0,
+    "force_col_wise": True,
+    "verbose": -1,
+    "seed": 42,
+    "feature_fraction_seed": 42,
+    "bagging_seed": 42,
+    "data_random_seed": 42,
+}
+
+# Binary LightGBM. This higher-capacity profile is intended for experiments
+# where the depth-7 model still improves out of sample. Sampling and L1/L2
+# regularization remain enabled to constrain the larger trees.
 LGBM_PARAMS: dict = {
     "objective": "binary",
     "metric": "auc",
@@ -915,6 +1190,26 @@ def validate_config() -> None:
         raise ValueError("LABEL_THRESHOLD must be finite.")
     get_label_return_fn()
     canonical_label_direction()
+    canonical_quantile_target(QUANTILE_TARGET)
+    validate_quantile_alpha(QUANTILE_ALPHA)
+    if not 0.0 <= float(QUANTILE_BAD_COVERAGE_ERROR) <= 1.0:
+        raise ValueError("QUANTILE_BAD_COVERAGE_ERROR must be in [0, 1].")
+    if not -1.0 <= float(QUANTILE_BAD_SPEARMAN_IC) <= 1.0:
+        raise ValueError("QUANTILE_BAD_SPEARMAN_IC must be in [-1, 1].")
+    if int(META_LEARNER_BASE_RANK) < 1:
+        raise ValueError("META_LEARNER_BASE_RANK must be positive.")
+    if (
+        not isfinite(float(META_LEARNER_MIN_PREDICTION))
+        or META_LEARNER_MIN_PREDICTION < 0.0
+    ):
+        raise ValueError("META_LEARNER_MIN_PREDICTION must be finite and non-negative.")
+    if (
+        not isfinite(float(META_LEARNER_TP_OFFSET))
+        or META_LEARNER_TP_OFFSET < 0.0
+    ):
+        raise ValueError("META_LEARNER_TP_OFFSET must be finite and non-negative.")
+    if not 0.0 < float(META_LEARNER_META_VAL_FRACTION) < 0.5:
+        raise ValueError("META_LEARNER_META_VAL_FRACTION must be in (0, 0.5).")
     if PAYOFF_TP <= 0:
         raise ValueError("PAYOFF_TP must be positive.")
     if not isfinite(float(PAYOFF_ADVERSE_FLOOR)) or PAYOFF_ADVERSE_FLOOR >= 0:
@@ -925,26 +1220,23 @@ def validate_config() -> None:
         raise ValueError("SAFE_ADVERSE_FLOOR must be finite.")
     if int(SLOPE_LOOKBACK) < 2:
         raise ValueError("SLOPE_LOOKBACK must be at least 2.")
-    if (
-        not isfinite(float(SLOPE_SLOWDOWN_THRESHOLD))
-        or SLOPE_SLOWDOWN_THRESHOLD <= 0
-    ):
+    if not isfinite(float(SLOPE_SLOWDOWN_THRESHOLD)) or SLOPE_SLOWDOWN_THRESHOLD <= 0:
         raise ValueError("SLOPE_SLOWDOWN_THRESHOLD must be finite and positive.")
     if not isfinite(float(SLOPE_MIN_INITIAL)) or SLOPE_MIN_INITIAL < 0:
         raise ValueError("SLOPE_MIN_INITIAL must be finite and non-negative.")
     if SLOPE_PRICE_COLUMN != "high":
         raise ValueError("SLOPE_PRICE_COLUMN must be 'high'.")
+    if int(MA_SLOPE_FAST_WINDOW) < 1:
+        raise ValueError("MA slope fast window must be positive.")
+    if min(int(MA_SLOPE_FAST_SHIFT), int(MA_SLOPE_FUTURE_SHIFT)) < 1:
+        raise ValueError("MA slope shifts must be positive.")
     if (
         not isfinite(float(BEAR_ZIGZAG_TOLERANCE))
         or BEAR_ZIGZAG_TOLERANCE <= 0
         or BEAR_ZIGZAG_TOLERANCE >= 1
     ):
         raise ValueError("BEAR_ZIGZAG_TOLERANCE must be finite and in (0, 1).")
-    if (
-        not isfinite(float(BEAR_MIN_DROP))
-        or BEAR_MIN_DROP < 0
-        or BEAR_MIN_DROP >= 1
-    ):
+    if not isfinite(float(BEAR_MIN_DROP)) or BEAR_MIN_DROP < 0 or BEAR_MIN_DROP >= 1:
         raise ValueError("BEAR_MIN_DROP must be finite and in [0, 1).")
     if int(BEAR_MIN_BARS) < 1:
         raise ValueError("BEAR_MIN_BARS must be at least 1.")
@@ -954,11 +1246,7 @@ def validate_config() -> None:
         or BULL_ZIGZAG_TOLERANCE >= 1
     ):
         raise ValueError("BULL_ZIGZAG_TOLERANCE must be finite and in (0, 1).")
-    if (
-        not isfinite(float(BULL_MIN_RISE))
-        or BULL_MIN_RISE < 0
-        or BULL_MIN_RISE >= 1
-    ):
+    if not isfinite(float(BULL_MIN_RISE)) or BULL_MIN_RISE < 0 or BULL_MIN_RISE >= 1:
         raise ValueError("BULL_MIN_RISE must be finite and in [0, 1).")
     if int(BULL_MIN_BARS) < 1:
         raise ValueError("BULL_MIN_BARS must be at least 1.")

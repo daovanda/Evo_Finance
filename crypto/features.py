@@ -40,10 +40,25 @@ def build_feature_frame(
     max_dominant_value_ratio: float = config.FEATURE_MAX_DOMINANT_VALUE_RATIO,
     quality_index: pd.Index | None = None,
     quality_filter: bool = True,
+    output_index: pd.Index | None = None,
 ) -> pd.DataFrame:
-    """Return a safe feature matrix aligned to df.index."""
+    """Return a safe feature matrix, optionally sampled after rolling math.
+
+    ``output_index`` is useful for multi-timeframe models: rolling features are
+    still calculated on every source candle, while only requested source rows
+    are retained in the returned frame.
+    """
     start_time = time.time()
     data = df.sort_index()
+    sampled_index: pd.Index | None = None
+    if output_index is not None:
+        sampled_index = pd.Index(output_index).drop_duplicates().sort_values()
+        missing_output = sampled_index.difference(data.index)
+        if len(missing_output):
+            raise ValueError(
+                "output_index contains timestamps absent from feature data: "
+                f"{list(missing_output[:3])}"
+            )
     windows = sorted({int(w) for w in windows if int(w) > 1})
     logger.info(
         "Crypto feature build: rows=%d | windows=%s | quality_rows=%s",
@@ -257,6 +272,10 @@ def build_feature_frame(
         features[f"imbalance_divergence_{w}"] = (
             features[f"taker_delta_z_{w}"] - features[f"ret_ts_rank_{w}"]
         )
+        if sampled_index is not None:
+            new_keys = list(features)[before_count:]
+            for key in new_keys:
+                features[key] = features[key].reindex(sampled_index)
         logger.info(
             "Crypto feature build: window %d/%d w=%d done | added=%d | total=%d | %.1fs",
             idx,
@@ -268,7 +287,10 @@ def build_feature_frame(
         )
 
     logger.info("Crypto feature build: assembling DataFrame with %d columns.", len(features))
-    feature_df = pd.DataFrame(features, index=data.index)
+    feature_df = pd.DataFrame(
+        features,
+        index=data.index if sampled_index is None else sampled_index,
+    )
     feature_df = feature_df.replace([np.inf, -np.inf], np.nan)
     if not quality_filter:
         logger.info(

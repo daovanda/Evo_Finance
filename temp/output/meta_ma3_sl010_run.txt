@@ -1,0 +1,92 @@
+09:47:55 [INFO] temp.plot_5m_meta_after_1m_signals - Building 5m base features | windows=[2, 3, 4, 6]
+09:47:55 [INFO] crypto.features - Crypto feature build: rows=901859 | windows=[2, 3, 4, 6] | quality_rows=all
+09:47:56 [INFO] crypto.features - Crypto feature build: base features=17
+09:47:56 [INFO] crypto.features - Crypto feature build: window 1/4 w=2 started.
+09:47:58 [INFO] crypto.features - Crypto feature build: window 1/4 w=2 done | added=79 | total=96 | 2.7s
+09:47:58 [INFO] crypto.features - Crypto feature build: window 2/4 w=3 started.
+09:48:01 [INFO] crypto.features - Crypto feature build: window 2/4 w=3 done | added=79 | total=175 | 2.6s
+09:48:01 [INFO] crypto.features - Crypto feature build: window 3/4 w=4 started.
+09:48:04 [INFO] crypto.features - Crypto feature build: window 3/4 w=4 done | added=79 | total=254 | 3.0s
+09:48:04 [INFO] crypto.features - Crypto feature build: window 4/4 w=6 started.
+09:48:07 [INFO] crypto.features - Crypto feature build: window 4/4 w=6 done | added=79 | total=333 | 2.8s
+09:48:07 [INFO] crypto.features - Crypto feature build: assembling DataFrame with 333 columns.
+09:48:09 [INFO] crypto.features - Crypto feature build: quality filter disabled | total 13.9s
+09:48:18 [INFO] crypto.meta_targets - Meta feature alignment: target=0 days 00:05:00 feature=0 days 00:01:00 | matched=901828/901859 (100.00%)
+09:48:18 [INFO] temp.plot_5m_meta_after_1m_signals - Building aligned 1m meta features | windows=[2, 5, 7]
+09:48:28 [INFO] temp.plot_5m_meta_after_1m_signals - Using exact selective builder for 6 Rank features.
+09:48:31 [INFO] crypto.meta_targets - meta_wf_01: OOF=52009 eligible=51993 positive=33108 (63.68%) | meta train=41603 val=10402
+09:48:34 [INFO] crypto.meta_targets - meta_wf_02: OOF=52914 eligible=52899 positive=28460 (53.80%) | meta train=42327 val=10583
+09:48:37 [INFO] crypto.meta_targets - meta_wf_03: OOF=52128 eligible=51245 positive=25777 (50.30%) | meta train=41698 val=10426
+09:48:41 [INFO] crypto.meta_targets - meta_wf_04: OOF=52992 eligible=49169 positive=20915 (42.54%) | meta train=42389 val=10599
+09:48:44 [INFO] crypto.meta_targets - meta_wf_05: OOF=52112 eligible=44879 positive=16810 (37.46%) | meta train=41685 val=10423
+09:48:48 [INFO] crypto.meta_targets - meta_wf_06: OOF=52992 eligible=34871 positive=12158 (34.87%) | meta train=42389 val=10599
+Accepted H1 after slopeMA3 > 0 | Val=13,859/28,553 | Test=15,865/33,733 | threshold=0.52016129
+
+Open minute 2 / open H1 - 1:
+ val n=13,859 | mean=+0.0733% | Q10=+0.0110% Q25=+0.0400% median=+0.0619% Q75=+0.0952% Q90=+0.1456% | P(>0)=92.85% P(<0)=7.06%
+test n=15,865 | mean=+0.0748% | Q10=+0.0154% Q25=+0.0411% median=+0.0612% Q75=+0.0940% Q90=+0.1459% | P(>0)=94.11% P(<0)=5.81%
+ all n=29,724 | mean=+0.0741% | Q10=+0.0137% Q25=+0.0406% median=+0.0615% Q75=+0.0944% Q90=+0.1458% | P(>0)=93.52% P(<0)=6.39%
+
+Low minute 2 / open H1 - 1:
+ val n=13,859 | mean=+0.0168% | min=-2.2619% Q1=-0.2803% Q5=-0.1392% Q10=-0.0862% Q25=-0.0193% median=+0.0287% Q75=+0.0624% Q80=+0.0715% Q90=+0.1018% | P(<-0.05%)=16.27% P(<-0.10%)=8.48% P(<-0.15%)=4.34%
+test n=15,865 | mean=+0.0205% | min=-1.7734% Q1=-0.2700% Q5=-0.1267% Q10=-0.0779% Q25=-0.0139% median=+0.0303% Q75=+0.0615% Q80=+0.0705% Q90=+0.1011% | P(<-0.05%)=14.94% P(<-0.10%)=7.20% P(<-0.15%)=3.77%
+ all n=29,724 | mean=+0.0188% | min=-2.2619% Q1=-0.2758% Q5=-0.1336% Q10=-0.0816% Q25=-0.0165% median=+0.0295% Q75=+0.0619% Q80=+0.0710% Q90=+0.1015% | P(<-0.05%)=15.56% P(<-0.10%)=7.80% P(<-0.15%)=4.03%
+
+High H1 > dynamic TP:
+ val hit=6,788/13,859 (48.98%) | TP mean all=0.1626% median all=0.1554% | TP mean hit=0.1648% median hit=0.1573%
+test hit=7,748/15,865 (48.84%) | TP mean all=0.1595% median all=0.1512% | TP mean hit=0.1629% median hit=0.1540%
+ all hit=14,536/29,724 (48.90%) | TP mean all=0.1610% median all=0.1531% | TP mean hit=0.1638% median hit=0.1557%
+
+Dynamic TP distribution for accepted trades:
+ val n=13,859 | mean=0.1626% min=0.1201% | Q1=0.1225% Q5=0.1277% Q10=0.1320% Q20=0.1382% Q25=0.1410% median=0.1554% Q75=0.1754% Q80=0.1814% Q90=0.2006% Q95=0.2201% Q99=0.2850% max=0.5086%
+test n=15,865 | mean=0.1595% min=0.1200% | Q1=0.1214% Q5=0.1254% Q10=0.1291% Q20=0.1346% Q25=0.1374% median=0.1512% Q75=0.1722% Q80=0.1787% Q90=0.1993% Q95=0.2202% Q99=0.2761% max=0.5584%
+ all n=29,724 | mean=0.1610% min=0.1200% | Q1=0.1217% Q5=0.1262% Q10=0.1302% Q20=0.1363% Q25=0.1391% median=0.1531% Q75=0.1738% Q80=0.1802% Q90=0.1999% Q95=0.2202% Q99=0.2809% max=0.5584%
+
+High minute 1 > dynamic TP:
+ val hit=1,593/13,859 (11.49%) | TP mean hit=0.1719%
+test hit=2,059/15,865 (12.98%) | TP mean hit=0.1697%
+ all hit=3,652/29,724 (12.29%) | TP mean hit=0.1707%
+
+Max high minute 2..15 / open H1 - 1:
+ val n=13,859 | mean=+0.3114% min=-0.3917% | Q1=+0.0056% Q5=+0.0523% Q10=+0.0735% Q20=+0.1120% Q25=+0.1290% median=+0.2316% Q75=+0.3965% Q80=+0.4530% Q90=+0.6357% Q95=+0.8519% Q99=+1.4375% max=+3.6693%
+test n=15,865 | mean=+0.2991% min=-0.3420% | Q1=+0.0145% Q5=+0.0532% Q10=+0.0747% Q20=+0.1095% Q25=+0.1260% median=+0.2181% Q75=+0.3721% Q80=+0.4238% Q90=+0.6084% Q95=+0.8170% Q99=+1.3745% max=+4.9861%
+ all n=29,724 | mean=+0.3049% min=-0.3917% | Q1=+0.0102% Q5=+0.0528% Q10=+0.0740% Q20=+0.1105% Q25=+0.1272% median=+0.2243% Q75=+0.3825% Q80=+0.4368% Q90=+0.6209% Q95=+0.8330% Q99=+1.4042% max=+4.9861%
+
+Close H3 / open H1 - 1:
+ val n=13,859 | mean=+0.0747% | Q10=-0.2871% Q25=-0.1100% median=+0.0589% Q75=+0.2329% Q90=+0.4520% | P(>0)=59.25% P(<0)=40.73%
+test n=15,865 | mean=+0.0696% | Q10=-0.2618% Q25=-0.0992% median=+0.0559% Q75=+0.2112% Q90=+0.4134% | P(>0)=59.89% P(<0)=40.10%
+ all n=29,724 | mean=+0.0720% | Q10=-0.2750% Q25=-0.1038% median=+0.0570% Q75=+0.2214% Q90=+0.4334% | P(>0)=59.59% P(<0)=40.39%
+
+Requested accepted-trade distributions (all returns vs open H1):
+  [val]
+    low minute 1   n=13,859 mean=-0.0270% min=-2.4693% | Q1=-0.2110% Q5=-0.1081% Q10=-0.0736% Q20=-0.0445% Q25=-0.0348% Q50=-0.0096% Q75=-0.0000% Q80=+0.0000% Q90=+0.0000% Q95=+0.0000% Q99=+0.0000% max=+0.0000%
+    high minute 1  n=13,859 mean=+0.1013% min=+0.0000% | Q1=+0.0038% Q5=+0.0288% Q10=+0.0407% Q20=+0.0524% Q25=+0.0568% Q50=+0.0811% Q75=+0.1203% Q80=+0.1334% Q90=+0.1801% Q95=+0.2338% Q99=+0.4064% max=+3.3666%
+    dynamic TP     n=13,859 mean=+0.1626% min=+0.1201% | Q1=+0.1225% Q5=+0.1277% Q10=+0.1320% Q20=+0.1382% Q25=+0.1410% Q50=+0.1554% Q75=+0.1754% Q80=+0.1814% Q90=+0.2006% Q95=+0.2201% Q99=+0.2850% max=+0.5086%
+    open minute 2  n=13,859 mean=+0.0733% min=-2.1444% | Q1=-0.0783% Q5=-0.0102% Q10=+0.0110% Q20=+0.0334% Q25=+0.0400% Q50=+0.0619% Q75=+0.0952% Q80=+0.1066% Q90=+0.1456% Q95=+0.1931% Q99=+0.3206% max=+2.9086%
+    low H2         n=13,859 mean=-0.0648% min=-6.3463% | Q1=-0.8301% Q5=-0.4617% Q10=-0.3306% Q20=-0.2073% Q25=-0.1706% Q50=-0.0402% Q75=+0.0713% Q80=+0.0959% Q90=+0.1680% Q95=+0.2519% Q99=+0.4810% max=+1.7459%
+    close H3       n=13,859 mean=+0.0747% min=-3.5065% | Q1=-0.7778% Q5=-0.4271% Q10=-0.2871% Q20=-0.1548% Q25=-0.1100% Q50=+0.0589% Q75=+0.2329% Q80=+0.2834% Q90=+0.4520% Q95=+0.6469% Q99=+1.1472% max=+3.0875%
+  [test]
+    low minute 1   n=15,865 mean=-0.0237% min=-1.2435% | Q1=-0.1923% Q5=-0.1011% Q10=-0.0682% Q20=-0.0389% Q25=-0.0307% Q50=-0.0067% Q75=+0.0000% Q80=+0.0000% Q90=+0.0000% Q95=+0.0000% Q99=+0.0000% max=+0.0000%
+    high minute 1  n=15,865 mean=+0.1029% min=+0.0000% | Q1=+0.0068% Q5=+0.0303% Q10=+0.0420% Q20=+0.0529% Q25=+0.0572% Q50=+0.0811% Q75=+0.1211% Q80=+0.1355% Q90=+0.1860% Q95=+0.2453% Q99=+0.4153% max=+2.0633%
+    dynamic TP     n=15,865 mean=+0.1595% min=+0.1200% | Q1=+0.1214% Q5=+0.1254% Q10=+0.1291% Q20=+0.1346% Q25=+0.1374% Q50=+0.1512% Q75=+0.1722% Q80=+0.1787% Q90=+0.1993% Q95=+0.2202% Q99=+0.2761% max=+0.5584%
+    open minute 2  n=15,865 mean=+0.0748% min=-0.9270% | Q1=-0.0640% Q5=-0.0041% Q10=+0.0154% Q20=+0.0347% Q25=+0.0411% Q50=+0.0612% Q75=+0.0940% Q80=+0.1057% Q90=+0.1459% Q95=+0.1970% Q99=+0.3447% max=+2.0486%
+    low H2         n=15,865 mean=-0.0526% min=-2.9543% | Q1=-0.7944% Q5=-0.4272% Q10=-0.3035% Q20=-0.1881% Q25=-0.1523% Q50=-0.0303% Q75=+0.0704% Q80=+0.0933% Q90=+0.1647% Q95=+0.2471% Q99=+0.5050% max=+3.3078%
+    close H3       n=15,865 mean=+0.0696% min=-2.5430% | Q1=-0.7773% Q5=-0.3986% Q10=-0.2618% Q20=-0.1414% Q25=-0.0992% Q50=+0.0559% Q75=+0.2112% Q80=+0.2607% Q90=+0.4134% Q95=+0.5915% Q99=+1.0763% max=+4.4140%
+  [all]
+    low minute 1   n=29,724 mean=-0.0252% min=-2.4693% | Q1=-0.2005% Q5=-0.1040% Q10=-0.0708% Q20=-0.0415% Q25=-0.0326% Q50=-0.0080% Q75=-0.0000% Q80=+0.0000% Q90=+0.0000% Q95=+0.0000% Q99=+0.0000% max=+0.0000%
+    high minute 1  n=29,724 mean=+0.1021% min=+0.0000% | Q1=+0.0051% Q5=+0.0296% Q10=+0.0415% Q20=+0.0527% Q25=+0.0571% Q50=+0.0811% Q75=+0.1206% Q80=+0.1344% Q90=+0.1832% Q95=+0.2394% Q99=+0.4127% max=+3.3666%
+    dynamic TP     n=29,724 mean=+0.1610% min=+0.1200% | Q1=+0.1217% Q5=+0.1262% Q10=+0.1302% Q20=+0.1363% Q25=+0.1391% Q50=+0.1531% Q75=+0.1738% Q80=+0.1802% Q90=+0.1999% Q95=+0.2202% Q99=+0.2809% max=+0.5584%
+    open minute 2  n=29,724 mean=+0.0741% min=-2.1444% | Q1=-0.0704% Q5=-0.0071% Q10=+0.0137% Q20=+0.0342% Q25=+0.0406% Q50=+0.0615% Q75=+0.0944% Q80=+0.1060% Q90=+0.1458% Q95=+0.1947% Q99=+0.3310% max=+2.9086%
+    low H2         n=29,724 mean=-0.0583% min=-6.3463% | Q1=-0.8127% Q5=-0.4440% Q10=-0.3168% Q20=-0.1979% Q25=-0.1602% Q50=-0.0340% Q75=+0.0707% Q80=+0.0946% Q90=+0.1659% Q95=+0.2500% Q99=+0.4955% max=+3.3078%
+    close H3       n=29,724 mean=+0.0720% min=-3.5065% | Q1=-0.7789% Q5=-0.4133% Q10=-0.2750% Q20=-0.1471% Q25=-0.1038% Q50=+0.0570% Q75=+0.2214% Q80=+0.2708% Q90=+0.4334% Q95=+0.6142% Q99=+1.1148% max=+4.4140%
+
+Observable 5m MA3 slope > 0 filter:
+ val kept=13,859/28,553 (48.54%) | hit 68.20% -> 69.20% | gross +0.0635% -> +0.0616% | E[net] +0.0435% -> +0.0416% | TP mean 0.1716% -> 0.1626%
+test kept=15,865/33,733 (47.03%) | hit 67.55% -> 68.59% | gross +0.0631% -> +0.0640% | E[net] +0.0431% -> +0.0440% | TP mean 0.1667% -> 0.1595%
+ all kept=29,724/62,286 (47.72%) | hit 67.85% -> 68.87% | gross +0.0633% -> +0.0629% | E[net] +0.0433% -> +0.0429% | TP mean 0.1689% -> 0.1610%
+
+Dynamic TP + SL 0.100% from open H1 after slopeMA3 > 0 (same 5m candle: SL first):
+ val n=13,859 | TP=7,571 (54.63%) | SL=5,529 (39.89%) | close H3=759 (5.48%) | gross=+0.0474% | E[net]=+0.0274% | win=57.35%
+test n=15,865 | TP=8,805 (55.50%) | SL=5,940 (37.44%) | close H3=1,120 (7.06%) | gross=+0.0498% | E[net]=+0.0298% | win=59.07%
+ all n=29,724 | TP=16,376 (55.09%) | SL=11,469 (38.58%) | close H3=1,879 (6.32%) | gross=+0.0487% | E[net]=+0.0287% | win=58.27%
+Saved: temp\output\meta_offset010_top30_ma3_positive_sl010.png
