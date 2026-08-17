@@ -97,6 +97,7 @@ from crypto.meta_targets import (
     required_feature_windows,
 )
 from crypto.quantile_fitness import QuantileFitnessEvaluator
+from crypto.quantile_exit_fitness import QuantileExitFitnessEvaluator
 
 
 logging.basicConfig(
@@ -119,6 +120,7 @@ def run(
     label_direction: str = config.LABEL_DIRECTION,
     quantile_target: str = config.QUANTILE_TARGET,
     quantile: float = config.QUANTILE_ALPHA,
+    quantile_exit_min_return: float | None = config.QUANTILE_EXIT_MIN_RETURN,
     meta_base_archive: str | Path = config.META_LEARNER_BASE_ARCHIVE,
     meta_base_rank: int = config.META_LEARNER_BASE_RANK,
     meta_min_prediction: float = config.META_LEARNER_MIN_PREDICTION,
@@ -139,14 +141,26 @@ def run(
     checkpoint_every: float = config.CHECKPOINT_EVERY_SECONDS,
 ) -> CryptoArchive:
     config.validate_config()
-    horizons = [int(h) for h in horizons]
     label_mode = config.canonical_label_mode(label_mode)
+    horizons = _resolve_mode_horizons(label_mode, horizons)
     label_direction = config.canonical_label_direction(label_direction)
     quantile_target = config.canonical_quantile_target(quantile_target)
     quantile = config.validate_quantile_alpha(quantile)
     if label_mode == "quantile_trade":
         config.QUANTILE_TARGET = quantile_target
         config.QUANTILE_ALPHA = quantile
+    elif label_mode == "quantile_exit":
+        quantile_target = "close"
+        config.QUANTILE_TARGET = "close"
+        config.QUANTILE_ALPHA = quantile
+        config.QUANTILE_EXIT_MIN_RETURN = (
+            None
+            if quantile_exit_min_return is None
+            else float(quantile_exit_min_return)
+        )
+        quantile_exit_min_return = config.quantile_exit_min_return(
+            config.QUANTILE_EXIT_MIN_RETURN
+        )
     if config.is_meta_learner_label_mode(label_mode):
         config.META_LEARNER_BASE_ARCHIVE = Path(meta_base_archive)
         config.META_LEARNER_BASE_RANK = int(meta_base_rank)
@@ -215,7 +229,13 @@ def run(
     if exit_after_k is not None:
         config.EXIT_AFTER_K = int(exit_after_k)
     if (
-        label_mode in {"ma_slope_reversal", "quantile_trade", "meta_learner"}
+        label_mode
+        in {
+            "ma_slope_reversal",
+            "quantile_trade",
+            "quantile_exit",
+            "meta_learner",
+        }
         and label_threshold is not None
     ):
         logger.warning(
@@ -258,6 +278,17 @@ def run(
             label_mode,
             quantile_target,
             quantile,
+        )
+    elif label_mode == "quantile_exit":
+        logger.info(
+            "Run quantile exit: candidates=H1-H%d | direction=%s | Q=%.2f | "
+            "trade when best predicted close return > %.4f%% | cost=%.4f%% | "
+            "top-fraction disabled",
+            max(horizons),
+            label_direction,
+            quantile,
+            100.0 * float(quantile_exit_min_return),
+            100.0 * float(config.TRADE_COST),
         )
     elif config.is_meta_learner_label_mode(label_mode):
         logger.info(
@@ -562,6 +593,8 @@ def run(
         horizons,
         quantile_target=quantile_target,
         quantile=quantile,
+        label_direction=label_direction,
+        quantile_exit_min_return=quantile_exit_min_return,
     )
     archive = (
         CryptoArchive.load(resume_archive)
@@ -714,7 +747,9 @@ def _make_fitness_evaluator(
     horizons: list[int] | tuple[int, ...],
     quantile_target: str = config.QUANTILE_TARGET,
     quantile: float = config.QUANTILE_ALPHA,
-) -> CryptoFitnessEvaluator | QuantileFitnessEvaluator:
+    label_direction: str = config.LABEL_DIRECTION,
+    quantile_exit_min_return: float | None = config.QUANTILE_EXIT_MIN_RETURN,
+) -> CryptoFitnessEvaluator | QuantileFitnessEvaluator | QuantileExitFitnessEvaluator:
     """Select the mode-specific evaluator without changing split construction."""
     selected_mode = config.canonical_label_mode(label_mode)
     if selected_mode == "quantile_trade":
@@ -722,6 +757,14 @@ def _make_fitness_evaluator(
             horizons=horizons,
             target=quantile_target,
             quantile=quantile,
+        )
+    if selected_mode == "quantile_exit":
+        return QuantileExitFitnessEvaluator(
+            horizons=horizons,
+            quantile=quantile,
+            direction=label_direction,
+            min_return=quantile_exit_min_return,
+            trade_cost=config.TRADE_COST,
         )
     return CryptoFitnessEvaluator(
         horizons=horizons,
@@ -731,7 +774,11 @@ def _make_fitness_evaluator(
 
 def _evaluate_final_archive(
     archive: CryptoArchive,
-    evaluator: CryptoFitnessEvaluator | QuantileFitnessEvaluator,
+    evaluator: (
+        CryptoFitnessEvaluator
+        | QuantileFitnessEvaluator
+        | QuantileExitFitnessEvaluator
+    ),
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -829,12 +876,22 @@ def _save_archive(
         "bull_min_bars": config.BULL_MIN_BARS,
         "bull_label_rule": config.BULL_LABEL_RULE,
         "fitness_horizon_mode": (
-            "mean" if label_mode == "quantile_trade" else config.FITNESS_HORIZON_MODE
+            "mean"
+            if label_mode == "quantile_trade"
+            else (
+                "exit_selection"
+                if label_mode == "quantile_exit"
+                else config.FITNESS_HORIZON_MODE
+            )
         ),
         "fitness": (
             config.quantile_trade_fitness_weights(config.QUANTILE_TARGET)
             if label_mode == "quantile_trade"
-            else config.FITNESS_WEIGHTS
+            else (
+                config.QUANTILE_EXIT_FITNESS_WEIGHTS
+                if label_mode == "quantile_exit"
+                else config.FITNESS_WEIGHTS
+            )
         ),
         "trade_top_fraction": config.TRADE_TOP_FRACTION,
         "trade_cost": config.TRADE_COST,
@@ -858,6 +915,17 @@ def _save_archive(
                 "quantile_trade_rule": config.QUANTILE_TRADE_RULE,
                 "quantile_target": config.QUANTILE_TARGET,
                 "quantile_alpha": config.QUANTILE_ALPHA,
+            }
+        )
+    elif label_mode == "quantile_exit":
+        metadata.pop("trade_top_fraction", None)
+        metadata.update(
+            {
+                "quantile_exit_rule": config.QUANTILE_EXIT_RULE,
+                "quantile_target": "close",
+                "quantile_alpha": float(config.QUANTILE_ALPHA),
+                "quantile_exit_min_return": config.quantile_exit_min_return(),
+                "quantile_exit_candidate_horizons": list(horizons),
             }
         )
     elif config.is_meta_learner_label_mode(label_mode):
@@ -980,7 +1048,13 @@ def _validate_resume_metadata(
         (
             "fitness_horizon_mode",
             str(metadata.get("fitness_horizon_mode", "")).strip().lower(),
-            "mean" if label_mode == "quantile_trade" else config.FITNESS_HORIZON_MODE,
+            "mean"
+            if label_mode == "quantile_trade"
+            else (
+                "exit_selection"
+                if label_mode == "quantile_exit"
+                else config.FITNESS_HORIZON_MODE
+            ),
         ),
     ]
     split_policy = metadata.get("split_policy")
@@ -1006,16 +1080,17 @@ def _validate_resume_metadata(
             "cannot be verified.",
             resume_path,
         )
+    if label_mode not in {"quantile_trade", "quantile_exit"}:
+        checks.append(
+            (
+                "trade_top_fraction",
+                metadata.get("trade_top_fraction"),
+                float(config.TRADE_TOP_FRACTION),
+            )
+        )
     if label_mode != "quantile_trade":
-        checks.extend(
-            [
-                (
-                    "trade_top_fraction",
-                    metadata.get("trade_top_fraction"),
-                    float(config.TRADE_TOP_FRACTION),
-                ),
-                ("trade_cost", metadata.get("trade_cost"), float(config.TRADE_COST)),
-            ]
+        checks.append(
+            ("trade_cost", metadata.get("trade_cost"), float(config.TRADE_COST))
         )
     if exit_after_k is not None or archive_exit_after_k is not None:
         checks.append(("exit_after_k", archive_exit_after_k, exit_after_k))
@@ -1205,6 +1280,34 @@ def _validate_resume_metadata(
                 ),
             ]
         )
+    if label_mode == "quantile_exit" and archive_label_mode == "quantile_exit":
+        archive_rule = metadata.get("quantile_exit_rule")
+        if archive_rule != config.QUANTILE_EXIT_RULE:
+            raise ValueError(
+                "Resume archive uses an incompatible quantile_exit rule. "
+                f"Archive={resume_path}, archive rule={archive_rule!r}, "
+                f"required rule={config.QUANTILE_EXIT_RULE!r}. Start a new archive."
+            )
+        checks.extend(
+            [
+                ("quantile_target", metadata.get("quantile_target"), "close"),
+                (
+                    "quantile_alpha",
+                    metadata.get("quantile_alpha"),
+                    float(config.QUANTILE_ALPHA),
+                ),
+                (
+                    "quantile_exit_min_return",
+                    metadata.get("quantile_exit_min_return"),
+                    config.quantile_exit_min_return(),
+                ),
+                (
+                    "quantile_exit_candidate_horizons",
+                    metadata.get("quantile_exit_candidate_horizons"),
+                    [int(horizon) for horizon in horizons],
+                ),
+            ]
+        )
     if (
         config.is_meta_learner_label_mode(label_mode)
         and archive_label_mode == label_mode
@@ -1386,6 +1489,19 @@ def _signature(features: list[str]) -> tuple[str, ...]:
     return tuple(sorted(features))
 
 
+def _resolve_mode_horizons(
+    label_mode: str,
+    horizons: list[int] | tuple[int, ...],
+) -> list[int]:
+    """Normalize horizons and expand quantile_exit to every close through Hmax."""
+    values = sorted({int(horizon) for horizon in horizons})
+    if not values or any(horizon < 1 for horizon in values):
+        raise ValueError("horizons must contain positive integers.")
+    if config.canonical_label_mode(label_mode) == "quantile_exit":
+        return list(range(1, max(values) + 1))
+    return values
+
+
 def _parse_horizons(text: str) -> list[int]:
     horizons = [int(part.strip()) for part in text.split(",") if part.strip()]
     if not horizons:
@@ -1416,7 +1532,9 @@ def main() -> None:
         default=list(config.HOLDING_HORIZONS),
         help=(
             "Comma-separated horizons. quantile_trade fits one quantile model "
-            "per horizon and averages accuracy across them. Default: "
+            "per horizon and averages accuracy across them. For quantile_exit, "
+            "the largest value is Hmax and candidates are expanded to H1..Hmax. "
+            "Default: "
             f"{','.join(str(h) for h in config.HOLDING_HORIZONS)}."
         ),
     )
@@ -1439,7 +1557,8 @@ def main() -> None:
             " For meta_close_exit it is the minimum close-H return. For "
             "meta_strategy_profit it is the minimum TP-or-close strategy "
             "return and defaults to TRADE_COST. It is ignored by bear/bull, "
-            "ma_slope_reversal, quantile_trade, and the original meta_learner."
+            "ma_slope_reversal, quantile_trade, quantile_exit, and the original "
+            "meta_learner."
         ),
     )
     parser.add_argument(
@@ -1459,6 +1578,7 @@ def main() -> None:
             "price down is favorable. It is ignored by bear, bull, and "
             "two_sided_tp, and quantile_trade. quantile_trade always defines "
             "MFE as upward excursion and MAE as downward excursion. "
+            "quantile_exit uses this direction to score close returns. "
             f"Default: {config.LABEL_DIRECTION}."
         ),
     )
@@ -1468,6 +1588,7 @@ def main() -> None:
         default=config.QUANTILE_TARGET,
         help=(
             "Regression target for --label-mode quantile_trade: mfe, mae, or close. "
+            "quantile_exit always uses close and ignores this option. "
             f"Default: {config.QUANTILE_TARGET}."
         ),
     )
@@ -1476,8 +1597,19 @@ def main() -> None:
         type=float,
         default=config.QUANTILE_ALPHA,
         help=(
-            "Quantile alpha strictly between 0 and 1 for quantile_trade, "
+            "Quantile alpha strictly between 0 and 1 for quantile_trade or "
+            "quantile_exit, "
             f"for example 0.20 or 0.80. Default: {config.QUANTILE_ALPHA}."
+        ),
+    )
+    parser.add_argument(
+        "--quantile-exit-min-return",
+        type=float,
+        default=config.QUANTILE_EXIT_MIN_RETURN,
+        help=(
+            "For quantile_exit, trade only when the largest predicted close "
+            "quantile is strictly above this return. Default: TRADE_COST "
+            f"({config.TRADE_COST})."
         ),
     )
     parser.add_argument(
@@ -1570,7 +1702,7 @@ def main() -> None:
         default=None,
         help=(
             "Fraction of highest predictions selected for fitness/trading. "
-            "Ignored by quantile_trade, which evaluates quantile accuracy only. "
+            "Ignored by quantile_trade and quantile_exit. "
             f"Default: config.TRADE_TOP_FRACTION={config.TRADE_TOP_FRACTION}."
         ),
     )
@@ -1607,6 +1739,7 @@ def main() -> None:
         label_direction=args.label_direction,
         quantile_target=args.quantile_target,
         quantile=args.quantile,
+        quantile_exit_min_return=args.quantile_exit_min_return,
         meta_base_archive=args.meta_base_archive,
         meta_base_rank=args.meta_base_rank,
         meta_feature_data=args.meta_feature_data,

@@ -68,6 +68,9 @@ QUANTILE_ALPHA: float = 0.80  # any finite quantile strictly between 0 and 1
 QUANTILE_TRADE_RULE: str = "mfe_mae_close_shared_quantile_fitness_purged_stop_v11"
 QUANTILE_BAD_COVERAGE_ERROR: float = 0.10
 QUANTILE_BAD_SPEARMAN_IC: float = 0.0
+QUANTILE_EXIT_RULE: str = "close_quantile_argmax_no_trade_v1"
+# None uses TRADE_COST after all configuration values have been loaded.
+QUANTILE_EXIT_MIN_RETURN: float | None = None
 
 # OOF dynamic-TP classification targets used by the three meta label modes.
 # The base archive is retrained inside every original walk-forward train fold;
@@ -950,6 +953,7 @@ LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
     "bear": bear_future_return,
     "bull": bull_future_return,
     "quantile_trade": quantile_trade_future_return,
+    "quantile_exit": quantile_trade_future_return,
     "meta_learner": meta_learner_future_return,
     "meta_close_exit": meta_learner_future_return,
     "meta_strategy_profit": meta_learner_future_return,
@@ -1032,6 +1036,7 @@ def default_label_threshold(
         "bull",
         "ma_slope_reversal",
         "quantile_trade",
+        "quantile_exit",
         "meta_learner",
         "meta_close_exit",
     }:
@@ -1059,8 +1064,8 @@ WF_PURGE_BARS: int | None = None  # None => max(HOLDING_HORIZONS) + 1
 # Safe feature construction. All features are time-series/ratio normalized;
 # raw price/volume scale columns are intentionally not selectable.
 # WINDOWS: list[int] = [1,2,3,4,5,7,10,14,20,30,40,50,60,80,120,160,240,320,400,480,600,800,960,1200,1440,]
-# WINDOWS: list[int] = [1, 2, 3, 5, 7]
-WINDOWS: list[int] = [2, 3, 5, 7, 9, 15, 30, 60]
+WINDOWS: list[int] = [1, 2, 3, 5, 7, 9]
+#WINDOWS: list[int] = [2, 3, 5, 7, 9, 15, 30, 45, 60]
 FEATURE_MIN_VALID_RATIO: float = 0.70
 FEATURE_MAX_DOMINANT_VALUE_RATIO: float = 0.985
 FEATURE_CORR_THRESHOLD: float = 0.70
@@ -1120,6 +1125,24 @@ QUANTILE_TRADE_FITNESS_WEIGHTS: dict[str, float] = {
     "overfit_gap": -0.20,
     "bad_fold_ratio": -0.20,
 }
+
+# quantile_exit selects the close horizon with the highest predicted close
+# quantile. Unselected rows receive zero return; selected rows pay TRADE_COST.
+QUANTILE_EXIT_FITNESS_WEIGHTS: dict[str, float] = {
+    "realized_return_score": 1.00,
+    "regret_score": -0.25,
+    "return_std_score": -0.10,
+    "overfit_gap": -0.20,
+    "bad_fold_ratio": -0.30,
+}
+
+
+def quantile_exit_min_return(value: float | None = None) -> float:
+    selected = QUANTILE_EXIT_MIN_RETURN if value is None else value
+    result = float(TRADE_COST if selected is None else selected)
+    if not isfinite(result):
+        raise ValueError("QUANTILE_EXIT_MIN_RETURN must be finite.")
+    return result
 
 def quantile_trade_fitness_weights(target: str | None = None) -> dict[str, float]:
     # Validate the target but deliberately use one shared quantile objective.
@@ -1192,6 +1215,7 @@ def validate_config() -> None:
     canonical_label_direction()
     canonical_quantile_target(QUANTILE_TARGET)
     validate_quantile_alpha(QUANTILE_ALPHA)
+    quantile_exit_min_return()
     if not 0.0 <= float(QUANTILE_BAD_COVERAGE_ERROR) <= 1.0:
         raise ValueError("QUANTILE_BAD_COVERAGE_ERROR must be in [0, 1].")
     if not -1.0 <= float(QUANTILE_BAD_SPEARMAN_IC) <= 1.0:

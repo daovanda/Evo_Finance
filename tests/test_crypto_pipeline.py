@@ -47,6 +47,7 @@ from crypto.backtest import (
 import matplotlib.pyplot as plt
 from crypto.main import (
     _make_fitness_evaluator,
+    _resolve_mode_horizons,
     _save_archive,
     _validate_resume_metadata,
 )
@@ -67,6 +68,10 @@ from crypto.fitness import (
 from crypto.quantile_fitness import (
     QuantileFitnessEvaluator,
     _internal_quantile_stop_split,
+)
+from crypto.quantile_exit_fitness import (
+    QuantileExitFitnessEvaluator,
+    quantile_exit_metrics,
 )
 from crypto.meta_targets import (
     MetaLearnerBase,
@@ -640,9 +645,82 @@ class CryptoPipelineTests(unittest.TestCase):
             QuantileFitnessEvaluator,
         )
         self.assertIsInstance(
+            _make_fitness_evaluator(
+                "quantile_exit",
+                [1, 2, 3],
+                quantile=0.2,
+                label_direction="Short",
+                quantile_exit_min_return=0.0003,
+            ),
+            QuantileExitFitnessEvaluator,
+        )
+        self.assertIsInstance(
             _make_fitness_evaluator("mfe", [3]),
             CryptoFitnessEvaluator,
         )
+
+    def test_quantile_exit_expands_max_horizon_without_changing_other_modes(self):
+        self.assertEqual(_resolve_mode_horizons("quantile_exit", [5]), [1, 2, 3, 4, 5])
+        self.assertEqual(_resolve_mode_horizons("quantile_exit", [2, 5]), [1, 2, 3, 4, 5])
+        self.assertEqual(_resolve_mode_horizons("quantile_trade", [2, 5]), [2, 5])
+
+    def test_quantile_exit_policy_selects_from_predictions_and_supports_no_trade(self):
+        index = pd.RangeIndex(3)
+        actual = pd.DataFrame(
+            {
+                1: [0.0010, 0.0040, -0.0010],
+                2: [0.0030, 0.0050, 0.0000],
+                3: [0.0020, 0.0060, 0.0040],
+            },
+            index=index,
+        )
+        prediction = pd.DataFrame(
+            {
+                1: [0.0003, 0.0002, 0.0009],
+                2: [0.0008, 0.0001, 0.0007],
+                3: [0.0005, 0.0000, 0.0006],
+            },
+            index=index,
+        )
+
+        metrics = quantile_exit_metrics(
+            actual=actual,
+            prediction=prediction,
+            horizons=[1, 2, 3],
+            min_return=0.0002,
+            trade_cost=0.0002,
+        )
+
+        # Row 0 selects H2; row 1 is NO_TRADE because equality is not enough;
+        # row 2 selects H1 even though actual H3 is the oracle choice.
+        self.assertEqual(metrics.n_selected, 2)
+        self.assertAlmostEqual(metrics.selected_rate, 2.0 / 3.0)
+        self.assertAlmostEqual(metrics.selected_horizon_rates[1], 1.0 / 3.0)
+        self.assertAlmostEqual(metrics.selected_horizon_rates[2], 1.0 / 3.0)
+        self.assertAlmostEqual(metrics.selected_horizon_rates[3], 0.0)
+        self.assertAlmostEqual(metrics.realized_net_return_mean, 0.0016 / 3.0)
+        self.assertAlmostEqual(metrics.oracle_net_return_mean, 0.0124 / 3.0)
+        self.assertAlmostEqual(metrics.regret_mean, 0.0108 / 3.0)
+
+    def test_quantile_exit_short_direction_negates_close_returns(self):
+        evaluator = QuantileExitFitnessEvaluator(
+            horizons=[1, 2],
+            quantile=0.2,
+            direction="Short",
+            min_return=0.0,
+            trade_cost=0.0,
+        )
+        frame = pd.DataFrame(
+            {
+                "quantile_close_return_h1": [0.01, -0.02],
+                "quantile_close_return_h2": [-0.03, 0.04],
+            }
+        )
+
+        directional = evaluator._directional_actual(frame)
+
+        np.testing.assert_allclose(directional[1], [-0.01, 0.02])
+        np.testing.assert_allclose(directional[2], [0.03, -0.04])
 
     def test_quantile_trade_archive_records_and_validates_its_policy(self):
         archive = CryptoArchive()
@@ -753,6 +831,51 @@ class CryptoPipelineTests(unittest.TestCase):
         self.assertNotIn("label_h2", labeled.columns)
         self.assertTrue(config.is_direction_neutral_label_mode("quantile_trade"))
 
+    def test_quantile_exit_targets_and_archive_policy(self):
+        df = _synthetic_crypto_frame(20)
+        labeled = add_binary_labels(
+            df,
+            horizons=[1, 2, 3],
+            label_mode="quantile_exit",
+            label_direction="Short",
+        )
+        for horizon in (1, 2, 3):
+            self.assertIn(f"quantile_close_return_h{horizon}", labeled)
+            self.assertNotIn(f"label_h{horizon}", labeled)
+        self.assertFalse(config.is_direction_neutral_label_mode("quantile_exit"))
+
+        archive = CryptoArchive()
+        archive.try_add(CryptoIndividual(features=["ret"], score=0.1))
+        with TemporaryDirectory() as tmpdir, patch.object(
+            config, "QUANTILE_ALPHA", 0.2
+        ), patch.object(config, "QUANTILE_EXIT_MIN_RETURN", 0.0003):
+            path = Path(tmpdir) / "quantile_exit.json"
+            _save_archive(
+                archive,
+                path,
+                horizons=[1, 2, 3],
+                label_threshold=0.0,
+                label_mode="quantile_exit",
+                label_direction="short",
+                exit_after_k=None,
+            )
+            loaded = CryptoArchive.load(path)
+            _validate_resume_metadata(
+                archive=loaded,
+                resume_path=path,
+                horizons=[1, 2, 3],
+                label_mode="quantile_exit",
+                label_direction="short",
+                label_threshold=0.0,
+            )
+
+        self.assertEqual(loaded.metadata["quantile_exit_rule"], config.QUANTILE_EXIT_RULE)
+        self.assertEqual(loaded.metadata["quantile_target"], "close")
+        self.assertEqual(loaded.metadata["fitness_horizon_mode"], "exit_selection")
+        self.assertEqual(loaded.metadata["quantile_exit_candidate_horizons"], [1, 2, 3])
+        self.assertNotIn("trade_top_fraction", loaded.metadata)
+        self.assertIn("trade_cost", loaded.metadata)
+
     def test_quantile_trade_selects_mfe_mae_or_close_target(self):
         self.assertEqual(
             QuantileFitnessEvaluator([3], "mfe", 0.8).target_column(3),
@@ -837,6 +960,69 @@ class CryptoPipelineTests(unittest.TestCase):
         self.assertEqual(final["final_train_rows"], 600.0)
         self.assertEqual(final["final_val_rows"], 130.0)
         self.assertEqual(final["final_test_rows"], 130.0)
+
+    def test_quantile_exit_fitness_runs_walk_forward_and_final_splits(self):
+        df = _synthetic_crypto_frame(900)
+        labeled = add_binary_labels(
+            df,
+            horizons=[1, 2, 3],
+            label_mode="quantile_exit",
+        )
+        feature_df = pd.DataFrame(
+            {"ret": df["close"].pct_change().fillna(0.0)}, index=df.index
+        )
+        feature_space = CryptoFeatureSpace(feature_df, ["ret"])
+        individual = CryptoIndividual(features=["ret"])
+        fold = CryptoFold(
+            name="wf_01",
+            train_df=labeled.iloc[:600],
+            val_df=labeled.iloc[620:750],
+            train_start=labeled.index[0],
+            train_end=labeled.index[599],
+            val_start=labeled.index[620],
+            val_end=labeled.index[749],
+        )
+        params = {
+            "objective": "quantile",
+            "metric": "quantile",
+            "learning_rate": 0.05,
+            "num_leaves": 7,
+            "max_depth": 3,
+            "min_data_in_leaf": 20,
+            "force_col_wise": True,
+            "verbose": -1,
+            "seed": 37,
+        }
+        evaluator = QuantileExitFitnessEvaluator(
+            horizons=[1, 2, 3],
+            quantile=0.2,
+            direction="long",
+            min_return=-1.0,
+            trade_cost=0.0002,
+            lgbm_params=params,
+            num_boost_round=3,
+            early_stopping_rounds=0,
+        )
+
+        score = evaluator.evaluate_walk_forward(individual, [fold], feature_space)
+        final = evaluator.evaluate_final(
+            individual=individual,
+            train_df=labeled.iloc[:600],
+            val_df=labeled.iloc[620:750],
+            test_df=labeled.iloc[760:890],
+            feature_data=feature_space,
+        )
+
+        self.assertTrue(np.isfinite(score))
+        self.assertEqual(individual.metrics["fitness_type"], "quantile_exit")
+        self.assertEqual(individual.metrics["fitness_horizon_mode"], "exit_selection")
+        self.assertIn("realized_return_score", individual.metrics)
+        self.assertIn("regret_score", individual.metrics)
+        self.assertIn("h1_selected_rate", individual.metrics)
+        self.assertEqual(final["final_fitness_type"], "quantile_exit")
+        self.assertIn("final_val_realized_net_return_mean", final)
+        self.assertIn("final_test_regret_mean", final)
+        self.assertEqual(final["final_n_horizon_scores"], 3.0)
 
     def test_quantile_trade_accepts_arbitrary_positive_horizons(self):
         evaluator = QuantileFitnessEvaluator(horizons=[1, 3, 5])

@@ -1,0 +1,113 @@
+{
+  "pipeline": "meta_rank1_cached_bundle",
+  "data": "data\\crypto\\BTCUSDT_5m.csv",
+  "data_1m": "data\\crypto\\BTCUSDT_1m.csv",
+  "common_oof_cache": "temp\\model\\meta_mfe_q20_after_1m_2m_3m\\common_meta_oof.pkl",
+  "fingerprint": "29eb435e184f7bcc",
+  "models": [
+    {
+      "kind": "base_quantile_mfe",
+      "model_path": "mfe_q20_h3_rank1.txt",
+      "fingerprint": "fe2e0f1838725fe5",
+      "archive": "crypto\\results\\crypto_btc_5m_quantile_mfe_q20_h3_seed1_1h.json",
+      "rank": 1,
+      "horizon": 3,
+      "quantile": 0.2,
+      "features": [
+        "ema(trade_count_ratio_3, 1)",
+        "delta((buy_pressure_negative_ratio_6 + taker_buy_base_volume_log_delta_4), 3)",
+        "garman_klass_vol_6",
+        "abs(bb_width_2)",
+        "taker_ratio_z_6",
+        "q75(ts_zscore_close_6, 6)",
+        "taker_buy_quote_volume_log_delta_6",
+        "(ret_x_volume_z_2 * (body_pct_mean_4 * (imbalance_x_high_volume_3 - rolling_ret_mean_3)))",
+        "(body_pct_mean_4 * (imbalance_x_high_volume_3 - rolling_ret_mean_4))",
+        "taker_buy_quote_volume_ratio_6",
+        "realized_vol_z_2"
+      ],
+      "training_scope": "all_valid_rows_with_internal_chronological_stop"
+    },
+    {
+      "kind": "meta_rank1_analysis_replay",
+      "model_path": "meta_after_1m_rank1.txt",
+      "fingerprint": "892f6edaf16dfc00",
+      "archive": "crypto\\results\\crypto_btc_5m_meta_after_1m_mfe_q20_h3_top80_seed1_8h.json",
+      "rank": 1,
+      "lookahead_bars": 1,
+      "horizon": 3,
+      "features": [
+        "rule_signal(where(gt((bb_width_3 - taker_buy_quote_volume_ratio_2), const(0.127425)), const(1), const(0)), const(-0.0382238), const(0.0528263))",
+        "q25(rule_signal(taker_delta_quote_sum_ratio_7, const(-0.164521), const(0.1964)), 5)",
+        "imbalance_x_trend_2",
+        "volatility_x_buy_pressure_2",
+        "drawdown_5",
+        "(buy_pressure_positive_ratio_2 * drawdown_5)",
+        "(where(gt(imbalance_x_high_volume_3, const(0.138202)), const(1), const(0)) + upper_wick_pct)",
+        "shift(signed_log(kurt_ret_7), 5)",
+        "drawdown_2",
+        "garman_klass_vol_7",
+        "range_x_volume_z_2",
+        "(bb_width_2 * taker_ratio_z_7)",
+        "bb_width_2",
+        "rule_signal(cross_below(rule_signal(taker_delta_quote_sum_ratio_2, const(-0.164521), const(0.1964)), vol_of_vol_2), const(-0.514722), const(0.516067))"
+      ],
+      "feature_cache_path": "features_after_1m.pkl",
+      "feature_fingerprint": "4ec44c23261a278d",
+      "training_scope": "meta_oof_train_with_final_val_early_stopping"
+    },
+    {
+      "kind": "meta_rank1_analysis_replay",
+      "model_path": "meta_after_2m_rank1.txt",
+      "fingerprint": "d2c5a988544c151f",
+      "archive": "crypto\\results\\crypto_btc_5m_meta_after_2m_mfe_q20_h3_top80_seed1_8h.json",
+      "rank": 1,
+      "lookahead_bars": 2,
+      "horizon": 3,
+      "features": [
+        "(bb_width_3 - atr_pct_2)",
+        "taker_delta_quote_sum_ratio_2",
+        "imbalance_x_trend_3",
+        "volatility_x_buy_pressure_2",
+        "bb_pos_3",
+        "neg_part(up_down_realized_vol_ratio_7)",
+        "slope(signed_log(volatility_x_buy_pressure_2), 7)",
+        "max_ret_2",
+        "((taker_delta_quote_sum_ratio_2 * ts_cov(volatility_x_buy_pressure_2, (taker_delta_quote_sum_ratio_2 * bb_pos_7), 2)) - ret_ts_rank_5)",
+        "rule_signal(buy_pressure_mean_5, const(-0.0290567), const(0.0383253))",
+        "range_pct_mean_2",
+        "taker_buy_base_volume_ratio_2",
+        "trade_size_base_ratio_7",
+        "lt(where(lt(neg_part(up_down_realized_vol_ratio_3), const(0.0370743)), const(-1), const(0)), slope(volatility_x_buy_pressure_2, 7))"
+      ],
+      "feature_cache_path": "features_after_2m.pkl",
+      "feature_fingerprint": "0b5c9682b1cf1f25",
+      "training_scope": "meta_oof_train_with_final_val_early_stopping"
+    },
+    {
+      "kind": "meta_rank1_analysis_replay",
+      "model_path": "meta_after_3m_rank1.txt",
+      "fingerprint": "c6e9912a6558a56d",
+      "archive": "crypto\\results\\crypto_btc_5m_meta_after_3m_mfe_q20_h3_top80_seed1_8h.json",
+      "rank": 1,
+      "lookahead_bars": 3,
+      "horizon": 3,
+      "features": [
+        "pos_part(buy_pressure_negative_ratio_9)",
+        "garman_klass_vol_3",
+        "signed_log((ret_ts_rank_3 * logret_close_3))",
+        "ts_rank(max_ret_3, 5)",
+        "ts_zscore_close_3",
+        "q75((buy_pressure_negative_ratio_9 * volatility_2), 1)",
+        "(min_ret_5 + ts_rank(max_ret_2, 5))",
+        "(clip(ret_ts_rank_5) + vol_of_vol_5)",
+        "cross_above((ret_ts_rank_3 * logret_close_3), sign(trade_count_ratio_3))",
+        "signed_log(trade_count_ratio_3)",
+        "gt(trade_size_quote_ratio_7, body_pct)"
+      ],
+      "feature_cache_path": "features_after_3m.pkl",
+      "feature_fingerprint": "d530c9719d85bfa0",
+      "training_scope": "meta_oof_train_with_final_val_early_stopping"
+    }
+  ]
+}

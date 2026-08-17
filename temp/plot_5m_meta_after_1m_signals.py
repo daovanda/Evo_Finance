@@ -1151,6 +1151,13 @@ def _accepted_signal_indices(args: argparse.Namespace) -> tuple[pd.DataFrame, di
         "open_h2_strategy_val": open_h2_val,
         "open_h2_strategy_test": open_h2_test,
         "open_h2_strategy_all": open_h2_all,
+        # Keep the split-level scores and targets available to analysis helpers.
+        # Plotting ignores these keys, while callers can form leakage-safe bands
+        # using the validation threshold/ranking before combining Val and Test.
+        "val_prediction": val_prediction,
+        "test_prediction": test_prediction,
+        "val_meta": val_meta,
+        "test_meta": test_meta,
     }
     return pd.DataFrame(index=accepted_entries), info
 

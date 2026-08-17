@@ -23,3 +23,8 @@ data/crypto/BTCUSDT_1m.csv
 data/crypto/BTCUSDT_3m.csv
 BTCUSDT_1m.csv.tar.gz
 BTCUSDT_3m.csv.tar.gz
+
+# Local caches and generated reports
+temp/**/*.pkl
+temp/output/
+temp/.mplconfig/

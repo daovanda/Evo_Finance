@@ -154,7 +154,7 @@ def add_binary_labels(
             )
     for h in horizons:
         h = int(h)
-        if selected_mode == "quantile_trade":
+        if selected_mode in {"quantile_trade", "quantile_exit"}:
             _add_quantile_trade_horizon_targets(labeled, h)
             continue
 
