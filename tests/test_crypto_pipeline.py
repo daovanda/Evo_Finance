@@ -51,7 +51,12 @@ from crypto.main import (
     _save_archive,
     _validate_resume_metadata,
 )
-from crypto.data import CryptoFold, add_binary_labels, split_labeled_by_dates
+from crypto.data import (
+    CryptoFold,
+    add_binary_labels,
+    attach_mfe_entry_m2_inputs,
+    split_labeled_by_dates,
+)
 from crypto.evolution import CryptoArchive, CryptoIndividual, CryptoMutator
 from crypto.expression import CryptoFeatureSpace
 from crypto.features import (
@@ -73,6 +78,7 @@ from crypto.quantile_exit_fitness import (
     QuantileExitFitnessEvaluator,
     quantile_exit_metrics,
 )
+from crypto.sample_filters import slope_accumulation_mask
 from crypto.meta_targets import (
     MetaLearnerBase,
     align_meta_feature_frame,
@@ -95,6 +101,33 @@ from crypto.prod.train_model import SCORE_BAND_FRACTIONS, _score_band_cutoffs
 
 
 class CryptoPipelineTests(unittest.TestCase):
+    def test_mfe_entry_m2_uses_second_minute_open_and_excludes_first_minute(self):
+        target_index = pd.date_range("2024-01-01", periods=4, freq="5min")
+        minute_index = pd.date_range("2024-01-01", periods=25, freq="1min")
+        target = pd.DataFrame(
+            {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0},
+            index=target_index,
+        )
+        minute = pd.DataFrame(
+            {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0},
+            index=minute_index,
+        )
+        minute.loc[pd.Timestamp("2024-01-01 00:05"), "high"] = 200.0
+        minute.loc[pd.Timestamp("2024-01-01 00:06"), "high"] = 101.0
+
+        enriched = attach_mfe_entry_m2_inputs(target, minute, [1])
+        labeled = add_binary_labels(
+            enriched,
+            horizons=[1],
+            threshold=0.005,
+            label_mode="mfe_entry_m2",
+            label_direction="Long",
+        )
+
+        self.assertAlmostEqual(enriched.iloc[0]["mfe_entry_m2_long_h1"], 0.01)
+        self.assertEqual(labeled.iloc[0]["label_h1"], 1.0)
+        self.assertAlmostEqual(labeled.iloc[0]["future_return_h1"], 0.005)
+
     def test_meta_learner_dynamic_tp_target_uses_hit_or_close_return(self):
         index = pd.date_range("2022-01-01", periods=4, freq="5min")
         frame = pd.DataFrame(
@@ -183,6 +216,7 @@ class CryptoPipelineTests(unittest.TestCase):
         frame = pd.DataFrame(
             {
                 "quantile_up_mfe_h3": [0.0030, 0.0010, 0.0010],
+                "quantile_down_mfe_h3": [0.0010, 0.0010, 0.0010],
                 "quantile_close_return_h3": [-0.0010, 0.0004, 0.0001],
             },
             index=index,
@@ -202,6 +236,34 @@ class CryptoPipelineTests(unittest.TestCase):
         np.testing.assert_allclose(
             targeted["future_return_h3"].to_numpy(),
             np.array([0.0020, 0.0004, 0.0001]),
+        )
+
+    def test_meta_strategy_profit_fixed_stop_is_stop_first_and_label_zero(self):
+        index = pd.date_range("2022-01-01", periods=3, freq="5min")
+        frame = pd.DataFrame(
+            {
+                "quantile_up_mfe_h3": [0.0030, 0.0010, 0.0030],
+                "quantile_down_mfe_h3": [0.0010, 0.0040, 0.0040],
+                "quantile_close_return_h3": [0.0010, 0.0020, 0.0020],
+            },
+            index=index,
+        )
+        prediction = pd.Series(0.0020, index=index)
+
+        targeted = attach_meta_targets(
+            frame,
+            prediction,
+            horizon=3,
+            min_prediction=0.0002,
+            target_mode="meta_strategy_profit",
+            label_threshold=0.0002,
+            stop_loss=0.003,
+        )
+
+        self.assertEqual(targeted["label_h3"].tolist(), [1.0, 0.0, 0.0])
+        np.testing.assert_allclose(
+            targeted["future_return_h3"].to_numpy(),
+            np.array([0.0020, -0.0030, -0.0030]),
         )
 
     def test_meta_mode_registry_and_default_thresholds(self):
@@ -545,6 +607,59 @@ class CryptoPipelineTests(unittest.TestCase):
         ).astype("datetime64[ns]")
         pd.testing.assert_index_equal(alignment.source_index, expected_source)
         self.assertEqual(alignment.lookahead_bars, 1)
+
+    def test_meta_feature_alignment_uses_last_closed_slower_candle(self):
+        target_index = pd.date_range("2024-01-01 00:00", periods=4, freq="5min")
+        feature_index = pd.date_range(
+            "2023-12-31 23:30", periods=4, freq="15min"
+        )
+
+        alignment = build_meta_feature_alignment(target_index, feature_index)
+
+        expected = pd.Series(
+            pd.to_datetime(
+                [
+                    "2023-12-31 23:45",
+                    "2023-12-31 23:45",
+                    "2024-01-01 00:00",
+                    "2024-01-01 00:00",
+                ]
+            ).astype("datetime64[ns]"),
+            index=target_index,
+        )
+        pd.testing.assert_series_equal(alignment.target_to_feature, expected)
+
+        with self.assertRaisesRegex(ValueError, "completed-candle"):
+            build_meta_feature_alignment(
+                target_index,
+                feature_index,
+                lookahead_bars=1,
+            )
+
+    def test_meta_feature_alignment_can_observe_into_h2_with_h3_limit(self):
+        target_index = pd.date_range("2024-01-01", periods=3, freq="5min")
+        feature_index = pd.date_range("2024-01-01", periods=30, freq="1min")
+
+        alignment = build_meta_feature_alignment(
+            target_index,
+            feature_index,
+            lookahead_bars=6,
+            horizon=3,
+        )
+
+        expected_source = pd.DatetimeIndex(
+            [feature_index[10], feature_index[15], feature_index[20]]
+        ).astype("datetime64[ns]")
+        pd.testing.assert_index_equal(alignment.source_index, expected_source)
+        self.assertEqual(alignment.lookahead_bars, 6)
+
+        with self.assertRaisesRegex(ValueError, "final horizon"):
+            build_meta_feature_alignment(
+                target_index,
+                feature_index,
+                lookahead_bars=16,
+                horizon=3,
+            )
 
     def test_post_observation_mfe_excludes_observed_first_minute(self):
         target_index = pd.date_range("2024-01-01", periods=4, freq="5min")
@@ -4029,6 +4144,33 @@ class CryptoPipelineTests(unittest.TestCase):
             full_matrix.loc[fold_index],
             check_exact=True,
         )
+
+
+class SampleFilterTests(unittest.TestCase):
+    def test_slope_accumulation_mask_matches_manual_causal_formula(self) -> None:
+        close = pd.Series(
+            np.exp([0.00, 0.02, 0.04, 0.041, 0.042, 0.0421, 0.0422]),
+            index=pd.date_range("2024-01-01", periods=7, freq="min"),
+        )
+        actual = slope_accumulation_mask(
+            close,
+            window=3,
+            previous_windows=3,
+            ratio=0.15,
+        )
+
+        expected = pd.Series(False, index=close.index)
+        logs = np.log(close.to_numpy())
+        x = np.arange(3, dtype=float)
+        for end in range(5, len(close)):
+            current = np.polyfit(x, logs[end - 2 : end + 1], 1)[0]
+            previous = [
+                np.polyfit(x, logs[end - offset - 2 : end - offset + 1], 1)[0]
+                for offset in range(1, 4)
+            ]
+            expected.iloc[end] = abs(current) <= 0.15 * max(map(abs, previous))
+
+        pd.testing.assert_series_equal(actual, expected)
 
 
 def _synthetic_crypto_frame(n: int) -> pd.DataFrame:

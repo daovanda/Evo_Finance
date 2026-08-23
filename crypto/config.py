@@ -13,6 +13,8 @@ import pandas as pd
 
 # Data
 DATA_PATH: Path = Path("data/crypto/BTCUSDT_15m.csv")
+MFE_ENTRY_M2_DATA_PATH: Path = Path("data/crypto/BTCUSDT_1m.csv")
+MFE_ENTRY_M2_RULE: str = "entry_open_second_minute_path_from_m2_to_close_h_v1"
 DATE_COLUMN: str = "date"
 
 # Output
@@ -26,7 +28,15 @@ LABEL_MODE: str = "close_path_mean"
 LABEL_DIRECTION: str = (
     "Long"  # "Long" => price up is favorable, "Short" => price down is favorable
 )
-PAYOFF_TP: float = 0.004  # legacy payoff archives were evolved with TP=0.40%
+
+# Optional causal row filter applied after labels are built and before the
+# existing chronological final/WF splits are materialized.
+SAMPLE_FILTER: str = "none"
+SAMPLE_FILTER_SLOPE_WINDOW: int = 3
+SAMPLE_FILTER_SLOPE_PREVIOUS_WINDOWS: int = 3
+SAMPLE_FILTER_SLOPE_RATIO: float = 0.15
+SAMPLE_FILTER_SLOPE_RULE: str = "ols_log_close_max_previous_abs_v1"
+PAYOFF_TP: float = 0.002  # legacy payoff archives were evolved with TP=0.40%
 # Effectively disables the newer adverse-path filter for legacy payoff archives.
 PAYOFF_ADVERSE_FLOOR: float = -999.0
 TP_SAFE_PATH: float = 0.001  # TP used by LABEL_MODE="safe_path_mfe"
@@ -85,10 +95,13 @@ META_LEARNER_MIN_PREDICTION: float = 0.0002
 # Fixed return added to every base MFE prediction before constructing the
 # dynamic TP label and hit return. Zero preserves the original behavior.
 META_LEARNER_TP_OFFSET: float = 0.0
+META_STRATEGY_STOP_LOSS: float = 0.0
 META_LEARNER_META_VAL_FRACTION: float = 0.20
 META_LEARNER_RULE: str = "oof_mfe_dynamic_tp_binary_v1"
 META_CLOSE_EXIT_RULE: str = "oof_mfe_dynamic_tp_close_exit_binary_v1"
-META_STRATEGY_PROFIT_RULE: str = "oof_mfe_dynamic_tp_strategy_profit_binary_v1"
+META_STRATEGY_PROFIT_RULE: str = (
+    "oof_mfe_dynamic_tp_strategy_profit_fixed_sl_stop_first_binary_v2"
+)
 META_LEARNER_LABEL_MODES: frozenset[str] = frozenset(
     {"meta_learner", "meta_close_exit", "meta_strategy_profit"}
 )
@@ -414,6 +427,36 @@ def mfe_future_return(
         return directional_price_return(min_low, entry_open, direction)
     max_high = future_highs.max(axis=1, skipna=False)
     return directional_price_return(max_high, entry_open, direction)
+
+
+def mfe_entry_m2_future_return(
+    df: Any,
+    horizon: int,
+    direction: str | None = None,
+) -> pd.Series:
+    """MFE from open minute 2 of H1 through the end of H."""
+    selected = canonical_label_direction(direction)
+    column = f"mfe_entry_m2_{selected}_h{int(horizon)}"
+    if column not in df:
+        raise ValueError(
+            f"Missing {column!r}; provide --mfe-entry-data with 1m OHLCV."
+        )
+    return pd.to_numeric(df[column], errors="coerce")
+
+
+def mfe_entry_m2_close_return(
+    df: Any,
+    horizon: int,
+    direction: str | None = None,
+) -> pd.Series:
+    """Final close-H return relative to open minute 2 of H1."""
+    selected = canonical_label_direction(direction)
+    column = f"close_entry_m2_{selected}_h{int(horizon)}"
+    if column not in df:
+        raise ValueError(
+            f"Missing {column!r}; provide --mfe-entry-data with 1m OHLCV."
+        )
+    return pd.to_numeric(df[column], errors="coerce")
 
 
 def mfe_ahead_future_return(
@@ -944,6 +987,7 @@ LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
     "ma_slope_reversal": ma_slope_reversal_future_return,
     "close_path_mean": close_path_mean_future_return,
     "mfe": mfe_future_return,
+    "mfe_entry_m2": mfe_entry_m2_future_return,
     "mfe_ahead": mfe_ahead_future_return,
     "adverse_floor": adverse_floor_future_return,
     "safe_path_mfe": safe_path_mfe_future_return,
@@ -1064,7 +1108,7 @@ WF_PURGE_BARS: int | None = None  # None => max(HOLDING_HORIZONS) + 1
 # Safe feature construction. All features are time-series/ratio normalized;
 # raw price/volume scale columns are intentionally not selectable.
 # WINDOWS: list[int] = [1,2,3,4,5,7,10,14,20,30,40,50,60,80,120,160,240,320,400,480,600,800,960,1200,1440,]
-WINDOWS: list[int] = [1, 2, 3, 5, 7, 9]
+WINDOWS: list[int] = [1, 2, 3, 5, 10, 15, 20, 27, 35, 42, 50]
 #WINDOWS: list[int] = [2, 3, 5, 7, 9, 15, 30, 45, 60]
 FEATURE_MIN_VALID_RATIO: float = 0.70
 FEATURE_MAX_DOMINANT_VALUE_RATIO: float = 0.985
@@ -1211,6 +1255,21 @@ def validate_config() -> None:
         raise ValueError("HOLDING_HORIZONS must contain positive integers.")
     if not isfinite(float(LABEL_THRESHOLD)):
         raise ValueError("LABEL_THRESHOLD must be finite.")
+    if SAMPLE_FILTER not in {"none", "slope_accumulation"}:
+        raise ValueError("SAMPLE_FILTER must be 'none' or 'slope_accumulation'.")
+    if int(SAMPLE_FILTER_SLOPE_WINDOW) < 2:
+        raise ValueError("SAMPLE_FILTER_SLOPE_WINDOW must be at least 2.")
+    if int(SAMPLE_FILTER_SLOPE_PREVIOUS_WINDOWS) < 1:
+        raise ValueError(
+            "SAMPLE_FILTER_SLOPE_PREVIOUS_WINDOWS must be at least 1."
+        )
+    if (
+        not isfinite(float(SAMPLE_FILTER_SLOPE_RATIO))
+        or SAMPLE_FILTER_SLOPE_RATIO < 0.0
+    ):
+        raise ValueError(
+            "SAMPLE_FILTER_SLOPE_RATIO must be finite and non-negative."
+        )
     get_label_return_fn()
     canonical_label_direction()
     canonical_quantile_target(QUANTILE_TARGET)
@@ -1232,6 +1291,11 @@ def validate_config() -> None:
         or META_LEARNER_TP_OFFSET < 0.0
     ):
         raise ValueError("META_LEARNER_TP_OFFSET must be finite and non-negative.")
+    if (
+        not isfinite(float(META_STRATEGY_STOP_LOSS))
+        or META_STRATEGY_STOP_LOSS < 0.0
+    ):
+        raise ValueError("META_STRATEGY_STOP_LOSS must be finite and non-negative.")
     if not 0.0 < float(META_LEARNER_META_VAL_FRACTION) < 0.5:
         raise ValueError("META_LEARNER_META_VAL_FRACTION must be in (0, 0.5).")
     if PAYOFF_TP <= 0:

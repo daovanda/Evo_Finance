@@ -77,48 +77,60 @@ def build_meta_feature_alignment(
     *,
     include_h1: bool = False,
     lookahead_bars: int = 0,
+    horizon: int = 1,
 ) -> MetaFeatureAlignment:
     """Map targets to the last source candle available at decision time."""
     targets = pd.DatetimeIndex(target_index).sort_values()
     features = pd.DatetimeIndex(feature_index).sort_values()
     target_interval = _infer_regular_interval(targets, "target")
     feature_interval = _infer_regular_interval(features, "feature")
-    if feature_interval > target_interval:
-        raise ValueError(
-            "meta feature candles cannot be slower than target candles: "
-            f"feature={feature_interval}, target={target_interval}."
-        )
-    if target_interval.value % feature_interval.value != 0:
+    slower_features = feature_interval > target_interval
+    if not slower_features and target_interval.value % feature_interval.value != 0:
         raise ValueError(
             "target candle interval must be an integer multiple of the meta "
             f"feature interval: feature={feature_interval}, target={target_interval}."
         )
-    bars_per_target = int(target_interval.value // feature_interval.value)
+    holding_horizon = int(horizon)
+    if holding_horizon < 1:
+        raise ValueError("meta feature alignment horizon must be positive.")
     observed_bars = int(lookahead_bars)
     if observed_bars < 0:
         raise ValueError("meta feature lookahead bars must be non-negative.")
+    if slower_features and (include_h1 or observed_bars):
+        raise ValueError(
+            "slower meta feature candles only support completed-candle features "
+            "with include_h1=False and lookahead_bars=0."
+        )
+    bars_per_target = (
+        0 if slower_features else int(target_interval.value // feature_interval.value)
+    )
     if include_h1:
         if observed_bars:
             raise ValueError(
                 "include_h1 and lookahead_bars cannot both be enabled."
             )
         observed_bars = bars_per_target
-    if observed_bars > bars_per_target:
+    max_observed_bars = holding_horizon * bars_per_target
+    if not slower_features and observed_bars > max_observed_bars:
         raise ValueError(
-            "meta feature lookahead cannot extend beyond H1: "
-            f"lookahead={observed_bars}, bars_per_target={bars_per_target}."
+            "meta feature lookahead cannot extend beyond the final horizon: "
+            f"lookahead={observed_bars}, horizon={holding_horizon}, "
+            f"bars_per_target={bars_per_target}, maximum={max_observed_bars}."
         )
 
     # CSV timestamps identify candle opens. Normally a 5m signal candle opened
-    # at 00:00 maps to the 1m candle opened at 00:04. In H1-ahead mode the
-    # complete next 5m candle is observable, so the same row maps to 00:09.
+    # at 00:00 maps to the 1m candle opened at 00:04. With one observed H1
+    # candle, the same row maps to 00:09; longer lookahead may continue into
+    # later holding candles but never beyond the configured final horizon.
     cutoffs = (
         targets
         + target_interval
         - feature_interval
         + observed_bars * feature_interval
     )
-    positions = features.get_indexer(cutoffs)
+    # Use the latest feature candle whose close is available by the cutoff.
+    # This also permits, for example, completed 15m context for a 5m target.
+    positions = features.searchsorted(cutoffs, side="right") - 1
     mapped = pd.Series(pd.NaT, index=targets, dtype="datetime64[ns]")
     valid = positions >= 0
     if valid.any():
@@ -369,6 +381,7 @@ def attach_meta_targets(
     target_mode: str = "meta_learner",
     label_threshold: float = 0.0,
     tp_offset: float = 0.0,
+    stop_loss: float = config.META_STRATEGY_STOP_LOSS,
     target_start_step: int = 1,
     path_mfe_column: str | None = None,
     observed_mfe_column: str | None = None,
@@ -383,7 +396,11 @@ def attach_meta_targets(
     threshold = float(label_threshold)
     if not np.isfinite(threshold):
         raise ValueError("meta label_threshold must be finite.")
+    if not np.isfinite(float(stop_loss)) or float(stop_loss) < 0.0:
+        raise ValueError("meta strategy stop_loss must be finite and non-negative.")
+    stop_enabled = selected_mode == "meta_strategy_profit" and float(stop_loss) > 0.0
     close_col = f"quantile_close_return_h{h}"
+    adverse_col = f"quantile_down_mfe_h{h}"
     start_step = int(target_start_step)
     if not 1 <= start_step <= h:
         raise ValueError(
@@ -398,6 +415,8 @@ def attach_meta_targets(
             f"quantile_up_s{step}" for step in range(start_step, h + 1)
         ]
     required_columns = [*path_columns, close_col]
+    if stop_enabled:
+        required_columns.append(adverse_col)
     if observed_mfe_column is not None:
         required_columns.append(str(observed_mfe_column))
     missing = [column for column in required_columns if column not in frame]
@@ -418,6 +437,11 @@ def attach_meta_targets(
             .max(axis=1, skipna=False)
         )
     close_return = pd.to_numeric(result[close_col], errors="coerce")
+    adverse = (
+        pd.to_numeric(result[adverse_col], errors="coerce")
+        if stop_enabled
+        else pd.Series(0.0, index=result.index)
+    )
     eligible = (
         base_prediction.notna()
         & np.isfinite(base_prediction)
@@ -426,6 +450,7 @@ def attach_meta_targets(
         & np.isfinite(tp)
         & mfe.notna()
         & close_return.notna()
+        & adverse.notna()
     )
     if observed_mfe_column is not None:
         observed_mfe = pd.to_numeric(
@@ -435,17 +460,23 @@ def attach_meta_targets(
         # the meta decision, so they must not become positive or negative rows.
         eligible &= observed_mfe.notna() & observed_mfe.lt(tp)
     hit = mfe.ge(tp) & eligible
+    sl_hit = pd.Series(False, index=result.index)
+    if stop_enabled:
+        sl_hit = adverse.ge(float(stop_loss)) & eligible
 
     label = pd.Series(np.nan, index=result.index, dtype="float64")
     future_return = pd.Series(np.nan, index=result.index, dtype="float64")
     future_return.loc[eligible] = close_return.loc[eligible]
     future_return.loc[hit] = tp.loc[hit]
+    if stop_enabled:
+        # Stop-first policy: any SL touch overrides TP, including both-touch rows.
+        future_return.loc[sl_hit] = -float(stop_loss)
     if selected_mode == "meta_learner":
         positive = hit
     elif selected_mode == "meta_close_exit":
         positive = close_return.gt(threshold) & eligible
     else:
-        positive = future_return.gt(threshold) & eligible
+        positive = future_return.gt(threshold) & eligible & ~sl_hit
     label.loc[eligible] = positive.loc[eligible].astype(float)
 
     result[f"meta_dynamic_tp_h{h}"] = tp.where(eligible)
@@ -507,6 +538,7 @@ def build_meta_learner_data(
     path_mfe_column: str | None = None,
     observed_mfe_column: str | None = None,
     tp_offset: float = 0.0,
+    stop_loss: float = config.META_STRATEGY_STOP_LOSS,
 ) -> MetaLearnerData:
     """Create six OOF meta folds plus leakage-safe final Val/Test targets."""
     evaluator = QuantileFitnessEvaluator(
@@ -533,6 +565,7 @@ def build_meta_learner_data(
             target_mode=target_mode,
             label_threshold=label_threshold,
             tp_offset=tp_offset,
+            stop_loss=stop_loss,
             target_start_step=target_start_step,
             path_mfe_column=path_mfe_column,
             observed_mfe_column=observed_mfe_column,
@@ -582,6 +615,7 @@ def build_meta_learner_data(
         target_mode=target_mode,
         label_threshold=label_threshold,
         tp_offset=tp_offset,
+        stop_loss=stop_loss,
         target_start_step=target_start_step,
         path_mfe_column=path_mfe_column,
         observed_mfe_column=observed_mfe_column,
@@ -608,6 +642,7 @@ def build_meta_learner_data(
         target_mode=target_mode,
         label_threshold=label_threshold,
         tp_offset=tp_offset,
+        stop_loss=stop_loss,
         target_start_step=target_start_step,
         path_mfe_column=path_mfe_column,
         observed_mfe_column=observed_mfe_column,

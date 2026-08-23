@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from pandas.api.indexers import FixedForwardWindowIndexer
 
 from crypto import config
 
@@ -69,6 +70,61 @@ def load_ohlcv(path: str | Path = config.DATA_PATH) -> pd.DataFrame:
         raise ValueError("OHLC rows must satisfy high >= low.")
 
     return df
+
+
+def attach_mfe_entry_m2_inputs(
+    target_df: pd.DataFrame,
+    minute_df: pd.DataFrame,
+    horizons: list[int] | tuple[int, ...],
+) -> pd.DataFrame:
+    """Attach future targets whose entry is open minute 2 of target H1."""
+    if len(target_df.index) < 2 or len(minute_df.index) < 2:
+        raise ValueError("mfe_entry_m2 requires at least two target and minute rows.")
+    target_interval = pd.Series(target_df.index).diff().dropna().mode().iloc[0]
+    minute_interval = pd.Series(minute_df.index).diff().dropna().mode().iloc[0]
+    if target_interval != pd.Timedelta(minutes=5):
+        raise ValueError(
+            f"mfe_entry_m2 currently requires 5m --data, got {target_interval}."
+        )
+    if minute_interval != pd.Timedelta(minutes=1):
+        raise ValueError(
+            f"--mfe-entry-data must contain 1m candles, got {minute_interval}."
+        )
+
+    result = target_df.copy()
+    entry_times = result.index + target_interval + minute_interval
+    entry = minute_df["open"].reindex(entry_times)
+    entry.index = result.index
+
+    for horizon in sorted({int(value) for value in horizons}):
+        if horizon < 1:
+            raise ValueError("mfe_entry_m2 horizons must be positive.")
+        path_bars = horizon * 5 - 1
+        indexer = FixedForwardWindowIndexer(window_size=path_bars)
+        path_high = minute_df["high"].rolling(
+            window=indexer, min_periods=path_bars
+        ).max().reindex(entry_times)
+        path_low = minute_df["low"].rolling(
+            window=indexer, min_periods=path_bars
+        ).min().reindex(entry_times)
+        path_high.index = result.index
+        path_low.index = result.index
+        close_h = result["close"].shift(-horizon)
+        complete = entry.notna() & path_high.notna() & path_low.notna() & close_h.notna()
+
+        result[f"mfe_entry_m2_long_h{horizon}"] = (
+            path_high.div(entry).sub(1.0).where(complete)
+        )
+        result[f"mfe_entry_m2_short_h{horizon}"] = (
+            1.0 - path_low.div(entry)
+        ).where(complete)
+        result[f"close_entry_m2_long_h{horizon}"] = (
+            close_h.div(entry).sub(1.0).where(complete)
+        )
+        result[f"close_entry_m2_short_h{horizon}"] = (
+            1.0 - close_h.div(entry)
+        ).where(complete)
+    return result
 
 
 def add_binary_labels(
@@ -270,9 +326,15 @@ def add_binary_labels(
             labeled[f"label_h{h}"] = explicit_label
             continue
 
-        if selected_mode in {"mfe", "mfe_ahead"}:
+        if selected_mode in {"mfe", "mfe_ahead", "mfe_entry_m2"}:
             if selected_mode == "mfe_ahead":
                 close_return = config.mfe_ahead_close_return(
+                    labeled,
+                    h,
+                    direction=selected_direction,
+                )
+            elif selected_mode == "mfe_entry_m2":
+                close_return = config.mfe_entry_m2_close_return(
                     labeled,
                     h,
                     direction=selected_direction,

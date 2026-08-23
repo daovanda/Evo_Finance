@@ -79,6 +79,7 @@ import pandas as pd
 from crypto import config
 from crypto.data import (
     add_binary_labels,
+    attach_mfe_entry_m2_inputs,
     load_ohlcv,
     make_walk_forward_folds,
     split_labeled_by_dates,
@@ -98,6 +99,7 @@ from crypto.meta_targets import (
 )
 from crypto.quantile_fitness import QuantileFitnessEvaluator
 from crypto.quantile_exit_fitness import QuantileExitFitnessEvaluator
+from crypto.sample_filters import canonical_sample_filter, slope_accumulation_mask
 
 
 logging.basicConfig(
@@ -121,10 +123,12 @@ def run(
     quantile_target: str = config.QUANTILE_TARGET,
     quantile: float = config.QUANTILE_ALPHA,
     quantile_exit_min_return: float | None = config.QUANTILE_EXIT_MIN_RETURN,
+    mfe_entry_data: str | Path = config.MFE_ENTRY_M2_DATA_PATH,
     meta_base_archive: str | Path = config.META_LEARNER_BASE_ARCHIVE,
     meta_base_rank: int = config.META_LEARNER_BASE_RANK,
     meta_min_prediction: float = config.META_LEARNER_MIN_PREDICTION,
     meta_tp_offset: float = config.META_LEARNER_TP_OFFSET,
+    meta_stop_loss: float = config.META_STRATEGY_STOP_LOSS,
     meta_val_fraction: float = config.META_LEARNER_META_VAL_FRACTION,
     meta_feature_data: str | Path | None = config.META_LEARNER_FEATURE_DATA,
     meta_feature_lookahead_bars: int = config.META_LEARNER_FEATURE_LOOKAHEAD_BARS,
@@ -139,13 +143,26 @@ def run(
     wf_val_months: int = config.WF_VAL_MONTHS,
     wf_step_months: int = config.WF_STEP_MONTHS,
     checkpoint_every: float = config.CHECKPOINT_EVERY_SECONDS,
+    sample_filter: str = config.SAMPLE_FILTER,
+    slope_filter_window: int = config.SAMPLE_FILTER_SLOPE_WINDOW,
+    slope_filter_previous_windows: int = config.SAMPLE_FILTER_SLOPE_PREVIOUS_WINDOWS,
+    slope_filter_ratio: float = config.SAMPLE_FILTER_SLOPE_RATIO,
 ) -> CryptoArchive:
+    sample_filter = canonical_sample_filter(sample_filter)
+    config.SAMPLE_FILTER = sample_filter
+    config.SAMPLE_FILTER_SLOPE_WINDOW = int(slope_filter_window)
+    config.SAMPLE_FILTER_SLOPE_PREVIOUS_WINDOWS = int(
+        slope_filter_previous_windows
+    )
+    config.SAMPLE_FILTER_SLOPE_RATIO = float(slope_filter_ratio)
     config.validate_config()
     label_mode = config.canonical_label_mode(label_mode)
     horizons = _resolve_mode_horizons(label_mode, horizons)
     label_direction = config.canonical_label_direction(label_direction)
     quantile_target = config.canonical_quantile_target(quantile_target)
     quantile = config.validate_quantile_alpha(quantile)
+    if label_mode == "mfe_entry_m2":
+        config.MFE_ENTRY_M2_DATA_PATH = Path(mfe_entry_data)
     if label_mode == "quantile_trade":
         config.QUANTILE_TARGET = quantile_target
         config.QUANTILE_ALPHA = quantile
@@ -166,6 +183,7 @@ def run(
         config.META_LEARNER_BASE_RANK = int(meta_base_rank)
         config.META_LEARNER_MIN_PREDICTION = float(meta_min_prediction)
         config.META_LEARNER_TP_OFFSET = float(meta_tp_offset)
+        config.META_STRATEGY_STOP_LOSS = float(meta_stop_loss)
         config.META_LEARNER_META_VAL_FRACTION = float(meta_val_fraction)
         config.META_LEARNER_FEATURE_DATA = (
             Path(meta_feature_data) if meta_feature_data not in (None, "") else None
@@ -194,6 +212,8 @@ def run(
             raise ValueError("meta_min_prediction must be finite and non-negative.")
         if not np.isfinite(meta_tp_offset) or meta_tp_offset < 0.0:
             raise ValueError("meta_tp_offset must be finite and non-negative.")
+        if not np.isfinite(meta_stop_loss) or meta_stop_loss < 0.0:
+            raise ValueError("meta_stop_loss must be finite and non-negative.")
         if not 0.0 < meta_val_fraction < 0.5:
             raise ValueError("meta_val_fraction must be in (0, 0.5).")
         if label_direction != "long":
@@ -320,6 +340,13 @@ def run(
         )
     logger.info("Loading crypto data from %s", data_path)
     raw_df = load_ohlcv(data_path)
+    label_input_df = raw_df
+    if label_mode == "mfe_entry_m2":
+        logger.info("Loading 1m entry/label data from %s", mfe_entry_data)
+        minute_entry_df = load_ohlcv(mfe_entry_data)
+        label_input_df = attach_mfe_entry_m2_inputs(
+            raw_df, minute_entry_df, horizons
+        )
     meta_base = None
     if config.is_meta_learner_label_mode(label_mode):
         meta_base = load_meta_base(
@@ -328,7 +355,7 @@ def run(
             horizons,
         )
         labeled_df = add_binary_labels(
-            raw_df,
+            label_input_df,
             horizons=horizons,
             label_mode="quantile_trade",
             label_direction="long",
@@ -336,13 +363,32 @@ def run(
     else:
         label_return_fn = config.get_label_return_fn(label_mode)
         labeled_df = add_binary_labels(
-            raw_df,
+            label_input_df,
             horizons=horizons,
             threshold=label_threshold,
             return_fn=label_return_fn,
             label_mode=label_mode,
             label_direction=label_direction,
             exit_after_k=exit_after_k,
+        )
+    if sample_filter == "slope_accumulation":
+        sample_mask = slope_accumulation_mask(
+            raw_df["close"],
+            window=config.SAMPLE_FILTER_SLOPE_WINDOW,
+            previous_windows=config.SAMPLE_FILTER_SLOPE_PREVIOUS_WINDOWS,
+            ratio=config.SAMPLE_FILTER_SLOPE_RATIO,
+        ).reindex(labeled_df.index, fill_value=False)
+        before_filter = len(labeled_df)
+        labeled_df = labeled_df.loc[sample_mask].copy()
+        logger.info(
+            "Sample filter slope_accumulation: window=%d | previous=%d | "
+            "ratio=%.4f | kept=%d/%d (%.2f%%)",
+            config.SAMPLE_FILTER_SLOPE_WINDOW,
+            config.SAMPLE_FILTER_SLOPE_PREVIOUS_WINDOWS,
+            config.SAMPLE_FILTER_SLOPE_RATIO,
+            len(labeled_df),
+            before_filter,
+            100.0 * len(labeled_df) / max(before_filter, 1),
         )
     train_df, val_df, test_df = split_labeled_by_dates(
         labeled_df,
@@ -410,6 +456,7 @@ def run(
             meta_feature_raw_df.index,
             include_h1=config.META_LEARNER_FEATURE_INCLUDE_H1,
             lookahead_bars=config.META_LEARNER_FEATURE_LOOKAHEAD_BARS,
+            horizon=meta_base.horizon,
         )
         config.META_LEARNER_TARGET_INTERVAL_SECONDS = (
             alignment.target_interval.total_seconds()
@@ -531,6 +578,7 @@ def run(
             target_mode=label_mode,
             label_threshold=float(label_threshold),
             tp_offset=config.META_LEARNER_TP_OFFSET,
+            stop_loss=config.META_STRATEGY_STOP_LOSS,
             meta_val_fraction=config.META_LEARNER_META_VAL_FRACTION,
             target_start_step=config.META_LEARNER_TARGET_START_STEP,
             path_mfe_column=meta_path_mfe_column,
@@ -849,6 +897,13 @@ def _save_archive(
         "exit_after_k": exit_after_k,
         "direction_neutral": config.is_direction_neutral_label_mode(label_mode),
         "label_threshold": label_threshold,
+        "sample_filter": config.SAMPLE_FILTER,
+        "sample_filter_slope_window": config.SAMPLE_FILTER_SLOPE_WINDOW,
+        "sample_filter_slope_previous_windows": (
+            config.SAMPLE_FILTER_SLOPE_PREVIOUS_WINDOWS
+        ),
+        "sample_filter_slope_ratio": config.SAMPLE_FILTER_SLOPE_RATIO,
+        "sample_filter_slope_rule": config.SAMPLE_FILTER_SLOPE_RULE,
         "payoff_tp": config.PAYOFF_TP,
         "payoff_adverse_floor": config.PAYOFF_ADVERSE_FLOOR,
         "tp_safe_path": config.TP_SAFE_PATH,
@@ -875,6 +930,14 @@ def _save_archive(
         "bull_min_rise": config.BULL_MIN_RISE,
         "bull_min_bars": config.BULL_MIN_BARS,
         "bull_label_rule": config.BULL_LABEL_RULE,
+        "mfe_entry_m2_data": (
+            _path_text(config.MFE_ENTRY_M2_DATA_PATH)
+            if label_mode == "mfe_entry_m2"
+            else None
+        ),
+        "mfe_entry_m2_rule": (
+            config.MFE_ENTRY_M2_RULE if label_mode == "mfe_entry_m2" else None
+        ),
         "fitness_horizon_mode": (
             "mean"
             if label_mode == "quantile_trade"
@@ -947,6 +1010,7 @@ def _save_archive(
                     config.META_LEARNER_MIN_PREDICTION
                 ),
                 "meta_tp_offset": float(config.META_LEARNER_TP_OFFSET),
+                "meta_stop_loss": float(config.META_STRATEGY_STOP_LOSS),
                 "meta_val_fraction": float(
                     config.META_LEARNER_META_VAL_FRACTION
                 ),
@@ -1039,6 +1103,7 @@ def _validate_resume_metadata(
             [int(h) for h in metadata.get("horizons", [])],
             [int(h) for h in horizons],
         ),
+        ("sample_filter", metadata.get("sample_filter", "none"), config.SAMPLE_FILTER),
         (
             "label_mode",
             archive_label_mode,
@@ -1087,6 +1152,31 @@ def _validate_resume_metadata(
                 metadata.get("trade_top_fraction"),
                 float(config.TRADE_TOP_FRACTION),
             )
+        )
+    if config.SAMPLE_FILTER == "slope_accumulation":
+        checks.extend(
+            [
+                (
+                    "sample_filter_slope_window",
+                    metadata.get("sample_filter_slope_window"),
+                    int(config.SAMPLE_FILTER_SLOPE_WINDOW),
+                ),
+                (
+                    "sample_filter_slope_previous_windows",
+                    metadata.get("sample_filter_slope_previous_windows"),
+                    int(config.SAMPLE_FILTER_SLOPE_PREVIOUS_WINDOWS),
+                ),
+                (
+                    "sample_filter_slope_ratio",
+                    metadata.get("sample_filter_slope_ratio"),
+                    float(config.SAMPLE_FILTER_SLOPE_RATIO),
+                ),
+                (
+                    "sample_filter_slope_rule",
+                    metadata.get("sample_filter_slope_rule"),
+                    config.SAMPLE_FILTER_SLOPE_RULE,
+                ),
+            ]
         )
     if label_mode != "quantile_trade":
         checks.append(
@@ -1280,6 +1370,21 @@ def _validate_resume_metadata(
                 ),
             ]
         )
+    if label_mode == "mfe_entry_m2" and archive_label_mode == "mfe_entry_m2":
+        checks.extend(
+            [
+                (
+                    "mfe_entry_m2_rule",
+                    metadata.get("mfe_entry_m2_rule"),
+                    config.MFE_ENTRY_M2_RULE,
+                ),
+                (
+                    "mfe_entry_m2_data",
+                    metadata.get("mfe_entry_m2_data"),
+                    _path_text(config.MFE_ENTRY_M2_DATA_PATH),
+                ),
+            ]
+        )
     if label_mode == "quantile_exit" and archive_label_mode == "quantile_exit":
         archive_rule = metadata.get("quantile_exit_rule")
         if archive_rule != config.QUANTILE_EXIT_RULE:
@@ -1382,6 +1487,11 @@ def _validate_resume_metadata(
                     "meta_tp_offset",
                     metadata.get("meta_tp_offset", 0.0),
                     float(config.META_LEARNER_TP_OFFSET),
+                ),
+                (
+                    "meta_stop_loss",
+                    metadata.get("meta_stop_loss", 0.0),
+                    float(config.META_STRATEGY_STOP_LOSS),
                 ),
                 (
                     "meta_val_fraction",
@@ -1593,6 +1703,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--mfe-entry-data",
+        default=str(config.MFE_ENTRY_M2_DATA_PATH),
+        help=(
+            "1m OHLCV used only to construct mfe_entry_m2 entry prices and "
+            "future labels. It is never added to the model feature matrix."
+        ),
+    )
+    parser.add_argument(
         "--quantile",
         type=float,
         default=config.QUANTILE_ALPHA,
@@ -1636,8 +1754,9 @@ def main() -> None:
             else None
         ),
         help=(
-            "Optional lower-timeframe OHLCV used only by the evolved meta "
-            "model. Base prediction and labels continue to use --data."
+            "Optional auxiliary-timeframe OHLCV used only by the evolved meta "
+            "model. Slower candles must be completed and require zero lookahead. "
+            "Base prediction and labels continue to use --data."
         ),
     )
     parser.add_argument(
@@ -1678,6 +1797,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--meta-stop-loss",
+        type=float,
+        default=config.META_STRATEGY_STOP_LOSS,
+        help=(
+            "Fixed Long stop loss used by meta_strategy_profit. Any SL touch "
+            "overrides TP and produces label 0. Use 0 to disable it. Default: "
+            f"{config.META_STRATEGY_STOP_LOSS}."
+        ),
+    )
+    parser.add_argument(
         "--meta-val-fraction",
         type=float,
         default=config.META_LEARNER_META_VAL_FRACTION,
@@ -1705,6 +1834,27 @@ def main() -> None:
             "Ignored by quantile_trade and quantile_exit. "
             f"Default: config.TRADE_TOP_FRACTION={config.TRADE_TOP_FRACTION}."
         ),
+    )
+    parser.add_argument(
+        "--sample-filter",
+        choices=("none", "slope_accumulation"),
+        default=config.SAMPLE_FILTER,
+        help="Optional causal row filter applied within the existing splits.",
+    )
+    parser.add_argument(
+        "--slope-filter-window",
+        type=int,
+        default=config.SAMPLE_FILTER_SLOPE_WINDOW,
+    )
+    parser.add_argument(
+        "--slope-filter-previous-windows",
+        type=int,
+        default=config.SAMPLE_FILTER_SLOPE_PREVIOUS_WINDOWS,
+    )
+    parser.add_argument(
+        "--slope-filter-ratio",
+        type=float,
+        default=config.SAMPLE_FILTER_SLOPE_RATIO,
     )
     parser.add_argument("--val-start", default=config.VAL_START)
     parser.add_argument("--test-start", default=config.TEST_START)
@@ -1740,6 +1890,7 @@ def main() -> None:
         quantile_target=args.quantile_target,
         quantile=args.quantile,
         quantile_exit_min_return=args.quantile_exit_min_return,
+        mfe_entry_data=args.mfe_entry_data,
         meta_base_archive=args.meta_base_archive,
         meta_base_rank=args.meta_base_rank,
         meta_feature_data=args.meta_feature_data,
@@ -1747,6 +1898,7 @@ def main() -> None:
         meta_feature_include_h1=args.meta_feature_include_h1,
         meta_min_prediction=args.meta_min_prediction,
         meta_tp_offset=args.meta_tp_offset,
+        meta_stop_loss=args.meta_stop_loss,
         meta_val_fraction=args.meta_val_fraction,
         exit_after_k=args.exit_after_k,
         trade_top_fraction=args.trade_top_fraction,
@@ -1758,6 +1910,10 @@ def main() -> None:
         wf_val_months=args.wf_val_months,
         wf_step_months=args.wf_step_months,
         checkpoint_every=args.checkpoint_every,
+        sample_filter=args.sample_filter,
+        slope_filter_window=args.slope_filter_window,
+        slope_filter_previous_windows=args.slope_filter_previous_windows,
+        slope_filter_ratio=args.slope_filter_ratio,
     )
 
 
