@@ -168,6 +168,9 @@ def add_binary_labels(
     slope is negative after config.MA_SLOPE_FUTURE_SHIFT candles; Short uses
     the sign-symmetric reversal. This target is horizon-neutral and
     future_return_h is zero for precision-only fitness.
+    For monotonic_close_path, Long requires the strict chain
+    open(H1) < close(H1) < ... < close(Horizon); Short uses the symmetric
+    decreasing chain. Its future_return_h is zero for precision-only fitness.
     For two_sided_tp, label=1 means both the Long and Short TP are reached;
     future_return_h is the combined gross payoff of the two positions. Label
     direction is ignored for this direction-neutral mode.
@@ -179,6 +182,9 @@ def add_binary_labels(
     For bull, label=1 symmetrically marks candles strictly inside an offline
     confirmed close-ZigZag trough-to-peak body. Its future_return_h is also
     zero and its direction/horizon arguments do not alter the target.
+    For peak, label=1 marks the confirmed valid Bear-definition peak zone
+    t-1..t+1. For trough, label=1 marks the symmetric Bull-definition trough
+    zone. Both are precision-only, horizon-neutral, and direction-neutral.
     For quantile_trade, no binary label is created. Each horizon receives
     upward-MFE and downward-MFE columns. Its dedicated evaluator selects the
     configured target: MFE is the maximum upward high excursion, MAE is the
@@ -196,11 +202,15 @@ def add_binary_labels(
     label_return_fn = return_fn or config.get_label_return_fn(selected_mode)
     label_threshold = config.default_label_threshold(selected_mode, threshold)
     decision_k = config.resolve_exit_after_k(label_mode, exit_after_k)
-    body_labels = None
+    zigzag_labels = None
     if selected_mode == "bear":
-        body_labels = config.bear_body_labels(labeled)
+        zigzag_labels = config.bear_body_labels(labeled)
     elif selected_mode == "bull":
-        body_labels = config.bull_body_labels(labeled)
+        zigzag_labels = config.bull_body_labels(labeled)
+    elif selected_mode == "peak":
+        zigzag_labels = config.peak_zone_labels(labeled)
+    elif selected_mode == "trough":
+        zigzag_labels = config.trough_zone_labels(labeled)
     if decision_k is not None:
         invalid_horizons = [int(h) for h in horizons if int(h) <= decision_k]
         if invalid_horizons:
@@ -214,9 +224,9 @@ def add_binary_labels(
             _add_quantile_trade_horizon_targets(labeled, h)
             continue
 
-        if selected_mode in {"bear", "bull"}:
-            assert body_labels is not None
-            explicit_label = body_labels
+        if selected_mode in {"bear", "bull", "peak", "trough"}:
+            assert zigzag_labels is not None
+            explicit_label = zigzag_labels
             complete = explicit_label.notna()
             labeled[f"future_return_h{h}"] = pd.Series(
                 0.0,
@@ -300,6 +310,7 @@ def add_binary_labels(
             "slope_slowdown",
             "slope_slowdown_all",
             "ma_slope_reversal",
+            "monotonic_close_path",
         }:
             if (
                 selected_mode in {"slope_slowdown", "slope_slowdown_all"}
@@ -310,7 +321,7 @@ def add_binary_labels(
                     "for example 0.0003 means 0.03% slope change per candle."
                 )
             complete = future_return.notna()
-            if selected_mode == "ma_slope_reversal":
+            if selected_mode in {"ma_slope_reversal", "monotonic_close_path"}:
                 explicit_label = future_return.astype("float64").where(complete)
             else:
                 explicit_label = (

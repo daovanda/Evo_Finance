@@ -97,8 +97,16 @@ from crypto.meta_targets import (
     load_meta_base,
     required_feature_windows,
 )
+from crypto.meta_regime_exit import (
+    build_meta_regime_exit_data,
+    load_meta_regime_base,
+    required_regime_windows,
+)
+from crypto.meta_regime_entry import build_meta_regime_entry_data
 from crypto.quantile_fitness import QuantileFitnessEvaluator
 from crypto.quantile_exit_fitness import QuantileExitFitnessEvaluator
+from crypto.regime_exit_fitness import RegimeExitFitnessEvaluator
+from crypto.regime_entry_fitness import RegimeEntryFitnessEvaluator
 from crypto.sample_filters import canonical_sample_filter, slope_accumulation_mask
 
 
@@ -133,6 +141,14 @@ def run(
     meta_feature_data: str | Path | None = config.META_LEARNER_FEATURE_DATA,
     meta_feature_lookahead_bars: int = config.META_LEARNER_FEATURE_LOOKAHEAD_BARS,
     meta_feature_include_h1: bool = config.META_LEARNER_FEATURE_INCLUDE_H1,
+    meta_bull_archive: str | Path = config.META_REGIME_EXIT_BULL_ARCHIVE,
+    meta_bear_archive: str | Path = config.META_REGIME_EXIT_BEAR_ARCHIVE,
+    meta_bull_rank: int = config.META_REGIME_EXIT_BULL_RANK,
+    meta_bear_rank: int = config.META_REGIME_EXIT_BEAR_RANK,
+    meta_regime_base_top_fraction: float | None = (
+        config.META_REGIME_EXIT_BASE_TOP_FRACTION
+    ),
+    meta_regime_entry_stop_loss: float = config.META_REGIME_ENTRY_STOP_LOSS,
     exit_after_k: int | None = None,
     trade_top_fraction: float | None = None,
     val_start: str = config.VAL_START,
@@ -245,6 +261,94 @@ def run(
             raise ValueError(
                 "--meta-feature-include-h1 requires every horizon to be at least 2."
             )
+    elif config.is_meta_regime_exit_label_mode(label_mode):
+        config.META_REGIME_EXIT_BULL_ARCHIVE = Path(meta_bull_archive)
+        config.META_REGIME_EXIT_BEAR_ARCHIVE = Path(meta_bear_archive)
+        config.META_REGIME_EXIT_BULL_RANK = int(meta_bull_rank)
+        config.META_REGIME_EXIT_BEAR_RANK = int(meta_bear_rank)
+        config.META_REGIME_EXIT_BASE_TOP_FRACTION = (
+            None
+            if meta_regime_base_top_fraction is None
+            else float(meta_regime_base_top_fraction)
+        )
+        config.META_LEARNER_META_VAL_FRACTION = float(meta_val_fraction)
+        config.META_LEARNER_FEATURE_DATA = (
+            Path(meta_feature_data) if meta_feature_data not in (None, "") else None
+        )
+        config.META_LEARNER_FEATURE_LOOKAHEAD_BARS = int(
+            meta_feature_lookahead_bars
+        )
+        config.META_LEARNER_FEATURE_INCLUDE_H1 = bool(meta_feature_include_h1)
+        config.META_LEARNER_FEATURE_ALIGNMENT_RULE = (
+            "target_open_plus_lower_timeframe_lookahead_v1"
+        )
+        config.META_LEARNER_TARGET_INTERVAL_SECONDS = None
+        config.META_LEARNER_FEATURE_INTERVAL_SECONDS = None
+        if [int(value) for value in horizons] != [1]:
+            raise ValueError("meta_regime_exit requires --horizons 1.")
+        if config.META_LEARNER_FEATURE_DATA is None:
+            raise ValueError("meta_regime_exit requires --meta-feature-data.")
+        if config.META_LEARNER_FEATURE_INCLUDE_H1:
+            raise ValueError(
+                "meta_regime_exit uses --meta-feature-lookahead-bars; "
+                "--meta-feature-include-h1 is not supported."
+            )
+        if config.META_LEARNER_FEATURE_LOOKAHEAD_BARS < 1:
+            raise ValueError(
+                "meta_regime_exit requires --meta-feature-lookahead-bars >= 1."
+            )
+        if int(meta_bull_rank) < 1 or int(meta_bear_rank) < 1:
+            raise ValueError("meta Bull/Bear ranks must be positive.")
+        if not 0.0 < float(meta_val_fraction) < 0.5:
+            raise ValueError("meta_val_fraction must be in (0, 0.5).")
+        if meta_regime_base_top_fraction is not None and (
+            not np.isfinite(float(meta_regime_base_top_fraction))
+            or not 0.0 < float(meta_regime_base_top_fraction) <= 1.0
+        ):
+            raise ValueError("meta regime base top fraction must be in (0, 1].")
+        if sample_filter != "none":
+            raise ValueError(
+                "meta_regime_exit requires --sample-filter none so contiguous "
+                "Bull/Bear signal episodes are preserved."
+            )
+    elif config.is_meta_regime_entry_label_mode(label_mode):
+        config.META_REGIME_EXIT_BULL_ARCHIVE = Path(meta_bull_archive)
+        config.META_REGIME_EXIT_BEAR_ARCHIVE = Path(meta_bear_archive)
+        config.META_REGIME_EXIT_BULL_RANK = int(meta_bull_rank)
+        config.META_REGIME_EXIT_BEAR_RANK = int(meta_bear_rank)
+        config.META_REGIME_EXIT_BASE_TOP_FRACTION = (
+            None
+            if meta_regime_base_top_fraction is None
+            else float(meta_regime_base_top_fraction)
+        )
+        config.META_REGIME_ENTRY_STOP_LOSS = float(meta_regime_entry_stop_loss)
+        config.META_LEARNER_META_VAL_FRACTION = float(meta_val_fraction)
+        config.META_LEARNER_FEATURE_DATA = None
+        config.META_LEARNER_FEATURE_LOOKAHEAD_BARS = 0
+        config.META_LEARNER_FEATURE_INCLUDE_H1 = False
+        config.META_LEARNER_TARGET_INTERVAL_SECONDS = None
+        config.META_LEARNER_FEATURE_INTERVAL_SECONDS = None
+        if [int(value) for value in horizons] != [1]:
+            raise ValueError("meta_regime_entry requires --horizons 1.")
+        if int(meta_bull_rank) < 1 or int(meta_bear_rank) < 1:
+            raise ValueError("meta Bull/Bear ranks must be positive.")
+        if not 0.0 < float(meta_val_fraction) < 0.5:
+            raise ValueError("meta_val_fraction must be in (0, 0.5).")
+        if meta_regime_base_top_fraction is not None and (
+            not np.isfinite(float(meta_regime_base_top_fraction))
+            or not 0.0 < float(meta_regime_base_top_fraction) <= 1.0
+        ):
+            raise ValueError("meta regime base top fraction must be in (0, 1].")
+        if (
+            not np.isfinite(float(meta_regime_entry_stop_loss))
+            or not 0.0 <= float(meta_regime_entry_stop_loss) < 1.0
+        ):
+            raise ValueError("meta regime entry stop loss must be in [0, 1).")
+        if sample_filter != "none":
+            raise ValueError(
+                "meta_regime_entry requires --sample-filter none so contiguous "
+                "Bull/Bear signal episodes are preserved."
+            )
     exit_after_k = config.resolve_exit_after_k(label_mode, exit_after_k)
     if exit_after_k is not None:
         config.EXIT_AFTER_K = int(exit_after_k)
@@ -252,9 +356,11 @@ def run(
         label_mode
         in {
             "ma_slope_reversal",
+            "monotonic_close_path",
             "quantile_trade",
             "quantile_exit",
             "meta_learner",
+            "meta_regime_entry",
         }
         and label_threshold is not None
     ):
@@ -267,6 +373,13 @@ def run(
         label_threshold = config.default_label_threshold(label_mode, label_threshold)
     if not np.isfinite(float(label_threshold)):
         raise ValueError("label_threshold must be finite.")
+    if config.is_meta_regime_exit_label_mode(label_mode):
+        if float(label_threshold) <= 0.0:
+            raise ValueError(
+                "meta_regime_exit label_threshold must be positive; "
+                "0.001 means exit label when directional close is below -0.1%."
+            )
+        config.META_REGIME_EXIT_THRESHOLD = float(label_threshold)
     if label_mode == "adverse_floor" and float(label_threshold) <= 0.0:
         raise ValueError(
             "adverse_floor label_threshold must be positive; pass for example "
@@ -310,6 +423,43 @@ def run(
             100.0 * float(quantile_exit_min_return),
             100.0 * float(config.TRADE_COST),
         )
+    elif config.is_meta_regime_entry_label_mode(label_mode):
+        logger.info(
+            "Run meta regime entry: bull=%s r%d | bear=%s r%d | "
+            "base_top=%s | stop_loss=%.4f%% | meta_val=%.1f%% | "
+            "entry_top=%.2f%%",
+            config.META_REGIME_EXIT_BULL_ARCHIVE,
+            config.META_REGIME_EXIT_BULL_RANK,
+            config.META_REGIME_EXIT_BEAR_ARCHIVE,
+            config.META_REGIME_EXIT_BEAR_RANK,
+            (
+                "archive"
+                if config.META_REGIME_EXIT_BASE_TOP_FRACTION is None
+                else f"{config.META_REGIME_EXIT_BASE_TOP_FRACTION:.2%}"
+            ),
+            100.0 * float(config.META_REGIME_ENTRY_STOP_LOSS),
+            100.0 * float(config.META_LEARNER_META_VAL_FRACTION),
+            100.0 * float(config.TRADE_TOP_FRACTION),
+        )
+    elif config.is_meta_regime_exit_label_mode(label_mode):
+        logger.info(
+            "Run meta regime exit: bull=%s r%d | bear=%s r%d | "
+            "base_top=%s | adverse close threshold=%.4f%% | "
+            "feature_data=%s | lookahead_bars=%d | exit_top=%.2f%%",
+            config.META_REGIME_EXIT_BULL_ARCHIVE,
+            config.META_REGIME_EXIT_BULL_RANK,
+            config.META_REGIME_EXIT_BEAR_ARCHIVE,
+            config.META_REGIME_EXIT_BEAR_RANK,
+            (
+                "archive"
+                if config.META_REGIME_EXIT_BASE_TOP_FRACTION is None
+                else f"{config.META_REGIME_EXIT_BASE_TOP_FRACTION:.2%}"
+            ),
+            100.0 * float(label_threshold),
+            config.META_LEARNER_FEATURE_DATA,
+            config.META_LEARNER_FEATURE_LOOKAHEAD_BARS,
+            100.0 * float(config.TRADE_TOP_FRACTION),
+        )
     elif config.is_meta_learner_label_mode(label_mode):
         logger.info(
             "Run meta learner: mode=%s | base=%s rank=%d | min TP=%.4f%% | "
@@ -348,7 +498,19 @@ def run(
             raw_df, minute_entry_df, horizons
         )
     meta_base = None
-    if config.is_meta_learner_label_mode(label_mode):
+    regime_base = None
+    if config.is_meta_regime_exit_label_mode(
+        label_mode
+    ) or config.is_meta_regime_entry_label_mode(label_mode):
+        regime_base = load_meta_regime_base(
+            config.META_REGIME_EXIT_BULL_ARCHIVE,
+            config.META_REGIME_EXIT_BEAR_ARCHIVE,
+            bull_rank=config.META_REGIME_EXIT_BULL_RANK,
+            bear_rank=config.META_REGIME_EXIT_BEAR_RANK,
+            top_fraction=config.META_REGIME_EXIT_BASE_TOP_FRACTION,
+        )
+        labeled_df = label_input_df.copy()
+    elif config.is_meta_learner_label_mode(label_mode):
         meta_base = load_meta_base(
             config.META_LEARNER_BASE_ARCHIVE,
             config.META_LEARNER_BASE_RANK,
@@ -433,7 +595,61 @@ def run(
     )
     feature_windows = list(config.WINDOWS)
     base_feature_space: CryptoFeatureSpace | None = None
-    if meta_base is not None and config.META_LEARNER_FEATURE_DATA is not None:
+    meta_regime_minute_df: pd.DataFrame | None = None
+    meta_regime_alignment = None
+    if regime_base is not None:
+        base_windows = required_regime_windows(regime_base)
+        logger.info("Building Bull/Bear base feature space | windows=%s", base_windows)
+        base_feature_df = build_feature_frame(
+            raw_df,
+            windows=base_windows,
+            quality_filter=False,
+        )
+        base_feature_space = CryptoFeatureSpace(
+            base_feature_df,
+            selectable_features(base_feature_df),
+        )
+        if config.is_meta_regime_exit_label_mode(label_mode):
+            logger.info(
+                "Loading lower-timeframe regime-exit features from %s",
+                config.META_LEARNER_FEATURE_DATA,
+            )
+            meta_regime_minute_df = load_ohlcv(config.META_LEARNER_FEATURE_DATA)
+            meta_regime_alignment = build_meta_feature_alignment(
+                labeled_df.index,
+                meta_regime_minute_df.index,
+                lookahead_bars=config.META_LEARNER_FEATURE_LOOKAHEAD_BARS,
+                horizon=1,
+            )
+            config.META_LEARNER_TARGET_INTERVAL_SECONDS = (
+                meta_regime_alignment.target_interval.total_seconds()
+            )
+            config.META_LEARNER_FEATURE_INTERVAL_SECONDS = (
+                meta_regime_alignment.feature_interval.total_seconds()
+            )
+            native_quality_index = meta_regime_alignment.source_index_for_targets(
+                feature_quality_index
+            )
+            native_feature_df = build_feature_frame(
+                meta_regime_minute_df,
+                windows=feature_windows,
+                quality_index=native_quality_index,
+                output_index=meta_regime_alignment.source_index,
+            )
+            feature_df = align_meta_feature_frame(
+                native_feature_df,
+                meta_regime_alignment,
+            )
+            del native_feature_df
+            gc.collect()
+        else:
+            logger.info("Building causal target-time features for regime entries.")
+            feature_df = build_feature_frame(
+                raw_df,
+                windows=feature_windows,
+                quality_index=feature_quality_index,
+            )
+    elif meta_base is not None and config.META_LEARNER_FEATURE_DATA is not None:
         base_windows = required_feature_windows(meta_base.individual)
         logger.info("Building 5m base feature space | windows=%s", base_windows)
         base_feature_df = build_feature_frame(
@@ -565,7 +781,73 @@ def run(
     if len(feature_pool) < config.FEATURE_MIN:
         raise ValueError("Feature pool is smaller than FEATURE_MIN.")
 
-    if meta_base is not None:
+    if regime_base is not None and config.is_meta_regime_exit_label_mode(label_mode):
+        assert meta_regime_minute_df is not None
+        assert meta_regime_alignment is not None
+        regime_data = build_meta_regime_exit_data(
+            raw_df=raw_df,
+            minute_df=meta_regime_minute_df,
+            alignment=meta_regime_alignment,
+            original_folds=folds,
+            final_train_df=train_df,
+            final_val_df=val_df,
+            final_test_df=test_df,
+            base_feature_space=base_feature_space,
+            base=regime_base,
+            exit_threshold=float(label_threshold),
+            meta_val_fraction=config.META_LEARNER_META_VAL_FRACTION,
+            purge_bars=purge_bars,
+            test_start=test_start,
+        )
+        if base_feature_space is not feature_space:
+            base_feature_space.clear_expression_cache()
+            del base_feature_space, base_feature_df
+        del meta_regime_minute_df
+        gc.collect()
+        folds = regime_data.folds
+        train_df = regime_data.train_df
+        val_df = regime_data.val_df
+        test_df = regime_data.test_df
+        feature_quality_index = folds[0].train_df.index
+        logger.info(
+            "Meta regime final split: OOF train=%d | val=%d | test=%d | folds=%d",
+            len(train_df),
+            len(val_df),
+            len(test_df),
+            len(folds),
+        )
+    elif regime_base is not None and config.is_meta_regime_entry_label_mode(label_mode):
+        regime_entry_data = build_meta_regime_entry_data(
+            raw_df=raw_df,
+            original_folds=folds,
+            final_train_df=train_df,
+            final_val_df=val_df,
+            final_test_df=test_df,
+            base_feature_space=base_feature_space,
+            base=regime_base,
+            stop_loss=float(config.META_REGIME_ENTRY_STOP_LOSS),
+            trade_cost=float(config.TRADE_COST),
+            meta_val_fraction=config.META_LEARNER_META_VAL_FRACTION,
+            purge_bars=purge_bars,
+        )
+        if base_feature_space is not feature_space:
+            base_feature_space.clear_expression_cache()
+            del base_feature_space, base_feature_df
+        gc.collect()
+        folds = regime_entry_data.folds
+        train_df = regime_entry_data.train_df
+        val_df = regime_entry_data.val_df
+        test_df = regime_entry_data.test_df
+        feature_quality_index = folds[0].train_df.index
+        logger.info(
+            "Meta regime-entry final split: OOF train=%d | val=%d | test=%d | "
+            "folds=%d",
+            len(train_df),
+            len(val_df),
+            len(test_df),
+            len(folds),
+        )
+    elif meta_base is not None:
         meta_data = build_meta_learner_data(
             base_labeled_df=labeled_df,
             original_folds=folds,
@@ -797,7 +1079,13 @@ def _make_fitness_evaluator(
     quantile: float = config.QUANTILE_ALPHA,
     label_direction: str = config.LABEL_DIRECTION,
     quantile_exit_min_return: float | None = config.QUANTILE_EXIT_MIN_RETURN,
-) -> CryptoFitnessEvaluator | QuantileFitnessEvaluator | QuantileExitFitnessEvaluator:
+) -> (
+    CryptoFitnessEvaluator
+    | QuantileFitnessEvaluator
+    | QuantileExitFitnessEvaluator
+    | RegimeEntryFitnessEvaluator
+    | RegimeExitFitnessEvaluator
+):
     """Select the mode-specific evaluator without changing split construction."""
     selected_mode = config.canonical_label_mode(label_mode)
     if selected_mode == "quantile_trade":
@@ -814,6 +1102,10 @@ def _make_fitness_evaluator(
             min_return=quantile_exit_min_return,
             trade_cost=config.TRADE_COST,
         )
+    if selected_mode == "meta_regime_exit":
+        return RegimeExitFitnessEvaluator()
+    if selected_mode == "meta_regime_entry":
+        return RegimeEntryFitnessEvaluator()
     return CryptoFitnessEvaluator(
         horizons=horizons,
         precision_only=config.is_precision_only_label_mode(selected_mode),
@@ -826,6 +1118,8 @@ def _evaluate_final_archive(
         CryptoFitnessEvaluator
         | QuantileFitnessEvaluator
         | QuantileExitFitnessEvaluator
+        | RegimeEntryFitnessEvaluator
+        | RegimeExitFitnessEvaluator
     ),
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
@@ -922,6 +1216,7 @@ def _save_archive(
         "ma_slope_fast_shift": config.MA_SLOPE_FAST_SHIFT,
         "ma_slope_future_shift": config.MA_SLOPE_FUTURE_SHIFT,
         "ma_slope_reversal_rule": config.MA_SLOPE_REVERSAL_RULE,
+        "monotonic_close_path_rule": config.MONOTONIC_CLOSE_PATH_RULE,
         "bear_zigzag_tolerance": config.BEAR_ZIGZAG_TOLERANCE,
         "bear_min_drop": config.BEAR_MIN_DROP,
         "bear_min_bars": config.BEAR_MIN_BARS,
@@ -930,6 +1225,10 @@ def _save_archive(
         "bull_min_rise": config.BULL_MIN_RISE,
         "bull_min_bars": config.BULL_MIN_BARS,
         "bull_label_rule": config.BULL_LABEL_RULE,
+        "peak_zone_radius": config.PEAK_ZONE_RADIUS,
+        "peak_label_rule": config.PEAK_LABEL_RULE,
+        "trough_zone_radius": config.TROUGH_ZONE_RADIUS,
+        "trough_label_rule": config.TROUGH_LABEL_RULE,
         "mfe_entry_m2_data": (
             _path_text(config.MFE_ENTRY_M2_DATA_PATH)
             if label_mode == "mfe_entry_m2"
@@ -953,12 +1252,20 @@ def _save_archive(
             else (
                 config.QUANTILE_EXIT_FITNESS_WEIGHTS
                 if label_mode == "quantile_exit"
-                else config.FITNESS_WEIGHTS
+                else (
+                    config.META_REGIME_ENTRY_FITNESS_WEIGHTS
+                    if label_mode == "meta_regime_entry"
+                    else config.FITNESS_WEIGHTS
+                )
             )
         ),
         "trade_top_fraction": config.TRADE_TOP_FRACTION,
         "trade_cost": config.TRADE_COST,
-        "return_score_scale": config.RETURN_SCORE_SCALE,
+        "return_score_scale": (
+            config.META_REGIME_ENTRY_RETURN_SCORE_SCALE
+            if label_mode == "meta_regime_entry"
+            else config.RETURN_SCORE_SCALE
+        ),
         "precision_only": config.is_precision_only_label_mode(label_mode),
         "split_policy": {
             "val_start": _timestamp_text(val_start),
@@ -989,6 +1296,90 @@ def _save_archive(
                 "quantile_alpha": float(config.QUANTILE_ALPHA),
                 "quantile_exit_min_return": config.quantile_exit_min_return(),
                 "quantile_exit_candidate_horizons": list(horizons),
+            }
+        )
+    elif config.is_meta_regime_entry_label_mode(label_mode):
+        base = load_meta_regime_base(
+            config.META_REGIME_EXIT_BULL_ARCHIVE,
+            config.META_REGIME_EXIT_BEAR_ARCHIVE,
+            bull_rank=config.META_REGIME_EXIT_BULL_RANK,
+            bear_rank=config.META_REGIME_EXIT_BEAR_RANK,
+            top_fraction=config.META_REGIME_EXIT_BASE_TOP_FRACTION,
+        )
+        metadata.update(
+            {
+                "meta_regime_entry_rule": config.META_REGIME_ENTRY_RULE,
+                "meta_target_mode": label_mode,
+                "meta_bull_archive": str(config.META_REGIME_EXIT_BULL_ARCHIVE),
+                "meta_bull_archive_sha256": base.bull.archive_sha256,
+                "meta_bull_rank": int(base.bull.rank),
+                "meta_bear_archive": str(config.META_REGIME_EXIT_BEAR_ARCHIVE),
+                "meta_bear_archive_sha256": base.bear.archive_sha256,
+                "meta_bear_rank": int(base.bear.rank),
+                "meta_regime_base_top_fraction": float(base.top_fraction),
+                "meta_regime_entry_stop_loss": float(
+                    config.META_REGIME_ENTRY_STOP_LOSS
+                ),
+                "meta_val_fraction": float(config.META_LEARNER_META_VAL_FRACTION),
+                "meta_regime_signal_policy": (
+                    "exclusive_bull_xor_bear_top_fraction"
+                ),
+                "meta_regime_test_cutoff_source": (
+                    "final_val_same_base_model_v1"
+                ),
+                "meta_regime_entry_label_rule": (
+                    "completed_episode_trade_net_return_gt_zero_v1"
+                ),
+                "meta_regime_execution_policy": (
+                    "entry_open_t1_exit_open_t1_after_signal_end_fixed_sl_v1"
+                ),
+                "meta_regime_lock_policy": (
+                    "reject_or_stop_locks_until_signal_episode_end_v1"
+                ),
+                "meta_final_train_source": "original_wf_validation_oof",
+            }
+        )
+    elif config.is_meta_regime_exit_label_mode(label_mode):
+        base = load_meta_regime_base(
+            config.META_REGIME_EXIT_BULL_ARCHIVE,
+            config.META_REGIME_EXIT_BEAR_ARCHIVE,
+            bull_rank=config.META_REGIME_EXIT_BULL_RANK,
+            bear_rank=config.META_REGIME_EXIT_BEAR_RANK,
+            top_fraction=config.META_REGIME_EXIT_BASE_TOP_FRACTION,
+        )
+        metadata.update(
+            {
+                "meta_regime_exit_rule": config.META_REGIME_EXIT_RULE,
+                "meta_target_mode": label_mode,
+                "meta_bull_archive": str(config.META_REGIME_EXIT_BULL_ARCHIVE),
+                "meta_bull_archive_sha256": base.bull.archive_sha256,
+                "meta_bull_rank": int(base.bull.rank),
+                "meta_bear_archive": str(config.META_REGIME_EXIT_BEAR_ARCHIVE),
+                "meta_bear_archive_sha256": base.bear.archive_sha256,
+                "meta_bear_rank": int(base.bear.rank),
+                "meta_regime_base_top_fraction": float(base.top_fraction),
+                "meta_regime_exit_threshold": float(label_threshold),
+                "meta_val_fraction": float(config.META_LEARNER_META_VAL_FRACTION),
+                "meta_feature_data": _path_text(config.META_LEARNER_FEATURE_DATA),
+                "meta_feature_lookahead_bars": int(
+                    config.META_LEARNER_FEATURE_LOOKAHEAD_BARS
+                ),
+                "meta_feature_alignment_rule": (
+                    config.META_LEARNER_FEATURE_ALIGNMENT_RULE
+                ),
+                "meta_target_interval_seconds": (
+                    config.META_LEARNER_TARGET_INTERVAL_SECONDS
+                ),
+                "meta_feature_interval_seconds": (
+                    config.META_LEARNER_FEATURE_INTERVAL_SECONDS
+                ),
+                "meta_regime_signal_policy": "exclusive_bull_xor_bear_top_fraction",
+                "meta_regime_test_cutoff_source": "final_val_same_base_model_v1",
+                "meta_regime_execution_policy": (
+                    "entry_open_t1_exit_open_after_observation_no_reverse_v1"
+                ),
+                "meta_regime_lock_policy": "one_entry_per_contiguous_signal_episode_v1",
+                "meta_final_train_source": "original_wf_validation_oof",
             }
         )
     elif config.is_meta_learner_label_mode(label_mode):
@@ -1294,6 +1685,18 @@ def _validate_resume_metadata(
                 ),
             ]
         )
+    if (
+        label_mode == "monotonic_close_path"
+        and archive_label_mode == "monotonic_close_path"
+    ):
+        archive_rule = metadata.get("monotonic_close_path_rule")
+        if archive_rule != config.MONOTONIC_CLOSE_PATH_RULE:
+            raise ValueError(
+                "Resume archive uses an incompatible monotonic_close_path rule. "
+                f"Archive={resume_path}, archive rule={archive_rule!r}, "
+                f"required rule={config.MONOTONIC_CLOSE_PATH_RULE!r}. "
+                "Start a new archive."
+            )
     if label_mode == "bear" and archive_label_mode == "bear":
         archive_rule = metadata.get("bear_label_rule")
         if archive_rule != config.BEAR_LABEL_RULE:
@@ -1345,6 +1748,70 @@ def _validate_resume_metadata(
                     "bull_min_bars",
                     metadata.get("bull_min_bars"),
                     int(config.BULL_MIN_BARS),
+                ),
+            ]
+        )
+    if label_mode == "peak" and archive_label_mode == "peak":
+        archive_rule = metadata.get("peak_label_rule")
+        if archive_rule != config.PEAK_LABEL_RULE:
+            raise ValueError(
+                "Resume archive uses an incompatible peak labeling rule. "
+                f"Archive={resume_path}, archive rule={archive_rule!r}, "
+                f"required rule={config.PEAK_LABEL_RULE!r}. Start a new archive."
+            )
+        checks.extend(
+            [
+                (
+                    "bear_zigzag_tolerance",
+                    metadata.get("bear_zigzag_tolerance"),
+                    float(config.BEAR_ZIGZAG_TOLERANCE),
+                ),
+                (
+                    "bear_min_drop",
+                    metadata.get("bear_min_drop"),
+                    float(config.BEAR_MIN_DROP),
+                ),
+                (
+                    "bear_min_bars",
+                    metadata.get("bear_min_bars"),
+                    int(config.BEAR_MIN_BARS),
+                ),
+                (
+                    "peak_zone_radius",
+                    metadata.get("peak_zone_radius"),
+                    int(config.PEAK_ZONE_RADIUS),
+                ),
+            ]
+        )
+    if label_mode == "trough" and archive_label_mode == "trough":
+        archive_rule = metadata.get("trough_label_rule")
+        if archive_rule != config.TROUGH_LABEL_RULE:
+            raise ValueError(
+                "Resume archive uses an incompatible trough labeling rule. "
+                f"Archive={resume_path}, archive rule={archive_rule!r}, "
+                f"required rule={config.TROUGH_LABEL_RULE!r}. Start a new archive."
+            )
+        checks.extend(
+            [
+                (
+                    "bull_zigzag_tolerance",
+                    metadata.get("bull_zigzag_tolerance"),
+                    float(config.BULL_ZIGZAG_TOLERANCE),
+                ),
+                (
+                    "bull_min_rise",
+                    metadata.get("bull_min_rise"),
+                    float(config.BULL_MIN_RISE),
+                ),
+                (
+                    "bull_min_bars",
+                    metadata.get("bull_min_bars"),
+                    int(config.BULL_MIN_BARS),
+                ),
+                (
+                    "trough_zone_radius",
+                    metadata.get("trough_zone_radius"),
+                    int(config.TROUGH_ZONE_RADIUS),
                 ),
             ]
         )
@@ -1411,6 +1878,71 @@ def _validate_resume_metadata(
                     metadata.get("quantile_exit_candidate_horizons"),
                     [int(horizon) for horizon in horizons],
                 ),
+            ]
+        )
+    if (
+        config.is_meta_regime_entry_label_mode(label_mode)
+        and archive_label_mode == label_mode
+    ):
+        if metadata.get("meta_regime_entry_rule") != config.META_REGIME_ENTRY_RULE:
+            raise ValueError(
+                "Resume archive uses an incompatible meta_regime_entry rule. "
+                "Start a new archive."
+            )
+        base = load_meta_regime_base(
+            config.META_REGIME_EXIT_BULL_ARCHIVE,
+            config.META_REGIME_EXIT_BEAR_ARCHIVE,
+            bull_rank=config.META_REGIME_EXIT_BULL_RANK,
+            bear_rank=config.META_REGIME_EXIT_BEAR_RANK,
+            top_fraction=config.META_REGIME_EXIT_BASE_TOP_FRACTION,
+        )
+        checks.extend(
+            [
+                ("meta_bull_archive_sha256", metadata.get("meta_bull_archive_sha256"), base.bull.archive_sha256),
+                ("meta_bull_rank", metadata.get("meta_bull_rank"), int(base.bull.rank)),
+                ("meta_bear_archive_sha256", metadata.get("meta_bear_archive_sha256"), base.bear.archive_sha256),
+                ("meta_bear_rank", metadata.get("meta_bear_rank"), int(base.bear.rank)),
+                ("meta_regime_base_top_fraction", metadata.get("meta_regime_base_top_fraction"), float(base.top_fraction)),
+                ("meta_regime_entry_stop_loss", metadata.get("meta_regime_entry_stop_loss"), float(config.META_REGIME_ENTRY_STOP_LOSS)),
+                ("meta_val_fraction", metadata.get("meta_val_fraction"), float(config.META_LEARNER_META_VAL_FRACTION)),
+                ("meta_regime_lock_policy", metadata.get("meta_regime_lock_policy"), "reject_or_stop_locks_until_signal_episode_end_v1"),
+                ("meta_regime_test_cutoff_source", metadata.get("meta_regime_test_cutoff_source"), "final_val_same_base_model_v1"),
+                ("meta_regime_entry_label_rule", metadata.get("meta_regime_entry_label_rule"), "completed_episode_trade_net_return_gt_zero_v1"),
+                ("meta_regime_execution_policy", metadata.get("meta_regime_execution_policy"), "entry_open_t1_exit_open_t1_after_signal_end_fixed_sl_v1"),
+            ]
+        )
+    if (
+        config.is_meta_regime_exit_label_mode(label_mode)
+        and archive_label_mode == label_mode
+    ):
+        if metadata.get("meta_regime_exit_rule") != config.META_REGIME_EXIT_RULE:
+            raise ValueError(
+                "Resume archive uses an incompatible meta_regime_exit rule. "
+                "Start a new archive."
+            )
+        base = load_meta_regime_base(
+            config.META_REGIME_EXIT_BULL_ARCHIVE,
+            config.META_REGIME_EXIT_BEAR_ARCHIVE,
+            bull_rank=config.META_REGIME_EXIT_BULL_RANK,
+            bear_rank=config.META_REGIME_EXIT_BEAR_RANK,
+            top_fraction=config.META_REGIME_EXIT_BASE_TOP_FRACTION,
+        )
+        checks.extend(
+            [
+                ("meta_bull_archive_sha256", metadata.get("meta_bull_archive_sha256"), base.bull.archive_sha256),
+                ("meta_bull_rank", metadata.get("meta_bull_rank"), int(base.bull.rank)),
+                ("meta_bear_archive_sha256", metadata.get("meta_bear_archive_sha256"), base.bear.archive_sha256),
+                ("meta_bear_rank", metadata.get("meta_bear_rank"), int(base.bear.rank)),
+                ("meta_regime_base_top_fraction", metadata.get("meta_regime_base_top_fraction"), float(base.top_fraction)),
+                ("meta_regime_exit_threshold", metadata.get("meta_regime_exit_threshold"), float(label_threshold)),
+                ("meta_val_fraction", metadata.get("meta_val_fraction"), float(config.META_LEARNER_META_VAL_FRACTION)),
+                ("meta_feature_data", metadata.get("meta_feature_data"), _path_text(config.META_LEARNER_FEATURE_DATA)),
+                ("meta_feature_lookahead_bars", metadata.get("meta_feature_lookahead_bars"), int(config.META_LEARNER_FEATURE_LOOKAHEAD_BARS)),
+                ("meta_feature_alignment_rule", metadata.get("meta_feature_alignment_rule"), config.META_LEARNER_FEATURE_ALIGNMENT_RULE),
+                ("meta_target_interval_seconds", metadata.get("meta_target_interval_seconds"), config.META_LEARNER_TARGET_INTERVAL_SECONDS),
+                ("meta_feature_interval_seconds", metadata.get("meta_feature_interval_seconds"), config.META_LEARNER_FEATURE_INTERVAL_SECONDS),
+                ("meta_regime_lock_policy", metadata.get("meta_regime_lock_policy"), "one_entry_per_contiguous_signal_episode_v1"),
+                ("meta_regime_test_cutoff_source", metadata.get("meta_regime_test_cutoff_source"), "final_val_same_base_model_v1"),
             ]
         )
     if (
@@ -1666,9 +2198,11 @@ def main() -> None:
             "two_sided_tp it is the positive absolute TP used on both sides."
             " For meta_close_exit it is the minimum close-H return. For "
             "meta_strategy_profit it is the minimum TP-or-close strategy "
-            "return and defaults to TRADE_COST. It is ignored by bear/bull, "
-            "ma_slope_reversal, quantile_trade, quantile_exit, and the original "
-            "meta_learner."
+            "return and defaults to TRADE_COST. For meta_regime_exit, 0.001 "
+            "labels a directional close below -0.1%% after the intrabar "
+            "observation. It is ignored by bear/bull/peak/trough, "
+            "ma_slope_reversal, monotonic_close_path, quantile_trade, "
+            "quantile_exit, and the original meta_learner."
         ),
     )
     parser.add_argument(
@@ -1685,8 +2219,8 @@ def main() -> None:
         default=config.LABEL_DIRECTION,
         help=(
             "Label direction. Long means price up is favorable; Short means "
-            "price down is favorable. It is ignored by bear, bull, and "
-            "two_sided_tp, and quantile_trade. quantile_trade always defines "
+            "price down is favorable. It is ignored by bear, bull, peak, "
+            "trough, two_sided_tp, and quantile_trade. quantile_trade always defines "
             "MFE as upward excursion and MAE as downward excursion. "
             "quantile_exit uses this direction to score close returns. "
             f"Default: {config.LABEL_DIRECTION}."
@@ -1816,6 +2350,45 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--meta-bull-archive",
+        default=str(config.META_REGIME_EXIT_BULL_ARCHIVE),
+        help="Bull archive used by --label-mode meta_regime_exit.",
+    )
+    parser.add_argument(
+        "--meta-bear-archive",
+        default=str(config.META_REGIME_EXIT_BEAR_ARCHIVE),
+        help="Bear archive used by --label-mode meta_regime_exit.",
+    )
+    parser.add_argument(
+        "--meta-bull-rank",
+        type=int,
+        default=config.META_REGIME_EXIT_BULL_RANK,
+    )
+    parser.add_argument(
+        "--meta-bear-rank",
+        type=int,
+        default=config.META_REGIME_EXIT_BEAR_RANK,
+    )
+    parser.add_argument(
+        "--meta-regime-base-top-fraction",
+        type=float,
+        default=config.META_REGIME_EXIT_BASE_TOP_FRACTION,
+        help=(
+            "Top fraction for each Bull/Bear base signal. Omit to require and "
+            "reuse the common trade_top_fraction stored by both archives."
+        ),
+    )
+    parser.add_argument(
+        "--meta-regime-entry-stop-loss",
+        type=float,
+        default=config.META_REGIME_ENTRY_STOP_LOSS,
+        help=(
+            "Fixed absolute stop distance for meta_regime_entry episode trades. "
+            "A stop or rejected entry locks the episode until its base signal "
+            f"ends. Default: {config.META_REGIME_ENTRY_STOP_LOSS}."
+        ),
+    )
+    parser.add_argument(
         "--exit-after-k",
         type=int,
         default=None,
@@ -1900,6 +2473,12 @@ def main() -> None:
         meta_tp_offset=args.meta_tp_offset,
         meta_stop_loss=args.meta_stop_loss,
         meta_val_fraction=args.meta_val_fraction,
+        meta_bull_archive=args.meta_bull_archive,
+        meta_bear_archive=args.meta_bear_archive,
+        meta_bull_rank=args.meta_bull_rank,
+        meta_bear_rank=args.meta_bear_rank,
+        meta_regime_base_top_fraction=args.meta_regime_base_top_fraction,
+        meta_regime_entry_stop_loss=args.meta_regime_entry_stop_loss,
         exit_after_k=args.exit_after_k,
         trade_top_fraction=args.trade_top_fraction,
         val_start=args.val_start,

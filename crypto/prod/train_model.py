@@ -81,6 +81,7 @@ def train_from_archive(
     logger.info("Loading crypto data from %s", data_path)
     raw_df = load_ohlcv(data_path)
     label_mode = config.canonical_label_mode(label_mode)
+    _apply_archive_target_config(archive_path, label_mode)
     exit_after_k = _resolve_archive_exit_after_k(
         archive_path,
         label_mode,
@@ -558,6 +559,34 @@ def _load_archive_metadata(path: Path) -> dict[str, Any]:
     return dict(metadata) if isinstance(metadata, dict) else {}
 
 
+def _apply_archive_target_config(path: Path, label_mode: str) -> None:
+    """Restore target-defining settings so production labels match the archive."""
+    metadata = _load_archive_metadata(path)
+    archived_mode = config.canonical_label_mode(metadata.get("label_mode"))
+    if archived_mode != config.canonical_label_mode(label_mode):
+        return
+    if archived_mode in {"bull", "trough"}:
+        config.BULL_ZIGZAG_TOLERANCE = float(
+            metadata.get("bull_zigzag_tolerance", config.BULL_ZIGZAG_TOLERANCE)
+        )
+        config.BULL_MIN_RISE = float(metadata.get("bull_min_rise", config.BULL_MIN_RISE))
+        config.BULL_MIN_BARS = int(metadata.get("bull_min_bars", config.BULL_MIN_BARS))
+        if archived_mode == "trough":
+            config.TROUGH_ZONE_RADIUS = int(
+                metadata.get("trough_zone_radius", config.TROUGH_ZONE_RADIUS)
+            )
+    elif archived_mode in {"bear", "peak"}:
+        config.BEAR_ZIGZAG_TOLERANCE = float(
+            metadata.get("bear_zigzag_tolerance", config.BEAR_ZIGZAG_TOLERANCE)
+        )
+        config.BEAR_MIN_DROP = float(metadata.get("bear_min_drop", config.BEAR_MIN_DROP))
+        config.BEAR_MIN_BARS = int(metadata.get("bear_min_bars", config.BEAR_MIN_BARS))
+        if archived_mode == "peak":
+            config.PEAK_ZONE_RADIUS = int(
+                metadata.get("peak_zone_radius", config.PEAK_ZONE_RADIUS)
+            )
+
+
 def _archive_horizons(path: Path) -> list[int]:
     raw_horizons = _load_archive_metadata(path).get("horizons")
     if not isinstance(raw_horizons, list) or not raw_horizons:
@@ -692,6 +721,10 @@ def _config_snapshot(
         "bull_min_rise": float(config.BULL_MIN_RISE),
         "bull_min_bars": int(config.BULL_MIN_BARS),
         "bull_label_rule": config.BULL_LABEL_RULE,
+        "peak_zone_radius": int(config.PEAK_ZONE_RADIUS),
+        "peak_label_rule": config.PEAK_LABEL_RULE,
+        "trough_zone_radius": int(config.TROUGH_ZONE_RADIUS),
+        "trough_label_rule": config.TROUGH_LABEL_RULE,
         "precision_only": config.is_precision_only_label_mode(label_mode),
         "trade_top_fraction": float(
             _validate_trade_top_fraction(trade_top_fraction)

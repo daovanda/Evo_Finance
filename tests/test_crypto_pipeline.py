@@ -2502,6 +2502,126 @@ class CryptoPipelineTests(unittest.TestCase):
         self.assertTrue(config.is_direction_neutral_label_mode("bull"))
         self.assertEqual(config.default_label_threshold("bull"), 0.0)
 
+    def test_peak_zone_labels_mark_plus_minus_one_around_valid_peak(self):
+        idx = pd.date_range("2024-01-01", periods=12, freq="5min")
+        close = [
+            100.0,
+            100.4,
+            100.8,  # valid peak at t=2
+            100.4,
+            100.0,
+            99.6,
+            99.2,
+            98.4,  # valid following trough, five bars later
+            98.8,
+            99.2,
+            99.0,
+            99.1,
+        ]
+        frame = pd.DataFrame(
+            {
+                "open": close,
+                "high": np.asarray(close) + 0.1,
+                "low": np.asarray(close) - 0.1,
+                "close": close,
+                "volume": [10.0] * len(close),
+                "trade_count": [10] * len(close),
+                "taker_buy_base_volume": [5.0] * len(close),
+                "taker_buy_quote_volume": [500.0] * len(close),
+            },
+            index=idx,
+        )
+        with (
+            patch.object(config, "BEAR_ZIGZAG_TOLERANCE", 0.003),
+            patch.object(config, "BEAR_MIN_DROP", 0.004),
+            patch.object(config, "BEAR_MIN_BARS", 5),
+            patch.object(config, "PEAK_ZONE_RADIUS", 1),
+        ):
+            long_labeled = add_binary_labels(
+                frame, horizons=[1, 3], label_mode="peak", label_direction="Long"
+            )
+            short_labeled = add_binary_labels(
+                frame, horizons=[3], label_mode="peak", label_direction="Short"
+            )
+
+        expected = pd.Series(
+            [0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            index=idx,
+            dtype="float64",
+        )
+        pd.testing.assert_series_equal(long_labeled["label_h1"], expected, check_names=False)
+        pd.testing.assert_series_equal(long_labeled["label_h3"], expected, check_names=False)
+        pd.testing.assert_series_equal(short_labeled["label_h3"], expected, check_names=False)
+        self.assertTrue((long_labeled["future_return_h1"] == 0.0).all())
+        self.assertIs(config.get_label_return_fn("peak"), config.peak_future_return)
+        self.assertTrue(config.is_precision_only_label_mode("peak"))
+        self.assertTrue(config.is_direction_neutral_label_mode("peak"))
+        self.assertEqual(config.default_label_threshold("peak"), 0.0)
+        evaluator = _make_fitness_evaluator("peak", [1])
+        self.assertIsInstance(evaluator, CryptoFitnessEvaluator)
+        self.assertTrue(evaluator.precision_only)
+
+    def test_trough_zone_labels_mark_plus_minus_one_around_valid_trough(self):
+        idx = pd.date_range("2024-01-01", periods=12, freq="5min")
+        close = [
+            100.0,
+            99.6,
+            99.2,  # valid trough at t=2
+            99.6,
+            100.0,
+            100.4,
+            100.8,
+            101.2,  # valid following peak, five bars later
+            100.8,
+            100.4,
+            100.6,
+            100.5,
+        ]
+        frame = pd.DataFrame(
+            {
+                "open": close,
+                "high": np.asarray(close) + 0.1,
+                "low": np.asarray(close) - 0.1,
+                "close": close,
+                "volume": [10.0] * len(close),
+                "trade_count": [10] * len(close),
+                "taker_buy_base_volume": [5.0] * len(close),
+                "taker_buy_quote_volume": [500.0] * len(close),
+            },
+            index=idx,
+        )
+        with (
+            patch.object(config, "BULL_ZIGZAG_TOLERANCE", 0.003),
+            patch.object(config, "BULL_MIN_RISE", 0.004),
+            patch.object(config, "BULL_MIN_BARS", 5),
+            patch.object(config, "TROUGH_ZONE_RADIUS", 1),
+        ):
+            long_labeled = add_binary_labels(
+                frame, horizons=[1, 3], label_mode="trough", label_direction="Long"
+            )
+            short_labeled = add_binary_labels(
+                frame, horizons=[3], label_mode="trough", label_direction="Short"
+            )
+
+        expected = pd.Series(
+            [0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            index=idx,
+            dtype="float64",
+        )
+        pd.testing.assert_series_equal(long_labeled["label_h1"], expected, check_names=False)
+        pd.testing.assert_series_equal(long_labeled["label_h3"], expected, check_names=False)
+        pd.testing.assert_series_equal(short_labeled["label_h3"], expected, check_names=False)
+        self.assertTrue((long_labeled["future_return_h1"] == 0.0).all())
+        self.assertIs(
+            config.get_label_return_fn("trough"), config.trough_future_return
+        )
+        self.assertTrue(config.is_precision_only_label_mode("trough"))
+        self.assertTrue(config.is_direction_neutral_label_mode("trough"))
+        self.assertEqual(config.default_label_threshold("trough"), 0.0)
+        evaluator = _make_fitness_evaluator("trough", [1])
+        self.assertIsInstance(evaluator, CryptoFitnessEvaluator)
+        self.assertTrue(evaluator.precision_only)
+
     def test_slope_slowdown_uses_high_and_aligns_expanded_window_to_t(self):
         idx = pd.date_range("2024-01-01", periods=12, freq="15min")
 
@@ -2765,6 +2885,70 @@ class CryptoPipelineTests(unittest.TestCase):
         self.assertFalse(config.is_direction_neutral_label_mode("ma_slope_reversal"))
         self.assertEqual(config.default_label_threshold("ma_slope_reversal"), 0.0)
         evaluator = _make_fitness_evaluator("ma_slope_reversal", [1])
+        self.assertIsInstance(evaluator, CryptoFitnessEvaluator)
+        self.assertTrue(evaluator.precision_only)
+
+    def test_monotonic_close_path_is_strict_directional_and_precision_only(self):
+        index = pd.date_range("2024-01-01", periods=7, freq="5min")
+        frame = pd.DataFrame(
+            {
+                "open": [100.0, 100.0, 100.0, 100.0, 104.0, 100.0, 100.0],
+                "high": [105.0] * 7,
+                "low": [95.0] * 7,
+                "close": [100.0, 101.0, 102.0, 103.0, 103.0, 102.0, 101.0],
+                "volume": [10.0] * 7,
+                "trade_count": [10] * 7,
+                "taker_buy_base_volume": [5.0] * 7,
+                "taker_buy_quote_volume": [500.0] * 7,
+            },
+            index=index,
+        )
+
+        long_labeled = add_binary_labels(
+            frame,
+            horizons=[3],
+            label_mode="monotonic_close_path",
+            label_direction="Long",
+        )
+        short_labeled = add_binary_labels(
+            frame,
+            horizons=[3],
+            label_mode="monotonic_close_path",
+            label_direction="Short",
+        )
+
+        expected_long = pd.Series(
+            [1.0, 0.0, 0.0, 0.0, np.nan, np.nan, np.nan], index=index
+        )
+        expected_short = pd.Series(
+            [0.0, 0.0, 0.0, 1.0, np.nan, np.nan, np.nan], index=index
+        )
+        pd.testing.assert_series_equal(
+            long_labeled["label_h3"], expected_long, check_names=False
+        )
+        pd.testing.assert_series_equal(
+            short_labeled["label_h3"], expected_short, check_names=False
+        )
+        self.assertTrue(
+            (long_labeled["future_return_h3"].dropna() == 0.0).all()
+        )
+        self.assertTrue(
+            (short_labeled["future_return_h3"].dropna() == 0.0).all()
+        )
+        self.assertIs(
+            config.get_label_return_fn("monotonic_close_path"),
+            config.monotonic_close_path_future_return,
+        )
+        self.assertTrue(
+            config.is_precision_only_label_mode("monotonic_close_path")
+        )
+        self.assertFalse(
+            config.is_direction_neutral_label_mode("monotonic_close_path")
+        )
+        self.assertEqual(
+            config.default_label_threshold("monotonic_close_path"), 0.0
+        )
+        evaluator = _make_fitness_evaluator("monotonic_close_path", [3])
         self.assertIsInstance(evaluator, CryptoFitnessEvaluator)
         self.assertTrue(evaluator.precision_only)
 
@@ -3258,6 +3442,75 @@ class CryptoPipelineTests(unittest.TestCase):
                 resume_path=Path("bull.json"),
                 horizons=[1],
                 label_mode="bull",
+                label_direction="long",
+                label_threshold=0.0,
+            )
+
+    def test_resume_metadata_checks_peak_and_trough_zone_definitions(self):
+        common = {
+            "horizons": [1],
+            "label_direction": "short",
+            "label_threshold": 0.0,
+            "fitness_horizon_mode": config.FITNESS_HORIZON_MODE,
+            "trade_top_fraction": config.TRADE_TOP_FRACTION,
+            "trade_cost": config.TRADE_COST,
+        }
+        peak_metadata = {
+            **common,
+            "label_mode": "peak",
+            "bear_zigzag_tolerance": config.BEAR_ZIGZAG_TOLERANCE,
+            "bear_min_drop": config.BEAR_MIN_DROP,
+            "bear_min_bars": config.BEAR_MIN_BARS,
+            "peak_zone_radius": config.PEAK_ZONE_RADIUS,
+            "peak_label_rule": config.PEAK_LABEL_RULE,
+        }
+        trough_metadata = {
+            **common,
+            "label_mode": "trough",
+            "bull_zigzag_tolerance": config.BULL_ZIGZAG_TOLERANCE,
+            "bull_min_rise": config.BULL_MIN_RISE,
+            "bull_min_bars": config.BULL_MIN_BARS,
+            "trough_zone_radius": config.TROUGH_ZONE_RADIUS,
+            "trough_label_rule": config.TROUGH_LABEL_RULE,
+        }
+        _validate_resume_metadata(
+            archive=CryptoArchive(metadata=peak_metadata),
+            resume_path=Path("peak.json"),
+            horizons=[1],
+            label_mode="peak",
+            label_direction="long",
+            label_threshold=0.0,
+        )
+        _validate_resume_metadata(
+            archive=CryptoArchive(metadata=trough_metadata),
+            resume_path=Path("trough.json"),
+            horizons=[1],
+            label_mode="trough",
+            label_direction="long",
+            label_threshold=0.0,
+        )
+        with self.assertRaisesRegex(ValueError, "peak_zone_radius"):
+            _validate_resume_metadata(
+                archive=CryptoArchive(
+                    metadata={
+                        **peak_metadata,
+                        "peak_zone_radius": config.PEAK_ZONE_RADIUS + 1,
+                    }
+                ),
+                resume_path=Path("peak.json"),
+                horizons=[1],
+                label_mode="peak",
+                label_direction="long",
+                label_threshold=0.0,
+            )
+        with self.assertRaisesRegex(ValueError, "trough labeling rule"):
+            _validate_resume_metadata(
+                archive=CryptoArchive(
+                    metadata={**trough_metadata, "trough_label_rule": "old"}
+                ),
+                resume_path=Path("trough.json"),
+                horizons=[1],
+                label_mode="trough",
                 label_direction="long",
                 label_threshold=0.0,
             )

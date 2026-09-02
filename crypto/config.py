@@ -39,7 +39,7 @@ SAMPLE_FILTER_SLOPE_RULE: str = "ols_log_close_max_previous_abs_v1"
 PAYOFF_TP: float = 0.002  # legacy payoff archives were evolved with TP=0.40%
 # Effectively disables the newer adverse-path filter for legacy payoff archives.
 PAYOFF_ADVERSE_FLOOR: float = -999.0
-TP_SAFE_PATH: float = 0.001  # TP used by LABEL_MODE="safe_path_mfe"
+TP_SAFE_PATH: float = 0.004  # TP used by LABEL_MODE="safe_path_mfe"
 SAFE_ADVERSE_FLOOR: float = -0.0015  # stop-first low/high floor for safe_path_mfe
 SAFE_PATH_RULE: str = "adverse_stop_first_v1"
 SLOPE_LOOKBACK: int = 2
@@ -54,6 +54,10 @@ MA_SLOPE_FAST_WINDOW: int = 3
 MA_SLOPE_FAST_SHIFT: int = 2
 MA_SLOPE_FUTURE_SHIFT: int = 2
 MA_SLOPE_REVERSAL_RULE: str = "ma3_sign_reversal_future_shift_v2"
+# Strict directional close path from entry open through every future close.
+# Long requires open(H1) < close(H1) < ... < close(Horizon); Short uses the
+# sign-symmetric decreasing chain. This is a classification-only target.
+MONOTONIC_CLOSE_PATH_RULE: str = "strict_directional_close_chain_v1"
 # Offline close-ZigZag target used by LABEL_MODE="bear". A candle is positive
 # only when it lies strictly between a confirmed peak and trough whose decline
 # satisfies both the duration and drop filters. These future-confirmed labels
@@ -67,6 +71,12 @@ BULL_ZIGZAG_TOLERANCE: float = 0.003
 BULL_MIN_RISE: float = 0.004
 BULL_MIN_BARS: int = 5
 BULL_LABEL_RULE: str = "confirmed_close_zigzag_body_v1"
+# Exact confirmed pivot zones. Peak reuses the Bear swing definition and
+# trough reuses the Bull swing definition; each valid pivot labels t-1..t+1.
+PEAK_ZONE_RADIUS: int = 1
+PEAK_LABEL_RULE: str = "confirmed_close_zigzag_peak_zone_v1"
+TROUGH_ZONE_RADIUS: int = 1
+TROUGH_LABEL_RULE: str = "confirmed_close_zigzag_trough_zone_v1"
 
 # Pure quantile-regression target used by LABEL_MODE="quantile_trade".
 # MFE is the maximum upward excursion, MAE the maximum downward excursion, and
@@ -123,6 +133,33 @@ META_LEARNER_TARGET_START_STEP: int = 1
 META_LEARNER_TARGET_INTERVAL_SECONDS: float | None = None
 META_LEARNER_FEATURE_INTERVAL_SECONDS: float | None = None
 
+# OOF Bull/Bear regime-exit meta learner. The two directional archives are
+# retrained inside every original WF train block. Their exclusive signals
+# define persistent position episodes; an early meta exit locks that episode
+# until the corresponding base signal turns off.
+META_REGIME_EXIT_BULL_ARCHIVE: Path = (
+    RESULTS_DIR / "crypto_btc_5m_bull_w60_top40_seed1_8h.json"
+)
+META_REGIME_EXIT_BEAR_ARCHIVE: Path = (
+    RESULTS_DIR / "crypto_btc_5m_bear_w60_top40_seed1_8h.json"
+)
+META_REGIME_EXIT_BULL_RANK: int = 1
+META_REGIME_EXIT_BEAR_RANK: int = 1
+META_REGIME_EXIT_BASE_TOP_FRACTION: float | None = None
+META_REGIME_EXIT_THRESHOLD: float = 0.001
+META_REGIME_EXIT_RULE: str = (
+    "oof_bull_bear_intrabar_directional_close_episode_lock_v1"
+)
+META_REGIME_EXIT_LABEL_MODES: frozenset[str] = frozenset({"meta_regime_exit"})
+# OOF Bull/Bear episode-entry filter. One sample is created only where the
+# executable no-reverse strategy can open a new position. The target is 1 when
+# that complete trade is net-positive after the optional fixed SL and cost.
+META_REGIME_ENTRY_STOP_LOSS: float = 0.0015
+META_REGIME_ENTRY_RULE: str = (
+    "oof_bull_bear_episode_start_net_win_fixed_sl_lock_v1"
+)
+META_REGIME_ENTRY_LABEL_MODES: frozenset[str] = frozenset({"meta_regime_entry"})
+
 
 def canonical_quantile_target(target: str | None = None) -> str:
     selected = str(target or QUANTILE_TARGET).strip().lower()
@@ -141,6 +178,16 @@ def validate_quantile_alpha(alpha: float | None = None) -> float:
 def is_meta_learner_label_mode(mode: str | None = None) -> bool:
     """Return whether a mode uses the OOF dynamic-TP meta pipeline."""
     return canonical_label_mode(mode) in META_LEARNER_LABEL_MODES
+
+
+def is_meta_regime_exit_label_mode(mode: str | None = None) -> bool:
+    """Return whether a mode uses the Bull/Bear episode-exit pipeline."""
+    return canonical_label_mode(mode) in META_REGIME_EXIT_LABEL_MODES
+
+
+def is_meta_regime_entry_label_mode(mode: str | None = None) -> bool:
+    """Return whether a mode filters executable Bull/Bear episode entries."""
+    return canonical_label_mode(mode) in META_REGIME_ENTRY_LABEL_MODES
 
 
 def meta_learner_rule(mode: str | None = None) -> str:
@@ -218,6 +265,35 @@ def close_exit_future_return(
     entry_open = df["open"].shift(-1)
     exit_close = df["close"].shift(-h)
     return directional_price_return(exit_close, entry_open, direction)
+
+
+def monotonic_close_path_future_return(
+    df: Any,
+    horizon: int,
+    direction: str | None = None,
+) -> pd.Series:
+    """Return a strict monotonic-close-path binary target.
+
+    At signal row ``t``, entry is ``open(t+1)``. Long is positive only when
+    every future close is strictly above the preceding price, starting with
+    ``close(t+1) > open(t+1)``. Short applies the symmetric strict decrease.
+    Rows without the complete H1..Horizon path remain NaN.
+    """
+    h = int(horizon)
+    if h < 1:
+        raise ValueError("horizon must be positive for monotonic_close_path.")
+
+    previous = pd.to_numeric(df["open"], errors="coerce").shift(-1)
+    complete = previous.notna()
+    monotonic = pd.Series(True, index=df.index, dtype=bool)
+    is_short = canonical_label_direction(direction) == "short"
+    for step in range(1, h + 1):
+        current = pd.to_numeric(df["close"], errors="coerce").shift(-step)
+        complete &= current.notna()
+        monotonic &= current.lt(previous) if is_short else current.gt(previous)
+        previous = current
+
+    return monotonic.astype("float64").where(complete)
 
 
 def high_exit_future_return(
@@ -926,6 +1002,67 @@ def bull_body_labels(df: Any) -> pd.Series:
     )
 
 
+def _confirmed_zigzag_pivot_zone_labels(
+    df: Any,
+    *,
+    tolerance: float,
+    min_move: float,
+    min_bars: int,
+    pivot_kind: str,
+    zone_radius: int,
+) -> pd.Series:
+    """Label a fixed zone around pivots whose following swing is valid."""
+    if pivot_kind not in {"peak", "trough"}:
+        raise ValueError("pivot_kind must be 'peak' or 'trough'.")
+    if int(zone_radius) < 0:
+        raise ValueError("zone_radius must be non-negative.")
+
+    prices, pivots = _confirmed_close_zigzag_pivots(df, float(tolerance))
+    labels = np.zeros(len(prices), dtype="float64")
+    end_kind = "trough" if pivot_kind == "peak" else "peak"
+    radius = int(zone_radius)
+
+    for start, end in zip(pivots, pivots[1:]):
+        if start[2] != pivot_kind or end[2] != end_kind:
+            continue
+        bars = int(end[0] - start[0])
+        if pivot_kind == "peak":
+            move = float((start[1] - end[1]) / start[1])
+        else:
+            move = float((end[1] - start[1]) / start[1])
+        if bars >= int(min_bars) and move >= float(min_move):
+            left = max(0, int(start[0]) - radius)
+            right = min(len(labels), int(start[0]) + radius + 1)
+            labels[left:right] = 1.0
+
+    labels[~np.isfinite(prices)] = np.nan
+    return pd.Series(labels, index=df.index, dtype="float64")
+
+
+def peak_zone_labels(df: Any) -> pd.Series:
+    """Label t-1..t+1 around valid Bear-definition ZigZag peaks."""
+    return _confirmed_zigzag_pivot_zone_labels(
+        df,
+        tolerance=float(BEAR_ZIGZAG_TOLERANCE),
+        min_move=float(BEAR_MIN_DROP),
+        min_bars=int(BEAR_MIN_BARS),
+        pivot_kind="peak",
+        zone_radius=int(PEAK_ZONE_RADIUS),
+    )
+
+
+def trough_zone_labels(df: Any) -> pd.Series:
+    """Label t-1..t+1 around valid Bull-definition ZigZag troughs."""
+    return _confirmed_zigzag_pivot_zone_labels(
+        df,
+        tolerance=float(BULL_ZIGZAG_TOLERANCE),
+        min_move=float(BULL_MIN_RISE),
+        min_bars=int(BULL_MIN_BARS),
+        pivot_kind="trough",
+        zone_radius=int(TROUGH_ZONE_RADIUS),
+    )
+
+
 def bear_future_return(
     df: Any,
     horizon: int,
@@ -944,6 +1081,26 @@ def bull_future_return(
     """Registry adapter; bull labels are horizon- and direction-neutral."""
     del horizon, direction
     return bull_body_labels(df)
+
+
+def peak_future_return(
+    df: Any,
+    horizon: int,
+    direction: str | None = None,
+) -> pd.Series:
+    """Registry adapter; peak zones are horizon- and direction-neutral."""
+    del horizon, direction
+    return peak_zone_labels(df)
+
+
+def trough_future_return(
+    df: Any,
+    horizon: int,
+    direction: str | None = None,
+) -> pd.Series:
+    """Registry adapter; trough zones are horizon- and direction-neutral."""
+    del horizon, direction
+    return trough_zone_labels(df)
 
 
 def quantile_trade_future_return(
@@ -979,8 +1136,35 @@ def meta_learner_future_return(
     )
 
 
+def meta_regime_exit_future_return(
+    df: Any,
+    horizon: int,
+    direction: str | None = None,
+) -> pd.Series:
+    """Registry adapter for the OOF Bull/Bear regime-exit data path."""
+    del df, horizon, direction
+    raise ValueError(
+        "meta_regime_exit requires OOF Bull/Bear predictions and lower-timeframe "
+        "execution data; construct it through crypto.main."
+    )
+
+
+def meta_regime_entry_future_return(
+    df: Any,
+    horizon: int,
+    direction: str | None = None,
+) -> pd.Series:
+    """Registry adapter for the OOF Bull/Bear episode-entry data path."""
+    del df, horizon, direction
+    raise ValueError(
+        "meta_regime_entry requires OOF Bull/Bear predictions and executable "
+        "episode outcomes; construct it through crypto.main."
+    )
+
+
 LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
     "close_exit": close_exit_future_return,
+    "monotonic_close_path": monotonic_close_path_future_return,
     "high_exit": high_exit_future_return,
     "slope_slowdown": slope_slowdown_future_return,
     "slope_slowdown_all": slope_slowdown_all_future_return,
@@ -996,11 +1180,15 @@ LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
     "exit_after_k": exit_after_k_future_return,
     "bear": bear_future_return,
     "bull": bull_future_return,
+    "peak": peak_future_return,
+    "trough": trough_future_return,
     "quantile_trade": quantile_trade_future_return,
     "quantile_exit": quantile_trade_future_return,
     "meta_learner": meta_learner_future_return,
     "meta_close_exit": meta_learner_future_return,
     "meta_strategy_profit": meta_learner_future_return,
+    "meta_regime_exit": meta_regime_exit_future_return,
+    "meta_regime_entry": meta_regime_entry_future_return,
 }
 
 LABEL_MODE_ALIASES: dict[str, str] = {
@@ -1038,15 +1226,27 @@ PRECISION_ONLY_LABEL_MODES: frozenset[str] = frozenset(
         "adverse_floor",
         "bear",
         "bull",
+        "peak",
+        "trough",
         "high_exit",
         "slope_slowdown",
         "slope_slowdown_all",
         "ma_slope_reversal",
+        "monotonic_close_path",
     }
 )
 
 DIRECTION_NEUTRAL_LABEL_MODES: frozenset[str] = frozenset(
-    {"bear", "bull", "quantile_trade", "two_sided_tp"}
+    {
+        "bear",
+        "bull",
+        "peak",
+        "trough",
+        "meta_regime_entry",
+        "meta_regime_exit",
+        "quantile_trade",
+        "two_sided_tp",
+    }
 )
 
 
@@ -1078,7 +1278,10 @@ def default_label_threshold(
     if selected_mode in {
         "bear",
         "bull",
+        "peak",
+        "trough",
         "ma_slope_reversal",
+        "monotonic_close_path",
         "quantile_trade",
         "quantile_exit",
         "meta_learner",
@@ -1087,6 +1290,10 @@ def default_label_threshold(
         return 0.0
     if selected_mode == "meta_strategy_profit":
         return float(TRADE_COST)
+    if selected_mode == "meta_regime_exit":
+        return float(META_REGIME_EXIT_THRESHOLD)
+    if selected_mode == "meta_regime_entry":
+        return 0.0
     return float(LABEL_THRESHOLD)
 
 
@@ -1108,8 +1315,8 @@ WF_PURGE_BARS: int | None = None  # None => max(HOLDING_HORIZONS) + 1
 # Safe feature construction. All features are time-series/ratio normalized;
 # raw price/volume scale columns are intentionally not selectable.
 # WINDOWS: list[int] = [1,2,3,4,5,7,10,14,20,30,40,50,60,80,120,160,240,320,400,480,600,800,960,1200,1440,]
-WINDOWS: list[int] = [1, 2, 3, 5, 10, 15, 20, 27, 35, 42, 50]
-#WINDOWS: list[int] = [2, 3, 5, 7, 9, 15, 30, 45, 60]
+#WINDOWS: list[int] = [1, 2, 3, 4, 5, 7, 9, 10]
+WINDOWS: list[int] = [2, 3, 5, 7, 9, 15, 20, 25, 30, 37, 45, 60]
 FEATURE_MIN_VALID_RATIO: float = 0.70
 FEATURE_MAX_DOMINANT_VALUE_RATIO: float = 0.985
 FEATURE_CORR_THRESHOLD: float = 0.70
@@ -1154,6 +1361,19 @@ FITNESS_WEIGHTS: dict[str, float] = {
     "auc_std": -0.30,  # old: -0.20
     "overfit_gap": -0.25,  # old: -0.25
     "bad_fold_ratio": -0.30,  # old: -0.30
+}
+
+# meta_regime_entry must improve the actual selected-entry strategy, not merely
+# rank net winners. A 0.10% scale keeps small per-trade improvements visible.
+META_REGIME_ENTRY_RETURN_SCORE_SCALE: float = 0.001
+META_REGIME_ENTRY_FITNESS_WEIGHTS: dict[str, float] = {
+    "auc_edge": 0.15,
+    "precision_excess": 0.25,
+    "trade_return_score": 0.30,
+    "strategy_delta_score": 0.30,
+    "auc_std": -0.20,
+    "overfit_gap": -0.20,
+    "bad_fold_ratio": -0.30,
 }
 
 # quantile_trade is prediction-only. Pinball skill compares the model against
@@ -1338,6 +1558,10 @@ def validate_config() -> None:
         raise ValueError("BULL_MIN_RISE must be finite and in [0, 1).")
     if int(BULL_MIN_BARS) < 1:
         raise ValueError("BULL_MIN_BARS must be at least 1.")
+    if int(PEAK_ZONE_RADIUS) < 0:
+        raise ValueError("PEAK_ZONE_RADIUS must be non-negative.")
+    if int(TROUGH_ZONE_RADIUS) < 0:
+        raise ValueError("TROUGH_ZONE_RADIUS must be non-negative.")
     if int(EXIT_AFTER_K) < 1:
         raise ValueError("EXIT_AFTER_K must be at least 1.")
     if FEATURE_MIN < 1 or FEATURE_MAX < FEATURE_MIN:
@@ -1362,6 +1586,14 @@ def validate_config() -> None:
         raise ValueError("TRADE_COST must be non-negative.")
     if RETURN_SCORE_SCALE <= 0:
         raise ValueError("RETURN_SCORE_SCALE must be positive.")
+    if (
+        not isfinite(float(META_REGIME_ENTRY_STOP_LOSS))
+        or META_REGIME_ENTRY_STOP_LOSS < 0
+        or META_REGIME_ENTRY_STOP_LOSS >= 1
+    ):
+        raise ValueError("META_REGIME_ENTRY_STOP_LOSS must be in [0, 1).")
+    if META_REGIME_ENTRY_RETURN_SCORE_SCALE <= 0:
+        raise ValueError("META_REGIME_ENTRY_RETURN_SCORE_SCALE must be positive.")
     if ARCHIVE_SIZE < 1:
         raise ValueError("ARCHIVE_SIZE must be positive.")
     if CHECKPOINT_EVERY_SECONDS < 0:
