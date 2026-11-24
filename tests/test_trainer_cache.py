@@ -27,6 +27,50 @@ def _sample_df(periods=4, tickers=None):
 
 
 class TrainerCacheTests(unittest.TestCase):
+    def test_feature_cache_uses_lru_eviction_without_changing_results(self):
+        df = _sample_df()
+        trainer = Trainer(feature_cache_max_items=2)
+        first = Individual(genes=[Gene("close_1"), Gene("volume_1")])
+        second = Individual(genes=[Gene("high_1")])
+
+        expected = Trainer(enable_feature_cache=False)._build_feature_matrix(first, df)
+        trainer._build_feature_matrix(first, df)
+        trainer._build_feature_matrix(second, df)
+
+        cached_formulas = [key[1] for key in trainer._feature_cache]
+        self.assertEqual(cached_formulas, ["volume_1", "high_1"])
+        self.assertLessEqual(len(trainer._feature_cache), 2)
+
+        recomputed = trainer._build_feature_matrix(first, df)
+        pd.testing.assert_frame_equal(recomputed, expected)
+        self.assertLessEqual(len(trainer._feature_cache), 2)
+
+    def test_zero_feature_cache_limit_remains_unbounded(self):
+        df = _sample_df()
+        trainer = Trainer(feature_cache_max_items=0)
+        individual = Individual(
+            genes=[Gene("open_1"), Gene("high_1"), Gene("low_1")]
+        )
+
+        trainer._build_feature_matrix(individual, df)
+
+        self.assertEqual(len(trainer._feature_cache), 3)
+
+    def test_split_cache_uses_lru_eviction(self):
+        trainer = Trainer(split_cache_max_items=2)
+        first_key = None
+
+        for offset in range(3):
+            split_df = _sample_df(periods=2).copy()
+            split_df["label"] = split_df["label"] + offset
+            labels = split_df["label"]
+            trainer._labels_and_groups(split_df, labels, labels.notna())
+            if offset == 0:
+                first_key = next(iter(trainer._split_cache))
+
+        self.assertEqual(len(trainer._split_cache), 2)
+        self.assertNotIn(first_key, trainer._split_cache)
+
     def test_sort_index_if_needed_keeps_sorted_frame_identity(self):
         df = _sample_df()
         sorted_df = trainer_module._sort_index_if_needed(df)

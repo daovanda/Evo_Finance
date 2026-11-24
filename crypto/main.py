@@ -86,7 +86,11 @@ from crypto.data import (
 )
 from crypto.evolution import CryptoArchive, CryptoIndividual, CryptoMutator
 from crypto.expression import CryptoFeatureSpace
-from crypto.features import build_feature_frame, selectable_features
+from crypto.features import (
+    build_feature_frame,
+    formula_uses_legacy_quote_proxy,
+    selectable_features,
+)
 from crypto.fitness import CryptoFitnessEvaluator
 from crypto.meta_targets import (
     align_meta_feature_frame,
@@ -126,6 +130,7 @@ def run(
     resume_archive: str | Path | None = None,
     horizons: list[int] | tuple[int, ...] = tuple(config.HOLDING_HORIZONS),
     label_threshold: float | None = None,
+    two_sided_max_excursion: float | None = None,
     label_mode: str = config.LABEL_MODE,
     label_direction: str = config.LABEL_DIRECTION,
     quantile_target: str = config.QUANTILE_TARGET,
@@ -357,6 +362,7 @@ def run(
         in {
             "ma_slope_reversal",
             "monotonic_close_path",
+            "mfe_mae_direction",
             "quantile_trade",
             "quantile_exit",
             "meta_learner",
@@ -373,6 +379,16 @@ def run(
         label_threshold = config.default_label_threshold(label_mode, label_threshold)
     if not np.isfinite(float(label_threshold)):
         raise ValueError("label_threshold must be finite.")
+    if two_sided_max_excursion is not None:
+        if label_mode != "two_sided_tp":
+            raise ValueError("--two-sided-max-excursion requires --label-mode two_sided_tp.")
+        two_sided_max_excursion = float(two_sided_max_excursion)
+        if (
+            not np.isfinite(two_sided_max_excursion)
+            or two_sided_max_excursion <= float(label_threshold)
+        ):
+            raise ValueError("two_sided_max_excursion must exceed the positive label threshold.")
+    config.TWO_SIDED_TP_MAX_EXCURSION = two_sided_max_excursion
     if config.is_meta_regime_exit_label_mode(label_mode):
         if float(label_threshold) <= 0.0:
             raise ValueError(
@@ -532,6 +548,7 @@ def run(
             label_mode=label_mode,
             label_direction=label_direction,
             exit_after_k=exit_after_k,
+            two_sided_max_excursion=two_sided_max_excursion,
         )
     if sample_filter == "slope_accumulation":
         sample_mask = slope_accumulation_mask(
@@ -1185,12 +1202,14 @@ def _save_archive(
 ) -> None:
     metadata = {
         "pipeline": "crypto",
+        "feature_schema_version": config.CRYPTO_FEATURE_SCHEMA_VERSION,
         "horizons": horizons,
         "label_mode": label_mode,
         "label_direction": label_direction,
         "exit_after_k": exit_after_k,
         "direction_neutral": config.is_direction_neutral_label_mode(label_mode),
         "label_threshold": label_threshold,
+        "two_sided_max_excursion": config.TWO_SIDED_TP_MAX_EXCURSION if label_mode == "two_sided_tp" else None,
         "sample_filter": config.SAMPLE_FILTER,
         "sample_filter_slope_window": config.SAMPLE_FILTER_SLOPE_WINDOW,
         "sample_filter_slope_previous_windows": (
@@ -1464,6 +1483,22 @@ def _validate_resume_metadata(
     wf_step_months: int = config.WF_STEP_MONTHS,
 ) -> None:
     metadata = getattr(archive, "metadata", {}) or {}
+    legacy_features = sorted(
+        {
+            formula
+            for individual in archive.entries
+            for formula in individual.features
+            if formula_uses_legacy_quote_proxy(formula)
+        }
+    )
+    if legacy_features:
+        raise ValueError(
+            "Resume archive contains legacy close*volume quote-flow features "
+            "that cannot be mixed with exact Binance quote_volume evolution. "
+            f"Archive={resume_path}, examples={legacy_features[:3]}. "
+            "The archive remains valid for legacy backtests; start a new "
+            "evolution archive for feature schema v2."
+        )
     if not metadata:
         logger.warning(
             "Resume archive %s has no metadata; cannot verify label/fitness compatibility.",
@@ -1471,6 +1506,16 @@ def _validate_resume_metadata(
         )
         return
 
+    archive_schema = metadata.get("feature_schema_version")
+    if archive_schema is not None and int(archive_schema) != int(
+        config.CRYPTO_FEATURE_SCHEMA_VERSION
+    ):
+        raise ValueError(
+            "Resume archive uses an incompatible crypto feature schema. "
+            f"Archive={resume_path}, archive schema={archive_schema}, "
+            f"required schema={config.CRYPTO_FEATURE_SCHEMA_VERSION}. "
+            "Start a new archive."
+        )
     metadata_label_mode = metadata.get("label_mode", "")
     archive_label_mode = (
         config.canonical_label_mode(metadata_label_mode)
@@ -1501,6 +1546,11 @@ def _validate_resume_metadata(
             label_mode,
         ),
         ("label_threshold", metadata.get("label_threshold"), float(label_threshold)),
+        (
+            "two_sided_max_excursion",
+            metadata.get("two_sided_max_excursion"),
+            config.TWO_SIDED_TP_MAX_EXCURSION if label_mode == "two_sided_tp" else None,
+        ),
         (
             "fitness_horizon_mode",
             str(metadata.get("fitness_horizon_mode", "")).strip().lower(),
@@ -2196,6 +2246,7 @@ def main() -> None:
             "this is the minimum high-price OLS slope change per candle; its "
             "mode default is config.SLOPE_SLOWDOWN_THRESHOLD. For "
             "two_sided_tp it is the positive absolute TP used on both sides."
+            " For mfe_or_mae it is the excursion either side must exceed."
             " For meta_close_exit it is the minimum close-H return. For "
             "meta_strategy_profit it is the minimum TP-or-close strategy "
             "return and defaults to TRADE_COST. For meta_regime_exit, 0.001 "
@@ -2204,6 +2255,12 @@ def main() -> None:
             "ma_slope_reversal, monotonic_close_path, quantile_trade, "
             "quantile_exit, and the original meta_learner."
         ),
+    )
+    parser.add_argument(
+        "--two-sided-max-excursion",
+        type=float,
+        default=None,
+        help="Optional two_sided_tp label cap on both future excursions; 0.003 means neither side may exceed 0.3%% from entry.",
     )
     parser.add_argument(
         "--label-mode",
@@ -2220,7 +2277,7 @@ def main() -> None:
         help=(
             "Label direction. Long means price up is favorable; Short means "
             "price down is favorable. It is ignored by bear, bull, peak, "
-            "trough, two_sided_tp, and quantile_trade. quantile_trade always defines "
+            "trough, two_sided_tp, mfe_or_mae, and quantile_trade. quantile_trade always defines "
             "MFE as upward excursion and MAE as downward excursion. "
             "quantile_exit uses this direction to score close returns. "
             f"Default: {config.LABEL_DIRECTION}."
@@ -2458,6 +2515,7 @@ def main() -> None:
         resume_archive=args.resume,
         horizons=args.horizons,
         label_threshold=args.label_threshold,
+        two_sided_max_excursion=args.two_sided_max_excursion,
         label_mode=args.label_mode,
         label_direction=args.label_direction,
         quantile_target=args.quantile_target,

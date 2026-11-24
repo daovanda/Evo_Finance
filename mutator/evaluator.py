@@ -22,6 +22,8 @@ Financial features expressible (examples)
 """
 
 from __future__ import annotations
+from contextlib import contextmanager
+from contextvars import ContextVar
 import re
 import numpy as np
 import pandas as pd
@@ -106,6 +108,10 @@ _CONST_OPS = ("const",)
 _TERMINAL_RE = re.compile(r'^([a-z_]+)_(\d+)$')
 DIV_ZERO_EPS = 1e-12
 
+_SHARED_EVALUATION_CACHE: ContextVar[
+    dict[tuple[int, int, str], pd.Series] | None
+] = ContextVar("shared_evaluation_cache", default=None)
+
 
 def _finite_series(series: pd.Series) -> pd.Series:
     """Return a numeric Series where +/-inf are treated as missing values."""
@@ -116,6 +122,33 @@ def _finite_series(series: pd.Series) -> pd.Series:
 
 def evaluate(formula: str, df: pd.DataFrame) -> pd.Series:
     formula = formula.strip()
+    cache = _SHARED_EVALUATION_CACHE.get()
+    cache_key = (id(df), id(df.index), formula)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+
+    result = _evaluate_uncached(formula, df)
+    if cache is not None:
+        cache[cache_key] = result
+    return result
+
+
+@contextmanager
+def shared_evaluation_cache():
+    """Reuse identical subexpressions within one bounded evaluation batch."""
+    existing = _SHARED_EVALUATION_CACHE.get()
+    if existing is not None:
+        yield
+        return
+
+    token = _SHARED_EVALUATION_CACHE.set({})
+    try:
+        yield
+    finally:
+        _SHARED_EVALUATION_CACHE.reset(token)
+
+
+def _evaluate_uncached(formula: str, df: pd.DataFrame) -> pd.Series:
     if not df.index.is_monotonic_increasing:
         sorted_df = df.sort_index()
         return evaluate(formula, sorted_df).reindex(df.index)

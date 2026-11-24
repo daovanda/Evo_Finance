@@ -22,7 +22,7 @@ from typing import List, Optional, Dict
 
 import lightgbm as lgb
 
-from config.settings import ARCHIVE_SIZE
+from config.settings import ACTIVE_PROFILE, ARCHIVE_SIZE
 from mutator.gene import Individual
 
 logger = logging.getLogger(__name__)
@@ -205,6 +205,7 @@ class Archive:
             rows.append(
                 {
                     "rank":         rank,
+                    "profile":      ACTIVE_PROFILE,
                     "score":        e.score,
                     "n_genes":      len(e.individual),
                     "generation":   e.individual.generation,

@@ -60,6 +60,11 @@ class SettingsValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "WF_PURGE_DAYS must be >= HOLDING_HORIZON"):
                 settings.validate_config()
 
+    def test_wf_train_stride_must_be_positive(self):
+        with patch.object(settings, "WF_TRAIN_BAR_STRIDE", 0):
+            with self.assertRaisesRegex(ValueError, "WF_TRAIN_BAR_STRIDE must be >= 1"):
+                settings.validate_config()
+
     def test_wf_early_stop_fraction_must_be_less_than_half(self):
         with patch.object(settings, "WF_EARLY_STOP_VALID_FRACTION", 0.5):
             with self.assertRaisesRegex(ValueError, "WF_EARLY_STOP_VALID_FRACTION"):

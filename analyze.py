@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -44,16 +45,23 @@ import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
 
+from config.profiles import bootstrap_profile_from_argv
+
+BOOTSTRAPPED_PROFILE = bootstrap_profile_from_argv(sys.argv[1:])
+
 from config.settings import (
+    ACTIVE_PROFILE, DEFAULT_DATA_DIR, TIME_UNIT,
     VAL_START, TEST_START, TEST_END, HIT_RATE_TOP_K,
     WF_END, WF_MIN_TRAIN_MONTHS, WF_VAL_MONTHS,
     WF_STEP_MONTHS, WF_PURGE_DAYS, FITNESS_WEIGHTS,
+    WF_TRAIN_BAR_STRIDE,
     REQUIRE_SECTOR_MAPPING, MIN_SECTOR_MEMBERS_IN_UNIVERSE,
 )
 from data.loader       import load_from_dir
 from model.data_utils  import (
     label_dataframe,
     make_walk_forward_folds,
+    sample_timestamp_groups,
     small_sectors_in_universe,
     split_labeled_by_dates,
     tickers_missing_sector,
@@ -64,7 +72,11 @@ from model.data_utils  import (
 )
 from model.trainer     import Trainer
 from mutator.gene      import Gene, Individual
-from fitness.fitness   import _ic_per_date, _random_hit_baseline_for_predictions
+from fitness.fitness   import (
+    _hit_rate_per_date,
+    _ic_per_date,
+    _random_hit_baseline_for_predictions,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,11 +94,33 @@ MARKET_SHOCK_BACKWARD_DAYS = 5
 MARKET_SHOCK_FORWARD_DAYS = 5
 
 
+def _format_profile_timestamp(value) -> str:
+    ts = pd.Timestamp(value)
+    return str(ts) if TIME_UNIT == "bar" else str(ts.date())
+
+
 # ─── Load archive JSON ────────────────────────────────────────────────────────
 
 def load_archive_json(path: Path) -> list[dict]:
     with open(path) as f:
         entries = json.load(f)
+    if not isinstance(entries, list):
+        raise ValueError(f"Archive must be a JSON list: {path}")
+    declared = {
+        str(entry.get("profile")).strip()
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("profile")
+    }
+    if declared and declared != {ACTIVE_PROFILE}:
+        raise ValueError(
+            f"Archive profile mismatch: {path} declares {sorted(declared)}, "
+            f"but active profile is {ACTIVE_PROFILE!r}."
+        )
+    if not declared:
+        logger.warning(
+            "Archive %s has no profile metadata; treating it as a legacy archive.",
+            path,
+        )
     logger.info("Loaded %d individuals từ %s", len(entries), path)
     return entries
 
@@ -193,39 +227,8 @@ def _hitrate_per_date(
     label:  pd.Series,
     top_k:  int = HIT_RATE_TOP_K,
 ) -> pd.Series:
-    """
-    Hit rate per date: |top_k pred ∩ top_k label| / top_k
-    Returns pd.Series index = date.
-    """
-    data = (
-        pd.DataFrame({"pred": pred, "label": label})
-        .replace([np.inf, -np.inf], np.nan)
-        .dropna()
-    )
-
-    if isinstance(data.index, pd.MultiIndex):
-        dates_arr = data.index.get_level_values("date")
-    else:
-        dates_arr = data.index
-
-    hits = {}
-    for date in np.unique(dates_arr):
-        mask = dates_arr == date
-        grp  = data[mask]
-        k = min(int(top_k), len(grp))
-        if k <= 0:
-            continue
-        if (
-            grp["pred"].nunique(dropna=True) < 2
-            or grp["label"].nunique(dropna=True) < 2
-        ):
-            hits[date] = float(k) / float(len(grp))
-            continue
-        top_pred  = set(grp.nlargest(k, "pred").index)
-        top_label = set(grp.nlargest(k, "label").index)
-        hits[date] = len(top_pred & top_label) / k
-
-    return pd.Series(hits).sort_index()
+    """Hit rate per timestamp, shared with evolutionary fitness."""
+    return _hit_rate_per_date(pred, label, top_k=top_k).sort_index()
 
 
 # ─── Compute IC + hit rate series ────────────────────────────────────────────
@@ -312,10 +315,14 @@ def compute_walk_forward_metrics(
     )
 
     for fold in wf_folds:
+        wf_train_df = sample_timestamp_groups(
+            fold.train_df,
+            WF_TRAIN_BAR_STRIDE,
+        )
         try:
             _, train_pred, val_pred, train_labels, val_labels = trainer.train(
                 individual,
-                fold.train_df,
+                wf_train_df,
                 fold.val_df,
                 feature_df=feature_df,
                 mode="wf",
@@ -331,7 +338,7 @@ def compute_walk_forward_metrics(
             return pd.DataFrame(), empty, empty, all_wf_dates
 
         train_ic_series = _ic_per_date(
-            train_pred, train_labels, fold.train_df.index
+            train_pred, train_labels, wf_train_df.index
         )
         val_ic_series = _ic_per_date(
             val_pred, val_labels, fold.val_df.index
@@ -986,6 +993,9 @@ def analyze(
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
+    entries = load_archive_json(Path(archive_path))
+    entries = _filter_archive_entries(entries, top=top, ranks=ranks)
+
     # ── Load data ─────────────────────────────────────────────────────────────
     logger.info("Loading data from %s …", data_dir)
     df = load_from_dir(data_dir, tickers=tickers)
@@ -1057,30 +1067,28 @@ def analyze(
             f"{fold.name} val split",
         )
     logger.info(
-        "WF folds=%d | end=%s | min_train=%dm | val=%dm | step=%dm | purge=%dd",
+        "WF folds=%d | end=%s | min_train=%dm | val=%dm | step=%dm | purge=%d %s",
         len(wf_folds),
         wf_end,
         wf_min_train_months,
         wf_val_months,
         wf_step_months,
         wf_purge_days,
+        "bars" if TIME_UNIT == "bar" else "trading days",
     )
     for fold in wf_folds:
         logger.info(
             "WF %s: train [%s -> %s) %d rows | val [%s -> %s) %d rows",
             fold.name,
-            fold.train_start.date(),
-            fold.train_end.date(),
+            _format_profile_timestamp(fold.train_start),
+            _format_profile_timestamp(fold.train_end),
             len(fold.train_df),
-            fold.val_start.date(),
-            fold.val_end.date(),
+            _format_profile_timestamp(fold.val_start),
+            _format_profile_timestamp(fold.val_end),
             len(fold.val_df),
         )
 
     # ── Load archive ──────────────────────────────────────────────────────────
-    entries = load_archive_json(Path(archive_path))
-    entries = _filter_archive_entries(entries, top=top, ranks=ranks)
-
     # ── Process each individual ───────────────────────────────────────────────
     all_ic: dict[int, pd.Series] = {}
     all_hr: dict[int, pd.Series] = {}
@@ -1182,7 +1190,13 @@ if __name__ == "__main__":
         description="Evo_Finance Analyzer - IC + Hit Rate charts",
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    parser.add_argument("--data-dir",   required=True, metavar="DIR")
+    parser.add_argument(
+        "--profile",
+        default=ACTIVE_PROFILE,
+        choices=["vnindex", "sp500_15m"],
+        help=f"Dataset profile. Default: {ACTIVE_PROFILE}",
+    )
+    parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR, metavar="DIR")
     parser.add_argument("--archive",    required=True, metavar="FILE")
     parser.add_argument("--val-start",  default=VAL_START,  metavar="DATE",
                         help=f"default: {VAL_START}")

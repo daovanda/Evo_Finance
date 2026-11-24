@@ -25,6 +25,30 @@ def _write_ohlcv(path: Path, dates, base: float, trading_flags=None) -> None:
 
 
 class LoaderVNIndexTests(unittest.TestCase):
+    def test_load_from_dir_supports_suffix_and_utc_intraday_timestamps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dates = pd.date_range("2024-01-02 14:30", periods=12, freq="15min", tz="UTC")
+            _write_ohlcv(root / "AAA_15Min.csv", dates, 10.0)
+            _write_ohlcv(root / "BBB_15Min.csv", dates, 20.0)
+            _write_ohlcv(root / "SPY_15Min.csv", dates, 100.0)
+
+            loaded = load_from_dir(
+                root,
+                min_rows=1,
+                market_index_ticker="SPY",
+                file_suffix="_15Min",
+            )
+
+            self.assertEqual(
+                loaded.index.get_level_values("ticker").unique().tolist(),
+                ["AAA", "BBB"],
+            )
+            loaded_dates = loaded.index.get_level_values("date")
+            self.assertIsNone(loaded_dates.tz)
+            self.assertEqual(loaded_dates.min(), pd.Timestamp("2024-01-02 14:30"))
+            self.assertIn("market_close", loaded.columns)
+
     def test_load_from_dir_inner_joins_vnindex_as_market_columns(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

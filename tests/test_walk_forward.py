@@ -7,6 +7,7 @@ from config import settings
 from model.data_utils import (
     label_dataframe,
     make_walk_forward_folds,
+    sample_timestamp_groups,
     sector_member_counts,
     small_sectors_in_universe,
     split_labeled_by_dates,
@@ -35,6 +36,24 @@ def _sample_ohlcv(periods=2200, start="2018-06-04"):
 
 
 class WalkForwardSplitTests(unittest.TestCase):
+    def test_timestamp_stride_keeps_complete_cross_sections(self):
+        df = _sample_ohlcv(periods=10, start="2024-01-01")
+
+        sampled = sample_timestamp_groups(df, stride=3)
+
+        expected_dates = pd.date_range("2024-01-01", periods=10, freq="B")[[0, 3, 6, 9]]
+        actual_dates = sampled.index.get_level_values("date").unique()
+        self.assertEqual(actual_dates.tolist(), expected_dates.tolist())
+        self.assertTrue((sampled.groupby(level="date").size() == 2).all())
+
+    def test_timestamp_stride_one_preserves_original_frame(self):
+        df = _sample_ohlcv(periods=5, start="2024-01-01")
+        self.assertIs(sample_timestamp_groups(df, stride=1), df)
+
+    def test_timestamp_stride_rejects_non_positive_value(self):
+        with self.assertRaisesRegex(ValueError, "stride must be >= 1"):
+            sample_timestamp_groups(_sample_ohlcv(periods=5), stride=0)
+
     def test_label_dataframe_sorts_by_date_before_forward_label(self):
         idx = pd.MultiIndex.from_tuples(
             [

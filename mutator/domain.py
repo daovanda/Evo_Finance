@@ -31,7 +31,7 @@ from mutator.gene import (
     FINANCE_WINDOW_OPS, MARKET_WINDOW_OPS, PAIR_TS_OPS,
     SECTOR_CS_OPS, SECTOR_NOARG_OPS, SECTOR_WINDOW_OPS, TS_ROLLING_OPS,
 )
-from mutator.evaluator import evaluate, has_division_by_zero
+from mutator.evaluator import evaluate, has_division_by_zero, shared_evaluation_cache
 from mutator.formula_guard import (
     BLOCKED_EVOLUTION_PRIMITIVES,
     const_threshold_violation,
@@ -113,6 +113,7 @@ class Domain:
         gene: Gene,
         train_df: pd.DataFrame,
         force: bool = False,
+        prevalidated_series: pd.Series | None = None,
     ) -> bool:
         """
         Attempt to add *gene* to the domain.
@@ -159,40 +160,46 @@ class Domain:
             return False
 
         if not force:
-            try:
-                if has_division_by_zero(gene.formula, train_df):
-                    logger.debug(
-                        "Domain.try_add: reject division-by-zero gene %r",
-                        gene.formula,
+            self._ensure_cache_context(train_df)
+            if prevalidated_series is None:
+                try:
+                    if has_division_by_zero(gene.formula, train_df):
+                        logger.debug(
+                            "Domain.try_add: reject division-by-zero gene %r",
+                            gene.formula,
+                        )
+                        return False
+                except Exception as exc:
+                    logger.warning(
+                        "Domain.try_add: division check failed for %r — %s",
+                        gene.formula, exc,
                     )
                     return False
-            except Exception as exc:
-                logger.warning(
-                    "Domain.try_add: division check failed for %r — %s",
-                    gene.formula, exc,
-                )
-                return False
 
-            try:
-                full_series = _evaluate_clean(gene.formula, train_df)
-            except Exception as exc:
-                logger.warning("Domain.try_add: cannot evaluate %r — %s",
-                               gene.formula, exc)
-                return False
+                try:
+                    full_series = _evaluate_clean(gene.formula, train_df)
+                except Exception as exc:
+                    logger.warning("Domain.try_add: cannot evaluate %r — %s",
+                                   gene.formula, exc)
+                    return False
 
-            quality_violation = _feature_quality_violation(
-                gene.formula,
-                full_series,
-                train_df,
-            )
-            if quality_violation is not None:
-                logger.debug(
-                    "Domain.try_add: reject low-quality feature %r - %s",
+                quality_violation = _feature_quality_violation(
                     gene.formula,
-                    quality_violation,
+                    full_series,
+                    train_df,
                 )
-                return False
-            new_series = full_series.dropna()
+                if quality_violation is not None:
+                    logger.debug(
+                        "Domain.try_add: reject low-quality feature %r - %s",
+                        gene.formula,
+                        quality_violation,
+                    )
+                    return False
+                new_series = full_series.dropna()
+            else:
+                # The mutator has just run the identical division, quality and
+                # individual-correlation checks on this exact context.
+                new_series = prevalidated_series
 
             checked = 0
             corr_start = time.perf_counter()
@@ -208,7 +215,8 @@ class Domain:
                 if abs(corr) >= CORR_THRESHOLD:
                     return False
 
-            # passed — cache it
+            # Cache only formulas that a future bounded domain corr-check can
+            # read. Appended formulas beyond that fixed window stay formula-only.
             elapsed = time.perf_counter() - corr_start
             if elapsed >= 5.0:
                 logger.info(
@@ -218,11 +226,27 @@ class Domain:
                     len(self._formulas),
                     gene.formula,
                 )
-            self._cache[gene.formula] = new_series
+            if _is_domain_corr_cache_relevant(gene.formula, self._formulas):
+                self._cache[gene.formula] = new_series
 
         self._formulas.append(gene.formula)
         logger.debug("Domain ← %r  (size=%d)", gene.formula, len(self._formulas))
         return True
+
+    def try_add_prevalidated(
+        self,
+        gene: Gene,
+        train_df: pd.DataFrame,
+        candidate_series: pd.Series,
+    ) -> bool:
+        """Add a just-validated candidate without breaking legacy subclasses."""
+        if type(self).try_add is not Domain.try_add:
+            return self.try_add(gene, train_df)
+        return self.try_add(
+            gene,
+            train_df,
+            prevalidated_series=candidate_series,
+        )
 
     def precompute(
         self,
@@ -230,49 +254,56 @@ class Domain:
         progress_every: int = 50,
         slow_sec: float = 1.0,
     ) -> None:
-        """Materialise all domain formulas on train_df with progress logging."""
+        """Warm the formulas that domain correlation checks can actually read."""
         self._ensure_cache_context(train_df)
-        total = len(self._formulas)
+        formulas = _bounded_domain_corr_formulas(self._formulas)
+        total = len(formulas)
         start = time.perf_counter()
         computed = skipped = failed = 0
         logger.info(
-            "Domain.precompute: start %d formulas on %d rows.",
+            "Domain.precompute: start %d/%d corr-relevant formulas on %d rows.",
             total,
+            len(self._formulas),
             len(train_df),
         )
 
-        for i, f in enumerate(self._formulas, 1):
-            t0 = time.perf_counter()
-            if f not in self._cache:
-                try:
-                    self._cache[f] = self._compute(f, train_df)
-                    computed += 1
-                except Exception as exc:
-                    failed += 1
-                    logger.warning("Domain.precompute: %r failed — %s", f, exc)
+        # Many seeded formulas share expensive children (for example body()
+        # across every rolling window). This cache exists only for this batch;
+        # the persistent domain cache still contains exactly the top-level
+        # formulas used by correlation checks.
+        with shared_evaluation_cache():
+            for i, f in enumerate(formulas, 1):
+                t0 = time.perf_counter()
+                if f not in self._cache:
+                    try:
+                        self._cache[f] = self._compute(f, train_df)
+                        computed += 1
+                    except Exception as exc:
+                        failed += 1
+                        logger.warning("Domain.precompute: %r failed — %s", f, exc)
 
-            else:
-                skipped += 1
+                else:
+                    skipped += 1
 
-            elapsed_formula = time.perf_counter() - t0
-            if slow_sec > 0 and elapsed_formula >= slow_sec:
-                logger.info(
-                    "Domain.precompute: slow %.2fs | %s",
-                    elapsed_formula,
-                    f,
-                )
+                elapsed_formula = time.perf_counter() - t0
+                if slow_sec > 0 and elapsed_formula >= slow_sec:
+                    logger.info(
+                        "Domain.precompute: slow %.2fs | %s",
+                        elapsed_formula,
+                        f,
+                    )
 
-            if progress_every > 0 and i % progress_every == 0:
-                logger.info(
-                    "Domain.precompute: %d/%d | computed=%d skipped=%d "
-                    "failed=%d | elapsed=%.1fs",
-                    i,
-                    total,
-                    computed,
-                    skipped,
-                    failed,
-                    time.perf_counter() - start,
-                )
+                if progress_every > 0 and i % progress_every == 0:
+                    logger.info(
+                        "Domain.precompute: %d/%d | computed=%d skipped=%d "
+                        "failed=%d | elapsed=%.1fs",
+                        i,
+                        total,
+                        computed,
+                        skipped,
+                        failed,
+                        time.perf_counter() - start,
+                    )
 
         logger.info(
             "Domain.precompute: done | computed=%d skipped=%d failed=%d "
@@ -572,6 +603,14 @@ def _bounded_domain_corr_formulas(formulas: List[str]) -> List[str]:
     return list(candidates[:max_checks])
 
 
+def _is_domain_corr_cache_relevant(formula: str, formulas: List[str]) -> bool:
+    """Whether an appended formula can occur in a future bounded corr scan."""
+    future_formulas = list(formulas)
+    if formula not in future_formulas:
+        future_formulas.append(formula)
+    return formula in _bounded_domain_corr_formulas(future_formulas)
+
+
 def _feature_quality_violation(
     formula: str,
     series: pd.Series,
@@ -613,85 +652,98 @@ def individual_corr_check(
     train_df: pd.DataFrame,
     threshold: float = CORR_THRESHOLD,
 ) -> bool:
-    """
-    Returns True nếu new_gene có corr < threshold với TẤT CẢ existing_genes
-    VÀ new_gene không phải hằng số (std > 1e-8).
-    """
-    violation = const_threshold_violation(new_gene.formula)
-    if violation is not None:
-        logger.debug(
-            "corr_check: reject unsafe const threshold %r - %s",
-            new_gene.formula,
-            violation,
-        )
-        return False
-    violation = expression_complexity_violation(new_gene.formula)
-    if violation is not None:
-        logger.debug(
-            "corr_check: reject expression complexity %r - %s",
-            new_gene.formula,
-            violation,
-        )
-        return False
-    violation = raw_scale_violation(new_gene.formula)
-    if violation is not None:
-        logger.debug(
-            "corr_check: reject raw-scale feature %r - %s",
-            new_gene.formula,
-            violation,
-        )
-        return False
-
-    try:
-        if has_division_by_zero(new_gene.formula, train_df):
-            logger.debug(
-                "corr_check: reject division-by-zero gene %r",
-                new_gene.formula,
-            )
-            return False
-    except Exception as exc:
-        logger.warning(
-            "corr_check division check failed for %r: %s",
-            new_gene.formula, exc,
-        )
-        return False
-
-    try:
-        full_series = _evaluate_clean(new_gene.formula, train_df)
-    except Exception as exc:
-        logger.warning("corr_check eval failed for %r: %s", new_gene.formula, exc)
-        return False
-
-    quality_violation = _feature_quality_violation(
-        new_gene.formula,
-        full_series,
+    passed, _ = individual_corr_check_with_series(
+        new_gene,
+        existing_genes,
         train_df,
+        threshold=threshold,
     )
-    if quality_violation is not None:
-        logger.debug(
-            "corr_check: reject low-quality feature %r - %s",
-            new_gene.formula,
-            quality_violation,
-        )
-        return False
+    return passed
 
-    new_series = full_series.dropna()
 
-    # Loại gene hằng số ngay tại đây
-    if new_series.std() < 1e-8:
-        logger.debug("corr_check: reject constant gene %r", new_gene.formula)
-        return False
+def individual_corr_check_with_series(
+    new_gene: Gene,
+    existing_genes: List[Gene],
+    train_df: pd.DataFrame,
+    threshold: float = CORR_THRESHOLD,
+) -> tuple[bool, pd.Series | None]:
+    """
+    Check a candidate and return its cleaned Series for immediate domain reuse.
 
-    for g in existing_genes:
-        try:
-            ex_series = (
-                evaluate(g.formula, train_df)
-                .replace([np.inf, -np.inf], np.nan)
-                .dropna()
+    The shared evaluator cache is candidate-scoped unless the caller opens an
+    outer scope to continue into Domain.try_add(). Rejected candidate arrays are
+    therefore released as soon as this function returns.
+    """
+    with shared_evaluation_cache():
+        violation = const_threshold_violation(new_gene.formula)
+        if violation is not None:
+            logger.debug(
+                "corr_check: reject unsafe const threshold %r - %s",
+                new_gene.formula, violation,
             )
-        except Exception:
-            continue
-        corr = _safe_corr(new_series, ex_series)
-        if abs(corr) >= threshold:
-            return False
-    return True
+            return False, None
+        violation = expression_complexity_violation(new_gene.formula)
+        if violation is not None:
+            logger.debug(
+                "corr_check: reject expression complexity %r - %s",
+                new_gene.formula, violation,
+            )
+            return False, None
+        violation = raw_scale_violation(new_gene.formula)
+        if violation is not None:
+            logger.debug(
+                "corr_check: reject raw-scale feature %r - %s",
+                new_gene.formula, violation,
+            )
+            return False, None
+
+        try:
+            if has_division_by_zero(new_gene.formula, train_df):
+                logger.debug(
+                    "corr_check: reject division-by-zero gene %r",
+                    new_gene.formula,
+                )
+                return False, None
+        except Exception as exc:
+            logger.warning(
+                "corr_check division check failed for %r: %s",
+                new_gene.formula, exc,
+            )
+            return False, None
+
+        try:
+            full_series = _evaluate_clean(new_gene.formula, train_df)
+        except Exception as exc:
+            logger.warning("corr_check eval failed for %r: %s", new_gene.formula, exc)
+            return False, None
+
+        quality_violation = _feature_quality_violation(
+            new_gene.formula,
+            full_series,
+            train_df,
+        )
+        if quality_violation is not None:
+            logger.debug(
+                "corr_check: reject low-quality feature %r - %s",
+                new_gene.formula, quality_violation,
+            )
+            return False, None
+
+        new_series = full_series.dropna()
+        if new_series.std() < 1e-8:
+            logger.debug("corr_check: reject constant gene %r", new_gene.formula)
+            return False, None
+
+        for g in existing_genes:
+            try:
+                ex_series = (
+                    evaluate(g.formula, train_df)
+                    .replace([np.inf, -np.inf], np.nan)
+                    .dropna()
+                )
+            except Exception:
+                continue
+            corr = _safe_corr(new_series, ex_series)
+            if abs(corr) >= threshold:
+                return False, None
+        return True, new_series

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import socket
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +37,46 @@ REQUEST_SLEEP_SEC = 0.25
 RATE_LIMIT_SLEEP_SEC = 60.0
 RATE_LIMIT_STATUS_CODES = {418, 429}
 MAX_RETRIES = 8
+_DEFAULT_GETADDRINFO = socket.getaddrinfo
+
+OUTPUT_COLUMNS = [
+    "date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "quote_volume",
+    "trade_count",
+    "taker_buy_base_volume",
+    "taker_buy_quote_volume",
+    "is_trading_day",
+]
+
+
+def force_ipv4_networking() -> None:
+    """Force urllib connections in this process to resolve IPv4 addresses."""
+    if socket.getaddrinfo is not _DEFAULT_GETADDRINFO:
+        return
+
+    def ipv4_getaddrinfo(
+        host: str,
+        port: int | str,
+        family: int = 0,
+        type: int = 0,
+        proto: int = 0,
+        flags: int = 0,
+    ) -> list[tuple[Any, ...]]:
+        return _DEFAULT_GETADDRINFO(
+            host,
+            port,
+            socket.AF_INET,
+            type,
+            proto,
+            flags,
+        )
+
+    socket.getaddrinfo = ipv4_getaddrinfo
 
 INTERVAL_TO_MS = {
     "1m": 60_000,
@@ -193,20 +234,7 @@ def _klines_to_dataframe(rows: list[list[Any]]) -> pd.DataFrame:
         "ignore",
     ]
     if not rows:
-        return pd.DataFrame(
-            columns=[
-                "date",
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume",
-                "trade_count",
-                "taker_buy_base_volume",
-                "taker_buy_quote_volume",
-                "is_trading_day",
-            ]
-        )
+        return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
     df = pd.DataFrame(rows, columns=columns)
     df["date"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
@@ -216,6 +244,7 @@ def _klines_to_dataframe(rows: list[list[Any]]) -> pd.DataFrame:
         "low",
         "close",
         "volume",
+        "quote_volume",
         "trade_count",
         "taker_buy_base_volume",
         "taker_buy_quote_volume",
@@ -228,20 +257,7 @@ def _klines_to_dataframe(rows: list[list[Any]]) -> pd.DataFrame:
     df = df.drop_duplicates(subset=["date"], keep="last").sort_values("date")
     df["date"] = df["date"].dt.tz_convert(OUTPUT_TIMEZONE).dt.tz_localize(None)
     df["is_trading_day"] = 1
-    return df[
-        [
-            "date",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "trade_count",
-            "taker_buy_base_volume",
-            "taker_buy_quote_volume",
-            "is_trading_day",
-        ]
-    ]
+    return df[OUTPUT_COLUMNS]
 
 
 def save_ohlcv(df: pd.DataFrame, out_path: Path) -> None:
@@ -272,7 +288,15 @@ def main() -> None:
     parser.add_argument("--end", default="now", help="End date/time. Naive values are treated as UTC. Default: now.")
     parser.add_argument("--out", default=None, help="Output CSV path.")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Binance base URL.")
+    parser.add_argument(
+        "--force-ipv4",
+        action="store_true",
+        help="Resolve Binance using IPv4 only.",
+    )
     args = parser.parse_args()
+
+    if args.force_ipv4:
+        force_ipv4_networking()
 
     symbol = args.symbol.strip().upper()
     interval = args.interval.strip()

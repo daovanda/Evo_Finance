@@ -1,14 +1,15 @@
-# Guild Evo Finance - Stock VN
+# Guild Evo Finance - Stock Profiles
 
-Tai lieu nay huong dan chay pipeline tien hoa feature cho phan co phieu Viet Nam
-trong repo `Evo_Finance`. Phan crypto co tai lieu rieng trong `crypto/`.
+Tai lieu nay huong dan chay pipeline tien hoa feature dung chung cho co phieu
+Viet Nam va My trong repo `Evo_Finance`. Phan crypto co pipeline rieng trong
+`crypto/`.
 
 ## 1. Cau truc nhanh
 
 Pipeline stock:
 
 ```text
-data/raw/*.csv
+profile + thu muc CSV
   -> load OHLCV + market index
   -> label theo tung ticker
   -> tao walk-forward folds
@@ -24,9 +25,27 @@ Archive luu nhung individual co fitness tot nhat.
 
 ## 2. Cau hinh quan trong
 
-Tat ca knob chinh nam trong `config/settings.py`.
+Model, mutator, fitness va archive dung cau hinh chung trong
+`config/settings.py`. Nhung gia tri phu thuoc thi truong nam trong:
 
-### 2.1. Final split
+```text
+config/profiles/vnindex.py   # VNINDEX + co phieu VN theo ngay
+config/profiles/sp500_15m.py # SPY + 50 co phieu My theo nen 15 phut
+```
+
+Chon profile bang `--profile`. Neu khong truyen, mac dinh luon la `vnindex`,
+nen lenh cu va ket qua cua pipeline VN khong bi doi.
+
+```text
+--profile vnindex    -> data/raw, VNINDEX.csv, ticker.csv
+--profile sp500_15m  -> data/raw/sp500, SPY_15Min.csv, ticker_15Min.csv
+```
+
+Profile quyet dinh duong dan mac dinh, benchmark, sector, split, horizon,
+window va gioi han corr phu hop quy mo du lieu. Cac cong thuc feature, cach
+mutate, LightGBM, fitness va archive van la cung mot implementation.
+
+### 2.1. Final split cua profile VNINDEX
 
 Hien tai:
 
@@ -56,10 +75,10 @@ HOLDING_HORIZON = 10
 label(t) = (close(t+10) - open(t+1)) / open(t+1)
 ```
 
-Tuc la tai ngay `t`, model chi dung du lieu den close `t`; entry gia dinh la
-open ngay `t+1`, exit la close ngay `t+10`.
+Voi `vnindex`, moi buoc la mot ngay giao dich. Voi `sp500_15m`, moi buoc la
+mot nen 15 phut. Cong thuc va quy tac chi dung du lieu den close `t` khong doi.
 
-### 2.3. Walk-forward trong tien hoa
+### 2.3. Walk-forward trong tien hoa cua profile VNINDEX
 
 Hien tai:
 
@@ -113,7 +132,7 @@ fold train co 30 ngay  -> early-stop lay 15 ngay cuoi do bi chan 50%
 
 ### 2.4. Market index va sector
 
-Market index:
+Profile `vnindex`:
 
 ```python
 MARKET_INDEX_TICKER = "VNINDEX"
@@ -125,10 +144,16 @@ Loader se doc file:
 data/raw/VNINDEX.csv
 ```
 
-Sau do tao cac cot `market_*` cho tung dong co phieu. Neu muon dung chi so khac,
-them file CSV tuong ung vao `data/raw/` va doi `MARKET_INDEX_TICKER`.
+Profile `sp500_15m` dung:
 
-Sector nam trong:
+```python
+MARKET_INDEX_TICKER = "SPY"
+```
+
+va loader doc `data/raw/sp500/SPY_15Min.csv`. Trong ca hai profile, benchmark
+duoc loai khoi universe va join thanh cac cot `market_*` tai dung timestamp.
+
+Sector nam trong profile tuong ung:
 
 ```python
 SECTORS = {...}
@@ -136,8 +161,8 @@ REQUIRE_SECTOR_MAPPING = True
 MIN_SECTOR_MEMBERS_IN_UNIVERSE = 2
 ```
 
-Khi them ticker moi, can cap nhat `SECTORS` neu van bat
-`REQUIRE_SECTOR_MAPPING=True`.
+Khi them ticker moi, can cap nhat `SECTORS` trong dung profile neu van bat
+`REQUIRE_SECTOR_MAPPING=True`. Khong sua sector VN khi chi thay doi universe My.
 
 ### 2.5. Feature va mutator
 
@@ -148,7 +173,7 @@ FEATURE_MIN = 3
 FEATURE_MAX = 30
 ```
 
-Window whitelist:
+Window whitelist cua VNINDEX:
 
 ```python
 WINDOWS = [3, 5, 10, 14, 20, 30, 60, 120]
@@ -162,6 +187,27 @@ CORR_CHECK_MAX_ROWS = 0
 DOMAIN_CORR_MAX_CHECKS = 0
 DOMAIN_PRECOMPUTE_ON_START = True
 ```
+
+Profile SP500 15m dung window theo bar va corr sampling de tranh startup qua
+nang tren panel hon 2.5 trieu dong. `CORR_CHECK_MAX_ROWS` chi ap dung cho corr
+guard; co che lay mau train WF ben duoi la mot cau hinh rieng.
+
+Rieng tap train cua moi WF fold co them timestamp stride:
+
+```python
+# config/profiles/vnindex.py
+WF_TRAIN_BAR_STRIDE = 1
+
+# config/profiles/sp500_15m.py
+WF_TRAIN_BAR_STRIDE = 100
+```
+
+Voi stride `100`, he thong giu timestamp thu 0, 100, 200, 300... trong fold train.
+Tai moi timestamp duoc chon, tat ca 50 co phieu van duoc giu nguyen thanh mot
+LightGBM ranking group. Du lieu lich su dung de tinh rolling feature, WF val,
+final train, final val va final test khong bi lay mau. Vi vay sampling nay chi
+giam so dong dung de fit model trong vong tien hoa, khong lam thay doi tap tinh
+fitness hay final evaluation.
 
 `CORR_THRESHOLD` dung de loc feature qua giong nhau trong domain va trong
 individual. Hien tai dang loc ca hai dau: tuong quan duong qua cao va am qua cao
@@ -191,8 +237,19 @@ DOMAIN_CORR_MAX_CHECKS = 0
   >0 = chi check toi da N formula trong domain.
 
 DOMAIN_PRECOMPUTE_ON_START = True
-  Tinh san feature domain luc bat dau. Khoi dong lau hon va ton RAM hon,
-  nhung sau do domain corr-check do bi giat/khoi tao lazy hon.
+  Tinh san cac feature ma domain corr-check co the doc luc bat dau.
+  Neu DOMAIN_CORR_MAX_CHECKS=N>0 thi chi warm N formula dau tien (bo qua
+  constant); neu bang 0 thi warm toan bo domain. Cac bieu thuc con trung nhau
+  duoc tai su dung trong cung dot precompute. Cach nay chi doi thoi gian va RAM,
+  khong doi thu tu formula, corr sample hay ket qua loc.
+
+TRAINER_FEATURE_CACHE_MAX_ITEMS = 32
+TRAINER_SPLIT_CACHE_MAX_ITEMS = 64
+  Hai cache cua Trainer duoc quan ly rieng theo LRU. Gia tri >0 gioi han so
+  phan tu va loai phan tu it duoc dung gan day nhat; 0 la khong gioi han.
+  Cache bi loai chi duoc tinh lai bang cung cong thuc va cung du lieu, nen khong
+  doi feature, split, score hay tao data leak. Profile SP500 dung 32/64; profile
+  VNINDEX dung 128/64 do tap du lieu nho hon.
 ```
 
 Neu muon chay nhanh hon, co the dung vi du:
@@ -275,12 +332,29 @@ $env:MKL_NUM_THREADS="1"
 $env:NUMEXPR_NUM_THREADS="1"
 
 python main.py `
+  --profile vnindex `
   --data-dir data/raw `
   --budget 600 `
   --seed 1 `
   --save results/archive_stock_smoke_seed1.json `
   --checkpoint-every 300
 ```
+
+`--data-dir data/raw` co the bo vi day la duong dan mac dinh cua `vnindex`.
+
+Chay profile SP500 15 phut:
+
+```powershell
+python main.py `
+  --profile sp500_15m `
+  --budget 600 `
+  --seed 1 `
+  --save results/archive_sp500_15m_smoke_seed1.json `
+  --checkpoint-every 300
+```
+
+Lenh nay tu dong doc `data/raw/sp500`, loai `SPY` khoi 50 co phieu va dung SPY
+lam benchmark. Co the them `--data-dir` neu du lieu nam o noi khac.
 
 File tao ra:
 
@@ -363,11 +437,25 @@ cd D:\Evo_Finance
 .\.venv\Scripts\Activate.ps1
 
 python analyze.py `
+  --profile vnindex `
   --data-dir data/raw `
   --archive results/archive_stock_seed1_12h.json `
   --top 10 `
   --out-dir results/chart/stock_seed1_12h_top10
 ```
+
+Analyze archive SP500 phai chon lai cung profile da dung luc tien hoa:
+
+```powershell
+python analyze.py `
+  --profile sp500_15m `
+  --archive results/archive_sp500_15m_seed1.json `
+  --top 10 `
+  --out-dir results/chart/sp500_15m_seed1
+```
+
+Khong resume/analyze cheo profile: formula co the giong nhau, nhung benchmark,
+sector, window, horizon va phan phoi du lieu khac nhau.
 
 ### 4.2. Analyze mot vai rank cu the
 

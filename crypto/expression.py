@@ -88,7 +88,10 @@ class CryptoFeatureSpace:
         missing = [name for name in self.base_features if name not in self.base_df.columns]
         if missing:
             raise ValueError(f"Base feature frame missing features: {missing[:5]}")
-        self._base_set = set(self.base_features)
+        # All feature-frame columns remain evaluable for archived formulas,
+        # while only base_features are exposed to new expression generation.
+        # build_feature_frame never includes raw OHLCV columns.
+        self._base_set = set(self.base_df.columns)
         self._cache: OrderedDict[str, pd.Series] = OrderedDict()
         self._cache_max_items = int(config.EXPR_CACHE_MAX_ITEMS)
 

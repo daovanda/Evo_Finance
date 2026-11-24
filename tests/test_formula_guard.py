@@ -2,6 +2,7 @@ import unittest
 
 import pandas as pd
 
+from config.settings import EXPR_MAX_DEPTH, EXPR_MAX_LENGTH
 from mutator.domain import Domain, individual_corr_check
 from mutator.formula_guard import (
     BLOCKED_EVOLUTION_PRIMITIVES,
@@ -24,16 +25,13 @@ from main import (
 
 class FormulaGuardTests(unittest.TestCase):
     def test_expression_complexity_guard(self):
-        allowed = (
-            "(cross_below(where(gt(ret(close_1, 20), const(0.156233)), "
-            "const(-1), const(0)), sector_neutralize(rel_sector_ret(20))))_w20"
-        )
-        too_deep = "ret(close_1, 1)"
-        for _ in range(5):
-            too_deep = f"sign({too_deep})"
-        too_long = "x" * 481
+        allowed = "close_1"
+        for _ in range(int(EXPR_MAX_DEPTH) - 1):
+            allowed = f"sign({allowed})"
+        too_deep = f"sign({allowed})"
+        too_long = "x" * (int(EXPR_MAX_LENGTH) + 1)
 
-        self.assertEqual(6, expression_depth(allowed))
+        self.assertEqual(int(EXPR_MAX_DEPTH), expression_depth(allowed))
         self.assertIsNone(expression_complexity_violation(allowed))
         self.assertIsNotNone(expression_complexity_violation(too_deep))
         self.assertIn("depth", expression_complexity_violation(too_deep))

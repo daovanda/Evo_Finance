@@ -8,6 +8,7 @@ normalization, bounded oscillator, or interaction of normalized quantities.
 from __future__ import annotations
 
 import logging
+import re
 import time
 
 import numpy as np
@@ -25,12 +26,52 @@ RAW_SCALE_COLUMNS = {
     "low",
     "close",
     "volume",
+    "quote_volume",
     "trade_count",
     "taker_buy_base_volume",
     "taker_buy_quote_volume",
     "trade_size_base",
     "trade_size_quote",
+    "trade_size_quote_exact",
 }
+
+# These columns retain the original close*volume approximation so archived
+# formulas can still be evaluated with their original meaning. They are not
+# eligible for new evolution; use the corresponding *_exact features instead.
+LEGACY_QUOTE_PROXY_FEATURES = {
+    "taker_buy_quote_ratio",
+    "taker_delta_quote_ratio",
+    "trade_size_quote",
+    "buy_pressure_quote",
+    "buy_pressure_diff",
+}
+
+
+def _is_legacy_quote_proxy_feature(name: str) -> bool:
+    if name in LEGACY_QUOTE_PROXY_FEATURES:
+        return True
+    if name.startswith("quote_volume_proxy_"):
+        return True
+    if name.startswith("trade_size_quote_") and "_exact" not in name:
+        return True
+    if name.startswith("taker_delta_quote_") and "_exact" not in name:
+        return True
+    return False
+
+
+def formula_uses_legacy_quote_proxy(formula: str) -> bool:
+    """Return whether an archived expression depends on approximate quote flow."""
+    text = str(formula)
+    if "quote_volume_proxy" in text:
+        return True
+    patterns = (
+        r"\btaker_buy_quote_ratio(?!_exact)",
+        r"\btaker_delta_quote_(?![A-Za-z0-9_]*_exact)",
+        r"\btrade_size_quote(?!_exact)",
+        r"\bbuy_pressure_quote(?!_exact)",
+        r"\bbuy_pressure_diff(?!_exact)",
+    )
+    return any(re.search(pattern, text) is not None for pattern in patterns)
 
 
 def build_feature_frame(
@@ -71,11 +112,13 @@ def build_feature_frame(
     low = _num(data["low"])
     close = _num(data["close"])
     volume = _num(data["volume"])
+    quote_volume = _num(data["quote_volume"])
     trade_count = _num(data["trade_count"])
     taker_base = _num(data["taker_buy_base_volume"])
     taker_quote = _num(data["taker_buy_quote_volume"])
 
     quote_volume_proxy = close * volume
+    vwap = _safe_div(quote_volume, volume)
     trade_count_safe = trade_count.where(trade_count > 0)
     true_range = _true_range(high, low, close)
     close_ret_1 = close.pct_change()
@@ -101,8 +144,12 @@ def build_feature_frame(
     rogers_satchell_component = (log_hc * log_ho) + (log_lc * log_lo)
     taker_sell_base = volume - taker_base
     taker_sell_quote = quote_volume_proxy - taker_quote
+    taker_sell_quote_exact = quote_volume - taker_quote
     taker_delta_base = taker_base - taker_sell_base
     taker_delta_quote = taker_quote - taker_sell_quote
+    taker_delta_quote_exact = taker_quote - taker_sell_quote_exact
+    taker_buy_vwap = _safe_div(taker_quote, taker_base)
+    taker_sell_vwap_exact = _safe_div(taker_sell_quote_exact, taker_sell_base)
     signed_volume = volume * np.sign(close_ret_1)
 
     features: dict[str, pd.Series] = {
@@ -114,17 +161,38 @@ def build_feature_frame(
         "upper_wick_pct": _safe_div(high - np.maximum(open_, close), open_),
         "lower_wick_pct": _safe_div(np.minimum(open_, close) - low, open_),
         "close_pos_in_range": _safe_div(close - low, high - low),
+        "vwap_vs_open": _safe_div(vwap, open_) - 1.0,
+        "close_vs_vwap": _safe_div(close, vwap) - 1.0,
+        "vwap_pos_in_range": _safe_div(vwap - low, high - low),
+        "taker_buy_vwap_vs_vwap": _safe_div(taker_buy_vwap, vwap) - 1.0,
+        "taker_sell_vwap_vs_vwap_exact": (
+            _safe_div(taker_sell_vwap_exact, vwap) - 1.0
+        ),
+        "taker_vwap_spread_exact": (
+            _safe_div(taker_buy_vwap, taker_sell_vwap_exact) - 1.0
+        ),
         "taker_buy_base_ratio": _safe_div(taker_base, volume),
         "taker_buy_quote_ratio": _safe_div(taker_quote, quote_volume_proxy),
+        "taker_buy_quote_ratio_exact": _safe_div(taker_quote, quote_volume),
         "taker_delta_base_ratio": _safe_div(taker_delta_base, volume),
         "taker_delta_quote_ratio": _safe_div(taker_delta_quote, quote_volume_proxy),
+        "taker_delta_quote_ratio_exact": _safe_div(
+            taker_delta_quote_exact, quote_volume
+        ),
         "trade_size_base": _safe_div(volume, trade_count_safe),
         "trade_size_quote": _safe_div(quote_volume_proxy, trade_count_safe),
+        "trade_size_quote_exact": _safe_div(quote_volume, trade_count_safe),
     }
     features["buy_pressure_base"] = (2.0 * features["taker_buy_base_ratio"]) - 1.0
     features["buy_pressure_quote"] = (2.0 * features["taker_buy_quote_ratio"]) - 1.0
+    features["buy_pressure_quote_exact"] = (
+        2.0 * features["taker_buy_quote_ratio_exact"]
+    ) - 1.0
     features["buy_pressure_diff"] = (
         features["buy_pressure_base"] - features["buy_pressure_quote"]
+    )
+    features["buy_pressure_diff_exact"] = (
+        features["buy_pressure_base"] - features["buy_pressure_quote_exact"]
     )
 
     flow_sources = {
@@ -133,8 +201,10 @@ def build_feature_frame(
         "taker_buy_base_volume": taker_base,
         "taker_buy_quote_volume": taker_quote,
         "quote_volume_proxy": quote_volume_proxy,
+        "quote_volume": quote_volume,
         "trade_size_base": features["trade_size_base"],
         "trade_size_quote": features["trade_size_quote"],
+        "trade_size_quote_exact": features["trade_size_quote_exact"],
     }
     flow_log_sources = {
         name: np.log1p(source.clip(lower=0))
@@ -227,13 +297,24 @@ def build_feature_frame(
             taker_delta_quote.rolling(w, min_periods=w).sum(),
             quote_volume_sum,
         )
+        quote_volume_exact_sum = quote_volume.rolling(w, min_periods=w).sum()
+        features[f"taker_delta_quote_sum_ratio_exact_{w}"] = _safe_div(
+            taker_delta_quote_exact.rolling(w, min_periods=w).sum(),
+            quote_volume_exact_sum,
+        )
         features[f"taker_delta_z_{w}"] = _rolling_zscore(
             features["taker_delta_base_ratio"], w
         )
         features[f"taker_delta_quote_z_{w}"] = _rolling_zscore(
             features["taker_delta_quote_ratio"], w
         )
+        features[f"taker_delta_quote_z_exact_{w}"] = _rolling_zscore(
+            features["taker_delta_quote_ratio_exact"], w
+        )
         features[f"taker_delta_accel_{w}"] = features[f"taker_delta_sum_ratio_{w}"].diff(w)
+        features[f"taker_delta_quote_accel_exact_{w}"] = features[
+            f"taker_delta_quote_sum_ratio_exact_{w}"
+        ].diff(w)
         features[f"signed_volume_sum_ratio_{w}"] = _safe_div(
             signed_volume.rolling(w, min_periods=w).sum(),
             volume_sum,
@@ -316,7 +397,9 @@ def build_feature_frame(
 def selectable_features(feature_df: pd.DataFrame) -> list[str]:
     return [
         col for col in feature_df.columns
-        if col not in RAW_SCALE_COLUMNS and not col.startswith("date")
+        if col not in RAW_SCALE_COLUMNS
+        and not col.startswith("date")
+        and not _is_legacy_quote_proxy_feature(col)
     ]
 
 

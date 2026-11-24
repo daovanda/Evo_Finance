@@ -9,12 +9,12 @@ compatibility.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List
 
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
 
 from config.settings import FITNESS_WEIGHTS, HIT_RATE_TOP_K
 from mutator.gene import Individual
@@ -27,30 +27,71 @@ def _ic_per_date(
     label: pd.Series,
     df_index: pd.Index,
 ) -> pd.Series:
-    """Compute Spearman IC for each date."""
+    """Compute vectorized Spearman IC independently for each timestamp."""
     data = _clean_metric_data(pred, label)
+    if data.empty:
+        return pd.Series(dtype=float)
 
-    if isinstance(data.index, pd.MultiIndex):
-        dates_arr = data.index.get_level_values("date")
-    else:
-        dates_arr = data.index
+    keys = _metric_group_keys(data)
+    sizes = data.groupby(keys, sort=True).size()
+    valid_groups = sizes.index[sizes >= 5]
+    if len(valid_groups) == 0:
+        return pd.Series(dtype=float)
 
-    ics = {}
-    for date in np.unique(dates_arr):
-        mask = dates_arr == date
-        grp = data[mask]
-        if len(grp) < 5:
-            continue
-        if (
-            grp["pred"].nunique(dropna=True) < 2
-            or grp["label"].nunique(dropna=True) < 2
-        ):
-            ics[date] = 0.0
-            continue
-        corr, _ = spearmanr(grp["pred"], grp["label"])
-        ics[date] = float(corr) if not np.isnan(corr) else 0.0
+    # Spearman correlation is Pearson correlation of average ranks. Ranking,
+    # centering and covariance are all isolated by timestamp, so no information
+    # can cross from one bar/date into another.
+    pred_rank = data["pred"].groupby(keys, sort=False).rank(method="average")
+    label_rank = data["label"].groupby(keys, sort=False).rank(method="average")
+    pred_centered = pred_rank - pred_rank.groupby(keys, sort=False).transform("mean")
+    label_centered = label_rank - label_rank.groupby(keys, sort=False).transform("mean")
 
-    return pd.Series(ics)
+    numerator = (pred_centered * label_centered).groupby(keys, sort=True).sum()
+    pred_ss = pred_centered.pow(2).groupby(keys, sort=True).sum()
+    label_ss = label_centered.pow(2).groupby(keys, sort=True).sum()
+    denominator = np.sqrt(pred_ss * label_ss)
+    ic = (numerator / denominator).reindex(valid_groups)
+
+    pred_unique = data["pred"].groupby(keys, sort=True).nunique(dropna=True)
+    label_unique = data["label"].groupby(keys, sort=True).nunique(dropna=True)
+    constant = (pred_unique < 2) | (label_unique < 2)
+    ic.loc[constant.reindex(valid_groups, fill_value=False)] = 0.0
+    ic = ic.replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
+    ic.index.name = None
+    return ic
+
+
+def _hit_rate_per_date(
+    pred: pd.Series,
+    label: pd.Series,
+    top_k: int = HIT_RATE_TOP_K,
+) -> pd.Series:
+    """Return top-k overlap per timestamp with legacy tie behavior preserved."""
+    data = _clean_metric_data(pred, label)
+    if data.empty or int(top_k) <= 0:
+        return pd.Series(dtype=float)
+
+    keys = _metric_group_keys(data)
+    sizes = data.groupby(keys, sort=True).size()
+    k_by_group = sizes.clip(upper=int(top_k)).astype(int)
+
+    # method='first' matches DataFrame.nlargest(..., keep='first') for ties.
+    pred_rank = data["pred"].groupby(keys, sort=False).rank(
+        method="first", ascending=False
+    )
+    label_rank = data["label"].groupby(keys, sort=False).rank(
+        method="first", ascending=False
+    )
+    row_k = pd.Series(keys.to_numpy(), index=data.index).map(k_by_group)
+    overlap = ((pred_rank <= row_k) & (label_rank <= row_k)).astype(np.int8)
+    hits = overlap.groupby(keys, sort=True).sum().astype(float) / k_by_group
+
+    pred_unique = data["pred"].groupby(keys, sort=True).nunique(dropna=True)
+    label_unique = data["label"].groupby(keys, sort=True).nunique(dropna=True)
+    constant = (pred_unique < 2) | (label_unique < 2)
+    hits.loc[constant] = (k_by_group / sizes).loc[constant]
+    hits.index.name = None
+    return hits.astype(float)
 
 
 def _hit_rate(
@@ -59,31 +100,8 @@ def _hit_rate(
     df_index: pd.Index,
     top_k: int = HIT_RATE_TOP_K,
 ) -> float:
-    data = _clean_metric_data(pred, label)
-
-    if isinstance(data.index, pd.MultiIndex):
-        dates_arr = data.index.get_level_values("date")
-    else:
-        dates_arr = data.index
-
-    hits = []
-    for date in np.unique(dates_arr):
-        mask = dates_arr == date
-        grp = data[mask]
-        k = min(int(top_k), len(grp))
-        if k <= 0:
-            continue
-        if (
-            grp["pred"].nunique(dropna=True) < 2
-            or grp["label"].nunique(dropna=True) < 2
-        ):
-            hits.append(float(k) / float(len(grp)))
-            continue
-        top_pred = set(grp.nlargest(k, "pred").index)
-        top_label = set(grp.nlargest(k, "label").index)
-        hits.append(len(top_pred & top_label) / k)
-
-    return float(np.mean(hits)) if hits else 0.0
+    hits = _hit_rate_per_date(pred, label, top_k=top_k)
+    return float(hits.mean()) if len(hits) else 0.0
 
 
 def _random_hit_baseline(df: pd.DataFrame, top_k: int = HIT_RATE_TOP_K) -> float:
@@ -103,6 +121,14 @@ def _clean_metric_data(pred: pd.Series, label: pd.Series) -> pd.DataFrame:
         .replace([np.inf, -np.inf], np.nan)
         .dropna()
     )
+
+
+def _metric_group_keys(data: pd.DataFrame) -> pd.Index:
+    """Return timestamp keys aligned one-to-one with metric rows."""
+    if isinstance(data.index, pd.MultiIndex):
+        level = "date" if "date" in data.index.names else 0
+        return pd.Index(data.index.get_level_values(level))
+    return pd.Index(data.index)
 
 
 def _random_hit_baseline_for_predictions(
@@ -215,6 +241,7 @@ class FitnessEvaluator:
         val_ic_series_parts: List[pd.Series] = []
 
         for fold in folds:
+            fold_start = time.perf_counter()
             train_ic = _ic_per_date(
                 fold.train_pred,
                 fold.train_labels,
@@ -243,6 +270,14 @@ class FitnessEvaluator:
             )
             if len(val_ic):
                 val_ic_series_parts.append(val_ic.rename(fold.name))
+            logger.info(
+                "WF fitness fold %s aggregated: train_groups=%d | "
+                "val_groups=%d | %.2fs",
+                fold.name,
+                len(train_ic),
+                len(val_ic),
+                time.perf_counter() - fold_start,
+            )
 
         if not fold_metrics:
             raise ValueError("No fold metrics available for walk-forward fitness.")

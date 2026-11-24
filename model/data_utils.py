@@ -130,19 +130,21 @@ def split_labeled_by_dates(
     import logging
 
     logger = logging.getLogger(__name__)
+    time_unit = "bars" if settings.TIME_UNIT == "bar" else "trading days"
     logger.info(
         "Final split: train [%s -> %s) %d rows | val [%s -> %s) %d rows | "
-        "test [%s -> %s] %d rows | purge=%d trading days",
-        data_start.date(),
-        train_end_ts.date(),
+        "test [%s -> %s] %d rows | purge=%d %s",
+        _format_boundary(data_start),
+        _format_boundary(train_end_ts),
         len(train_df),
         val_start,
-        val_end_ts.date(),
+        _format_boundary(val_end_ts),
         len(val_df),
         test_start,
-        test_end or data_end.date(),
+        test_end or _format_boundary(data_end),
         len(test_df),
         purge_days,
+        time_unit,
     )
 
     return train_df, val_df, test_df
@@ -297,6 +299,24 @@ def make_walk_forward_folds(
             "No walk-forward folds created. Reduce WF_MIN_TRAIN_MONTHS or check WF_END."
         )
     return folds
+
+
+def sample_timestamp_groups(
+    df: pd.DataFrame,
+    stride: int,
+) -> pd.DataFrame:
+    """Keep every Nth timestamp while preserving each complete ticker group."""
+    stride = int(stride)
+    if stride < 1:
+        raise ValueError("Timestamp sampling stride must be >= 1.")
+    if stride == 1 or df.empty:
+        return df
+
+    _validate_index(df)
+    dates = df.index.get_level_values("date")
+    unique_dates = pd.DatetimeIndex(sorted(pd.unique(dates)))
+    selected_dates = unique_dates[::stride]
+    return df[dates.isin(selected_dates)].copy()
 
 
 def validate_ohlcv(df: pd.DataFrame) -> None:
@@ -496,6 +516,11 @@ def small_sectors_in_universe(
         for sector, count in sector_member_counts(df).items()
         if count < min_members
     }
+
+
+def _format_boundary(value: pd.Timestamp) -> str:
+    ts = pd.Timestamp(value)
+    return str(ts) if settings.TIME_UNIT == "bar" else str(ts.date())
 
 
 def _validate_index(df: pd.DataFrame) -> None:

@@ -1,10 +1,11 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 
 from mutator.domain import Domain, individual_corr_check, _safe_corr
-from mutator.evaluator import evaluate, has_division_by_zero
+from mutator.evaluator import evaluate, has_division_by_zero, shared_evaluation_cache
 from mutator.formula_guard import const_threshold_violation, raw_scale_violation
 from mutator.gene import (
     BREADTH_NOARG_OPS,
@@ -233,6 +234,74 @@ def _sample_df(periods=80):
 
 
 class FinancePrimitiveTests(unittest.TestCase):
+    def test_shared_evaluation_cache_preserves_exact_formula_results(self):
+        df = _sample_df(periods=30)
+        formulas = [
+            "body()",
+            "(body())_w3",
+            "(body())_w5",
+            "ret(close_1, 3)",
+        ]
+        expected = {formula: evaluate(formula, df) for formula in formulas}
+
+        with shared_evaluation_cache():
+            actual = {formula: evaluate(formula, df) for formula in formulas}
+
+        for formula in formulas:
+            pd.testing.assert_series_equal(actual[formula], expected[formula])
+
+    def test_domain_precompute_only_warms_corr_relevant_formulas(self):
+        df = _sample_df(periods=30)
+        domain = Domain()
+        domain._formulas = [
+            "const(0)",
+            "body()",
+            "(body())_w3",
+            "range()",
+        ]
+
+        with patch("mutator.domain.DOMAIN_CORR_MAX_CHECKS", 2):
+            domain.precompute(df, progress_every=0, slow_sec=0)
+
+        self.assertEqual(set(domain._cache), {"body()", "(body())_w3"})
+
+    def test_domain_does_not_cache_appended_formula_beyond_corr_window(self):
+        df = _sample_df(periods=30)
+        domain = Domain()
+        domain._formulas = ["body()", "range()"]
+        candidate = Gene("ret(close_1, 3)")
+        candidate_series = evaluate(candidate.formula, df).dropna()
+
+        with (
+            patch("mutator.domain.DOMAIN_CORR_MAX_CHECKS", 2),
+            patch("mutator.domain._safe_corr", return_value=0.0),
+        ):
+            self.assertTrue(
+                domain.try_add_prevalidated(candidate, df, candidate_series)
+            )
+
+        self.assertIn(candidate.formula, domain.formulas)
+        self.assertNotIn(candidate.formula, domain._cache)
+
+    def test_domain_reuses_prevalidated_candidate_inside_corr_window(self):
+        df = _sample_df(periods=30)
+        domain = Domain()
+        candidate = Gene("ret(close_1, 3)")
+        candidate_series = evaluate(candidate.formula, df).dropna()
+
+        with (
+            patch("mutator.domain.DOMAIN_CORR_MAX_CHECKS", 2),
+            patch("mutator.domain.has_division_by_zero") as division_mock,
+            patch("mutator.domain._evaluate_clean") as evaluate_mock,
+        ):
+            self.assertTrue(
+                domain.try_add_prevalidated(candidate, df, candidate_series)
+            )
+
+        division_mock.assert_not_called()
+        evaluate_mock.assert_not_called()
+        self.assertIs(domain._cache[candidate.formula], candidate_series)
+
     def test_corr_dedup_uses_spearman_for_monotonic_copies(self):
         x = pd.Series(np.linspace(0.0, 1.0, 100))
         monotonic_nonlinear = pd.Series(np.exp(20.0 * x))

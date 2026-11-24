@@ -21,7 +21,12 @@ from mutator.gene import (
     CUMULATIVE_TS_OPS, CS_UNARY_OPS, TS_ROLLING_OPS, FINANCE_TS_OPS,
     PAIR_TS_OPS, BINARY_OPS,
 )
-from mutator.domain import Domain, individual_corr_check
+from mutator.domain import (
+    Domain,
+    individual_corr_check,
+    individual_corr_check_with_series,
+)
+from mutator.evaluator import shared_evaluation_cache
 from mutator.formula_guard import (
     const_threshold_violation,
     expression_complexity_violation,
@@ -258,15 +263,25 @@ class Mutator:
             return False
 
         others = [g for g in ind.genes if g.formula != old_gene.formula]
-        if individual_corr_check(new_gene, others, train_df):
-            if (
-                new_gene.formula not in self.domain.formulas
-                and not self.domain.try_add(new_gene, train_df)
-            ):
-                return False
-            ind.replace_gene(old_gene, new_gene)
-            logger.debug("%s: %r", tag, new_gene.formula)
-            return True
+        with shared_evaluation_cache():
+            passed, candidate_series = individual_corr_check_with_series(
+                new_gene,
+                others,
+                train_df,
+            )
+            if passed:
+                if (
+                    new_gene.formula not in self.domain.formulas
+                    and not self.domain.try_add_prevalidated(
+                        new_gene,
+                        train_df,
+                        candidate_series,
+                    )
+                ):
+                    return False
+                ind.replace_gene(old_gene, new_gene)
+                logger.debug("%s: %r", tag, new_gene.formula)
+                return True
         return False
 
     def _random_selectable_domain_gene(self) -> Gene:

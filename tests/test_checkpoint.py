@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import pandas as pd
 from archive.archive import Archive
+from config.settings import ACTIVE_PROFILE
 from main import (
     _checkpoint_path,
     _final_evaluate_archive,
@@ -18,6 +19,7 @@ from main import (
     _print_summary,
     _safe_float,
     _save_json,
+    _validate_archive_profile,
 )
 from model.trainer import Trainer
 from mutator.gene import Gene, Individual
@@ -38,6 +40,17 @@ def _archive_with_one_entry() -> Archive:
 
 
 class CheckpointTests(unittest.TestCase):
+    def test_archive_summary_records_active_profile(self):
+        rows = _archive_with_one_entry().summary()
+        self.assertEqual(rows[0]["profile"], ACTIVE_PROFILE)
+
+    def test_resume_rejects_archive_from_another_profile(self):
+        with self.assertRaisesRegex(ValueError, "Archive profile mismatch"):
+            _validate_archive_profile(
+                [{"profile": "sp500_15m", "genes": ["ret(close_1, 5)"]}],
+                Path("sp500.json"),
+            )
+
     def test_resume_archive_is_always_re_evaluated(self):
         rows = [
             {

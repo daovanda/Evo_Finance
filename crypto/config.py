@@ -24,6 +24,7 @@ DEFAULT_ARCHIVE_PATH: Path = RESULTS_DIR / "crypto_btc_archive.json"
 # Multi-horizon binary labels. Edit this list freely, for example [3, 7, 10, 20].
 HOLDING_HORIZONS: list[int] = [5]
 LABEL_THRESHOLD: float = 0.0  # label=1 when future_return > threshold
+TWO_SIDED_TP_MAX_EXCURSION: float | None = None
 LABEL_MODE: str = "close_path_mean"
 LABEL_DIRECTION: str = (
     "Long"  # "Long" => price up is favorable, "Short" => price down is favorable
@@ -36,7 +37,7 @@ SAMPLE_FILTER_SLOPE_WINDOW: int = 3
 SAMPLE_FILTER_SLOPE_PREVIOUS_WINDOWS: int = 3
 SAMPLE_FILTER_SLOPE_RATIO: float = 0.15
 SAMPLE_FILTER_SLOPE_RULE: str = "ols_log_close_max_previous_abs_v1"
-PAYOFF_TP: float = 0.002  # legacy payoff archives were evolved with TP=0.40%
+PAYOFF_TP: float = 0.001  # legacy payoff archives were evolved with TP=0.40%
 # Effectively disables the newer adverse-path filter for legacy payoff archives.
 PAYOFF_ADVERSE_FLOOR: float = -999.0
 TP_SAFE_PATH: float = 0.004  # TP used by LABEL_MODE="safe_path_mfe"
@@ -505,6 +506,48 @@ def mfe_future_return(
     return directional_price_return(max_high, entry_open, direction)
 
 
+def mfe_or_mae_future_return(
+    df: Any,
+    horizon: int,
+    direction: str | None = None,
+) -> pd.Series:
+    """Return the larger upside or downside excursion from open(t+1)."""
+    del direction
+    h = int(horizon)
+    if h < 1:
+        raise ValueError("horizon must be positive for mfe_or_mae.")
+    entry = df["open"].shift(-1)
+    high = df["high"].rolling(h, min_periods=h).max().shift(-h)
+    low = df["low"].rolling(h, min_periods=h).min().shift(-h)
+    excursion = np.maximum(high - entry, entry - low)
+    return excursion.div(entry.where(entry.gt(0)))
+
+
+def mfe_mae_direction_future_return(
+    df: Any,
+    horizon: int,
+    direction: str | None = None,
+) -> pd.Series:
+    """Signed MFE-minus-MAE edge from open(t+1) across the complete horizon."""
+    h = int(horizon)
+    if h < 1:
+        raise ValueError("horizon must be positive for mfe_mae_direction.")
+    entry = pd.to_numeric(df["open"], errors="coerce").shift(-1)
+    highs = pd.concat(
+        [pd.to_numeric(df["high"], errors="coerce").shift(-k) for k in range(1, h + 1)],
+        axis=1,
+    )
+    lows = pd.concat(
+        [pd.to_numeric(df["low"], errors="coerce").shift(-k) for k in range(1, h + 1)],
+        axis=1,
+    )
+    complete = entry.gt(0) & highs.notna().all(axis=1) & lows.notna().all(axis=1)
+    edge = (highs.max(axis=1) + lows.min(axis=1)) / entry - 2.0
+    if canonical_label_direction(direction) == "short":
+        edge = -edge
+    return edge.where(complete)
+
+
 def mfe_entry_m2_future_return(
     df: Any,
     horizon: int,
@@ -837,6 +880,7 @@ def two_sided_tp_outcome(
     df: Any,
     horizon: int,
     threshold: float,
+    max_excursion: float | None = None,
 ) -> tuple[pd.Series, pd.Series]:
     """Gross payoff and label for simultaneous Long and Short positions.
 
@@ -851,6 +895,12 @@ def two_sided_tp_outcome(
         raise ValueError("horizon must be positive for two_sided_tp.")
     if not isfinite(tp) or tp <= 0.0:
         raise ValueError("two_sided_tp label_threshold must be finite and positive.")
+    if max_excursion is not None and (
+        not isfinite(float(max_excursion)) or float(max_excursion) <= tp
+    ):
+        raise ValueError(
+            "two_sided_tp max_excursion must be finite and greater than the TP threshold."
+        )
 
     entry_open = df["open"].shift(-1)
     future_highs = pd.concat(
@@ -878,6 +928,10 @@ def two_sided_tp_outcome(
     payoff = payoff.mask(up_hit & ~down_hit, tp - close_return)
     payoff = payoff.mask(~up_hit & down_hit, tp + close_return)
     payoff = payoff.mask(both_hit, 2.0 * tp).where(complete)
+    if max_excursion is not None:
+        both_hit &= (max_high_return <= float(max_excursion)) & (
+            min_low_return >= -float(max_excursion)
+        )
     label = both_hit.astype("float64").where(complete)
     return payoff, label
 
@@ -1171,6 +1225,8 @@ LABEL_RETURN_FNS: dict[str, Callable[[Any, int], Any]] = {
     "ma_slope_reversal": ma_slope_reversal_future_return,
     "close_path_mean": close_path_mean_future_return,
     "mfe": mfe_future_return,
+    "mfe_or_mae": mfe_or_mae_future_return,
+    "mfe_mae_direction": mfe_mae_direction_future_return,
     "mfe_entry_m2": mfe_entry_m2_future_return,
     "mfe_ahead": mfe_ahead_future_return,
     "adverse_floor": adverse_floor_future_return,
@@ -1223,6 +1279,7 @@ def resolve_exit_after_k(
 
 PRECISION_ONLY_LABEL_MODES: frozenset[str] = frozenset(
     {
+        "mfe_or_mae",
         "adverse_floor",
         "bear",
         "bull",
@@ -1233,11 +1290,13 @@ PRECISION_ONLY_LABEL_MODES: frozenset[str] = frozenset(
         "slope_slowdown_all",
         "ma_slope_reversal",
         "monotonic_close_path",
+        "mfe_mae_direction",
     }
 )
 
 DIRECTION_NEUTRAL_LABEL_MODES: frozenset[str] = frozenset(
     {
+        "mfe_or_mae",
         "bear",
         "bull",
         "peak",
@@ -1282,6 +1341,7 @@ def default_label_threshold(
         "trough",
         "ma_slope_reversal",
         "monotonic_close_path",
+        "mfe_mae_direction",
         "quantile_trade",
         "quantile_exit",
         "meta_learner",
@@ -1314,14 +1374,15 @@ WF_PURGE_BARS: int | None = None  # None => max(HOLDING_HORIZONS) + 1
 
 # Safe feature construction. All features are time-series/ratio normalized;
 # raw price/volume scale columns are intentionally not selectable.
+CRYPTO_FEATURE_SCHEMA_VERSION: int = 2  # exact Binance quote-volume features
 # WINDOWS: list[int] = [1,2,3,4,5,7,10,14,20,30,40,50,60,80,120,160,240,320,400,480,600,800,960,1200,1440,]
-#WINDOWS: list[int] = [1, 2, 3, 4, 5, 7, 9, 10]
-WINDOWS: list[int] = [2, 3, 5, 7, 9, 15, 20, 25, 30, 37, 45, 60]
+WINDOWS: list[int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+# WINDOWS: list[int] = [2, 3, 5, 7, 9, 15, 20, 25, 30, 35]
 FEATURE_MIN_VALID_RATIO: float = 0.70
 FEATURE_MAX_DOMINANT_VALUE_RATIO: float = 0.985
 FEATURE_CORR_THRESHOLD: float = 0.70
-EXPR_MAX_DEPTH: int = 6
-EXPR_MAX_LENGTH: int = 480
+EXPR_MAX_DEPTH: int = 4
+EXPR_MAX_LENGTH: int = 320
 EXPR_MAX_ABS_QUANTILE: float = 50.0
 # Each generated expression can hold one full-length float Series. Keep this
 # cache bounded so long evolution runs do not grow RAM without limit.
@@ -1331,7 +1392,7 @@ EVOLUTION_GC_EVERY: int = 25  # iterations; 0 disables explicit garbage collecti
 # Individual/evolution knobs.
 FEATURE_MIN: int = 4
 FEATURE_MAX: int = 24
-ARCHIVE_SIZE: int = 50
+ARCHIVE_SIZE: int = 30
 TIME_BUDGET_SECONDS: float = 3600.0
 RESTART_PROB: float = 0.001
 CHECKPOINT_EVERY_SECONDS: float = 12 * 60 * 60
@@ -1437,6 +1498,8 @@ QUANTILE_TRADE_LGBM_PARAMS: dict = {
 # Binary LightGBM. This higher-capacity profile is intended for experiments
 # where the depth-7 model still improves out of sample. Sampling and L1/L2
 # regularization remain enabled to constrain the larger trees.
+FEATURE_MAX: int = 40
+
 LGBM_PARAMS: dict = {
     "objective": "binary",
     "metric": "auc",

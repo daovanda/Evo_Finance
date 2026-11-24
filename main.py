@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -31,12 +32,19 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+# Select the dataset profile before any module imports config.settings values.
+from config.profiles import bootstrap_profile_from_argv
+
+BOOTSTRAPPED_PROFILE = bootstrap_profile_from_argv(sys.argv[1:])
+
 # ── Project imports ────────────────────────────────────────────────────────────
 from config.settings import (
+    ACTIVE_PROFILE, DEFAULT_DATA_DIR, TIME_UNIT,
     DEFAULT_WINDOW, RESTART_PROB, TIME_BUDGET_SECONDS,
     VAL_START, TEST_START, TEST_END,
     WF_END, WF_MIN_TRAIN_MONTHS, WF_VAL_MONTHS,
     WF_STEP_MONTHS, WF_PURGE_DAYS, DOMAIN_PRECOMPUTE_ON_START,
+    WF_TRAIN_BAR_STRIDE,
     CHECKPOINT_EVERY_SECONDS, FEATURE_MIN, FEATURE_MAX,
     REQUIRE_SECTOR_MAPPING, MIN_SECTOR_MEMBERS_IN_UNIVERSE,
 )
@@ -51,6 +59,7 @@ from mutator.mutator    import Mutator
 from model.trainer      import Trainer
 from model.data_utils   import (
     label_dataframe, make_walk_forward_folds,
+    sample_timestamp_groups,
     small_sectors_in_universe, split_labeled_by_dates,
     tickers_missing_sector, validate_market_ohlcv, validate_ohlcv,
     validate_full_universe_panel, validate_temporal_splits,
@@ -172,11 +181,11 @@ def run(
         logger.info(
             "WF %s: train [%s -> %s) %d rows | val [%s -> %s) %d rows",
             fold.name,
-            fold.train_start.date(),
-            fold.train_end.date(),
+            _format_profile_timestamp(fold.train_start),
+            _format_profile_timestamp(fold.train_end),
             len(fold.train_df),
-            fold.val_start.date(),
-            fold.val_end.date(),
+            _format_profile_timestamp(fold.val_start),
+            _format_profile_timestamp(fold.val_end),
             len(fold.val_df),
         )
     wf_feature_df = wf_labeled_df.sort_index()
@@ -325,17 +334,24 @@ def _evaluate_and_archive_wf(
     )
 
     for fold in wf_folds:
+        wf_train_df = sample_timestamp_groups(
+            fold.train_df,
+            WF_TRAIN_BAR_STRIDE,
+        )
         fold_start = time.perf_counter()
         logger.info(
-            "WF fold %s start: train=%d rows | val=%d rows | n_genes=%d",
+            "WF fold %s start: train=%d/%d rows (timestamp stride=%d) | "
+            "val=%d rows | n_genes=%d",
             fold.name,
+            len(wf_train_df),
             len(fold.train_df),
+            WF_TRAIN_BAR_STRIDE,
             len(fold.val_df),
             len(individual),
         )
         try:
             booster, train_pred, val_pred, train_labels, val_labels = trainer.train(
-                individual, fold.train_df, fold.val_df,
+                individual, wf_train_df, fold.val_df,
                 feature_df=feature_df, mode="wf"
             )
         except Exception as exc:
@@ -355,7 +371,7 @@ def _evaluate_and_archive_wf(
                 val_pred=val_pred,
                 train_labels=train_labels,
                 val_labels=val_labels,
-                train_df=fold.train_df,
+                train_df=wf_train_df,
                 val_df=fold.val_df,
             )
         )
@@ -455,6 +471,7 @@ def _load_archive_json_into_archive(
         rows = json.load(f)
     if not isinstance(rows, list):
         raise ValueError(f"Resume archive must be a JSON list: {path}")
+    _validate_archive_profile(rows, path)
 
     loaded = 0
     skipped = 0
@@ -528,6 +545,26 @@ def _archive_row_to_individual(row: dict) -> Individual:
         metrics=_archive_metrics_from_row(row),
         generation=generation,
     )
+
+
+def _validate_archive_profile(rows: list[dict], path: Path) -> None:
+    declared = {
+        str(row.get("profile")).strip()
+        for row in rows
+        if isinstance(row, dict) and row.get("profile")
+    }
+    if not declared:
+        logger.warning(
+            "Resume archive %s has no profile metadata; treating it as a legacy archive.",
+            path,
+        )
+        return
+    if declared != {ACTIVE_PROFILE}:
+        raise ValueError(
+            f"Archive profile mismatch: {path} declares {sorted(declared)}, "
+            f"but active profile is {ACTIVE_PROFILE!r}. Use --profile "
+            f"{next(iter(sorted(declared)))} or choose a matching archive."
+        )
 
 
 def _legacy_guard_violations(individual: Individual) -> list[tuple[str, str]]:
@@ -804,20 +841,32 @@ def _load_data(path: str) -> pd.DataFrame:
     return df.sort_index()
 
 
+def _format_profile_timestamp(value) -> str:
+    ts = pd.Timestamp(value)
+    return str(ts) if TIME_UNIT == "bar" else str(ts.date())
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Evo_Finance evolutionary feature selection for LightGBM lambdarank",
         formatter_class=argparse.RawTextHelpFormatter,
     )
 
+    parser.add_argument(
+        "--profile",
+        default=ACTIVE_PROFILE,
+        choices=["vnindex", "sp500_15m"],
+        help=f"Dataset profile. Default: {ACTIVE_PROFILE}",
+    )
+
     # ── Nguồn dữ liệu (chọn 1 trong 2) ──────────────────────────────────────
-    data_grp = parser.add_mutually_exclusive_group(required=True)
+    data_grp = parser.add_mutually_exclusive_group(required=False)
     data_grp.add_argument(
         "--data-dir",
         metavar="DIR",
         help=(
             "Directory containing <TICKER>.csv files generated by craw_data.py\n"
-            "Example: --data-dir data/raw"
+            f"Default for profile {ACTIVE_PROFILE}: {DEFAULT_DATA_DIR}"
         ),
     )
     data_grp.add_argument(
@@ -956,16 +1005,26 @@ if __name__ == "__main__":
         "--wf-purge-days",
         type=int,
         default=WF_PURGE_DAYS,
-        metavar="DAYS",
-        help=f"Trading-day purge before each WF split. Default: {WF_PURGE_DAYS}",
+        metavar="TIMESTAMPS",
+        help=(
+            f"Purge in {'bars' if TIME_UNIT == 'bar' else 'trading days'} "
+            f"before each WF split. Default: {WF_PURGE_DAYS}"
+        ),
     )
 
     args = parser.parse_args()
 
     # ── Load data ─────────────────────────────────────────────────────────────
-    if args.data_dir:
+    data_dir = args.data_dir or (None if args.data else DEFAULT_DATA_DIR)
+    logger.info(
+        "Active profile: %s | data=%s | time_unit=%s",
+        ACTIVE_PROFILE,
+        args.data or data_dir,
+        TIME_UNIT,
+    )
+    if data_dir:
         from data.loader import load_from_dir
-        df = load_from_dir(args.data_dir, tickers=args.tickers)
+        df = load_from_dir(data_dir, tickers=args.tickers)
     else:
         df = _load_data(args.data)
 

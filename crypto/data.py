@@ -47,6 +47,7 @@ def load_ohlcv(path: str | Path = config.DATA_PATH) -> pd.DataFrame:
         "low",
         "close",
         "volume",
+        "quote_volume",
         "trade_count",
         "taker_buy_base_volume",
         "taker_buy_quote_volume",
@@ -62,13 +63,71 @@ def load_ohlcv(path: str | Path = config.DATA_PATH) -> pd.DataFrame:
     price_cols = ["open", "high", "low", "close"]
     if (df[price_cols] <= 0).any().any():
         raise ValueError("OHLC prices must be positive.")
-    if (df["volume"] < 0).any():
-        raise ValueError("Volume must be non-negative.")
-    if (df["trade_count"] < 0).any():
-        raise ValueError("trade_count must be non-negative.")
     if (df["high"] < df["low"]).any():
         raise ValueError("OHLC rows must satisfy high >= low.")
-
+    price_tolerance = np.maximum(df["high"].abs() * 1e-10, 1e-10)
+    invalid_open_close = (
+        (df["open"] < df["low"] - price_tolerance)
+        | (df["open"] > df["high"] + price_tolerance)
+        | (df["close"] < df["low"] - price_tolerance)
+        | (df["close"] > df["high"] + price_tolerance)
+    )
+    if invalid_open_close.any():
+        raise ValueError("OHLC rows must keep open and close within low-high.")
+    if (df["volume"] < 0).any():
+        raise ValueError("Volume must be non-negative.")
+    if (df["quote_volume"] < 0).any():
+        raise ValueError("quote_volume must be non-negative.")
+    if (df["trade_count"] < 0).any():
+        raise ValueError("trade_count must be non-negative.")
+    if (df["taker_buy_base_volume"] < 0).any():
+        raise ValueError("taker_buy_base_volume must be non-negative.")
+    if (df["taker_buy_quote_volume"] < 0).any():
+        raise ValueError("taker_buy_quote_volume must be non-negative.")
+    base_tolerance = np.maximum(df["volume"].abs() * 1e-9, 1e-12)
+    if (df["taker_buy_base_volume"] > df["volume"] + base_tolerance).any():
+        raise ValueError("taker_buy_base_volume must not exceed volume.")
+    quote_tolerance = np.maximum(df["quote_volume"].abs() * 1e-9, 1e-8)
+    if (
+        df["taker_buy_quote_volume"]
+        > df["quote_volume"] + quote_tolerance
+    ).any():
+        raise ValueError(
+            "taker_buy_quote_volume must not exceed quote_volume."
+        )
+    inactive_volume = df["volume"] == 0
+    if (inactive_volume & (df["quote_volume"] > quote_tolerance)).any():
+        raise ValueError("quote_volume must be zero when volume is zero.")
+    inactive_taker = df["taker_buy_base_volume"] == 0
+    if (inactive_taker & (df["taker_buy_quote_volume"] > quote_tolerance)).any():
+        raise ValueError(
+            "taker_buy_quote_volume must be zero when taker_buy_base_volume is zero."
+        )
+    active_volume = df["volume"] > 0
+    quote_lower = df["low"] * df["volume"]
+    quote_upper = df["high"] * df["volume"]
+    quote_range_tolerance = np.maximum(quote_upper.abs() * 1e-8, 1e-8)
+    invalid_quote_range = active_volume & (
+        (df["quote_volume"] < quote_lower - quote_range_tolerance)
+        | (df["quote_volume"] > quote_upper + quote_range_tolerance)
+    )
+    if invalid_quote_range.any():
+        raise ValueError(
+            "quote_volume / volume must lie within the candle low-high range."
+        )
+    active_taker = df["taker_buy_base_volume"] > 0
+    taker_quote_lower = df["low"] * df["taker_buy_base_volume"]
+    taker_quote_upper = df["high"] * df["taker_buy_base_volume"]
+    taker_range_tolerance = np.maximum(taker_quote_upper.abs() * 1e-8, 1e-8)
+    invalid_taker_range = active_taker & (
+        (df["taker_buy_quote_volume"] < taker_quote_lower - taker_range_tolerance)
+        | (df["taker_buy_quote_volume"] > taker_quote_upper + taker_range_tolerance)
+    )
+    if invalid_taker_range.any():
+        raise ValueError(
+            "taker_buy_quote_volume / taker_buy_base_volume must lie within "
+            "the candle low-high range."
+        )
     return df
 
 
@@ -135,6 +194,7 @@ def add_binary_labels(
     label_mode: str | None = None,
     label_direction: str | None = None,
     exit_after_k: int | None = None,
+    two_sided_max_excursion: float | None = None,
 ) -> pd.DataFrame:
     """
     Add future_return_h{h} and label_h{h}.
@@ -171,7 +231,14 @@ def add_binary_labels(
     For monotonic_close_path, Long requires the strict chain
     open(H1) < close(H1) < ... < close(Horizon); Short uses the symmetric
     decreasing chain. Its future_return_h is zero for precision-only fitness.
+    For mfe_or_mae, either future excursion from open(t+1) must exceed the
+    threshold. Its label ignores direction and its future return is zero.
+    For mfe_mae_direction, Long is positive when the future upward excursion
+    exceeds the downward excursion; Short uses the reverse comparison. Both
+    excursions use open(t+1) and the complete H1..Horizon path. Ties are 0.
     For two_sided_tp, label=1 means both the Long and Short TP are reached;
+    when two_sided_max_excursion is provided, neither side may exceed that
+    absolute excursion during H1..Horizon.
     future_return_h is the combined gross payoff of the two positions. Label
     direction is ignored for this direction-neutral mode.
     For bear, label=1 marks candles strictly inside an offline confirmed
@@ -241,6 +308,7 @@ def add_binary_labels(
                 labeled,
                 h,
                 threshold=float(label_threshold),
+                max_excursion=two_sided_max_excursion,
             )
             labeled[f"future_return_h{h}"] = future_return
             labeled[f"label_h{h}"] = explicit_label
@@ -311,6 +379,8 @@ def add_binary_labels(
             "slope_slowdown_all",
             "ma_slope_reversal",
             "monotonic_close_path",
+            "mfe_or_mae",
+            "mfe_mae_direction",
         }:
             if (
                 selected_mode in {"slope_slowdown", "slope_slowdown_all"}
@@ -505,7 +575,13 @@ def make_walk_forward_folds(
     if len(unique_dates) == 0:
         raise ValueError(f"No data before WF_END={wf_end}.")
 
-    first_val_candidate = unique_dates[0] + pd.DateOffset(months=int(min_train_months))
+    # Anchor calendar folds at the start of the local day. The first Binance
+    # row can begin at 07:00 after UTC -> Asia/Ho_Chi_Minh conversion; carrying
+    # that time into every boundary can push an otherwise complete final fold
+    # a few hours beyond a midnight WF_END.
+    first_val_candidate = unique_dates[0].normalize() + pd.DateOffset(
+        months=int(min_train_months)
+    )
     val_start = _first_date_at_or_after(unique_dates, first_val_candidate)
     folds: list[CryptoFold] = []
 

@@ -1,8 +1,9 @@
 import unittest
 import warnings
 
+import numpy as np
 import pandas as pd
-from scipy.stats import ConstantInputWarning
+from scipy.stats import ConstantInputWarning, spearmanr
 
 from fitness.fitness import (
     FitnessEvaluator,
@@ -16,6 +17,47 @@ from mutator.gene import Individual
 
 
 class FitnessMetricTests(unittest.TestCase):
+    def test_grouped_metrics_match_previous_scan_implementation(self):
+        rng = np.random.default_rng(123)
+        dates = pd.date_range("2024-01-01", periods=40, freq="15min")
+        tickers = [f"T{i:02d}" for i in range(50)]
+        idx = pd.MultiIndex.from_product([dates, tickers], names=["date", "ticker"])
+        pred = pd.Series(rng.normal(size=len(idx)), index=idx)
+        label = pd.Series(rng.normal(size=len(idx)), index=idx)
+        pred.iloc[::137] = np.nan
+        label.iloc[::211] = np.inf
+        pred.iloc[10:15] = 0.5
+
+        clean = (
+            pd.DataFrame({"pred": pred, "label": label})
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+        )
+        dates_arr = clean.index.get_level_values("date")
+        legacy_ic = {}
+        legacy_hits = []
+        for date in np.unique(dates_arr):
+            grp = clean[dates_arr == date]
+            if len(grp) >= 5:
+                if grp["pred"].nunique() < 2 or grp["label"].nunique() < 2:
+                    legacy_ic[date] = 0.0
+                else:
+                    corr, _ = spearmanr(grp["pred"], grp["label"])
+                    legacy_ic[date] = float(corr) if not np.isnan(corr) else 0.0
+            k = min(10, len(grp))
+            if grp["pred"].nunique() < 2 or grp["label"].nunique() < 2:
+                legacy_hits.append(float(k) / float(len(grp)))
+            else:
+                top_pred = set(grp.nlargest(k, "pred").index)
+                top_label = set(grp.nlargest(k, "label").index)
+                legacy_hits.append(len(top_pred & top_label) / k)
+
+        pd.testing.assert_series_equal(
+            _ic_per_date(pred, label, idx),
+            pd.Series(legacy_ic),
+        )
+        self.assertEqual(_hit_rate(pred, label, idx), float(np.mean(legacy_hits)))
+
     def test_ic_per_date_handles_constant_inputs_without_warning(self):
         dates = pd.date_range("2024-01-01", periods=2)
         tickers = ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"]

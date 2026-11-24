@@ -29,6 +29,7 @@ from craw_btc import (
     DEFAULT_INTERVAL,
     DEFAULT_SYMBOL,
     INTERVAL_TO_MS,
+    OUTPUT_COLUMNS,
     OUTPUT_TIMEZONE,
     fetch_klines,
 )
@@ -1069,7 +1070,15 @@ def _minimum_feature_lookback_bars() -> int:
 def _read_existing_ohlcv(path: Path) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
-    return pd.read_csv(path, parse_dates=["date"])
+    frame = pd.read_csv(path, parse_dates=["date"])
+    missing = sorted(set(OUTPUT_COLUMNS) - set(frame.columns))
+    if missing:
+        raise ValueError(
+            f"Existing OHLCV file {path} uses an obsolete schema; missing "
+            f"columns={missing}. Re-crawl the complete history before live "
+            "refresh so exact quote-volume features are never partly missing."
+        )
+    return frame
 
 
 def _merge_ohlcv(old_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:

@@ -1,97 +1,107 @@
+"""Append missing daily KBS bars to the existing Vietnamese stock CSVs."""
+
+import argparse
+import os
+from datetime import datetime, time as clock_time, timedelta, timezone
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from time import sleep
+
 import pandas as pd
 
+PRICE_COLUMNS = ["open", "high", "low", "close"]
+COLUMNS = ["date", *PRICE_COLUMNS, "volume", "is_trading_day"]
+VIETNAM_TZ = timezone(timedelta(hours=7))
 
-import os
-import sys
-os.environ["VNAI_DISABLE_PROMO"] = "1"
-sys.stdout.reconfigure(encoding="utf-8")
-from vnstock import Vnstock
-from datetime import datetime
-import os
-import numpy as np
-import time
-from config.settings import MARKET_INDEX_TICKER
 
-# =========================
-# CONFIG
-# =========================
-START_DATE = "2015-01-01"
-END_DATE = datetime.today().strftime("%Y-%m-%d")
+def prepare_append(path: Path, fetch, end) -> tuple[pd.DataFrame, str]:
+    old = pd.read_csv(path, dtype=str)
+    if old.columns.tolist() != COLUMNS:
+        raise ValueError("Unexpected CSV column layout")
+    old_times = pd.DatetimeIndex(pd.to_datetime(old["date"]))
+    old_days = old_times.normalize()
+    if old.empty or old_days.hasnans or not old_days.is_unique:
+        raise ValueError("Existing CSV is empty or has invalid/duplicate trading dates")
+    last = old_days.max()
+    if last >= end:
+        return old.iloc[:0], str(last.date())
+    start = last + pd.Timedelta(days=1)
+    fresh = fetch(path.stem, str(start.date()), str(end.date()))
+    if fresh.empty:
+        return old.iloc[:0], str(last.date())
+    fresh = fresh.rename(columns={"time": "date"}).copy()
+    fresh["date"] = pd.to_datetime(fresh["date"])
+    fresh = fresh.dropna(subset=["date", *PRICE_COLUMNS, "volume"])
+    fresh = fresh[fresh["volume"].gt(0) & fresh[PRICE_COLUMNS].gt(0).all(axis=1)]
+    fresh_days = fresh["date"].dt.normalize()
+    new = fresh.loc[fresh_days.between(start, end)].assign(day=fresh_days)
+    new = new.sort_values("date", kind="stable").drop_duplicates("day", keep="last").set_index("day")
+    # The stock loader joins on the full timestamp, not only the calendar date.
+    time_of_day = pd.Series(old_times - old_days).mode().iloc[0]
+    new["date"] = (new.index + time_of_day).strftime("%Y-%m-%d %H:%M:%S")
+    new["is_trading_day"] = 1
+    return new[COLUMNS], str(last.date())
 
-TICKERS = [
-    "ACB", "BID", "BVH", "CTG", "FPT",
-    "GAS", "GVR", "HDB", "HPG", "KDH",
-    "MBB", "MSN", "MWG", "NVL", "PDR",
-    "PLX", "PNJ", "POW", "SAB", "SSI",
-    "STB", "TCB", "TPB", "VCB", "VHM",
-    "VIC", "VJC", "VNM", "VPB", "VRE"
-]
 
-OUTPUT_DIR = "data/raw"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-vn = Vnstock(source="KBS")
-
-# =========================
-# STOCK DATA - FIXED
-# =========================
-for ticker in TICKERS:
-    print(f"📥 Loading {ticker}")
-
+def append_atomic(path: Path, rows: pd.DataFrame) -> None:
+    original = path.read_bytes()
+    with NamedTemporaryFile(dir=path.parent, suffix=".tmp", delete=False) as handle:
+        temporary = Path(handle.name)
     try:
-        stock = vn.stock(symbol=ticker)
-        df = stock.quote.history(
-            start=START_DATE,
-            end=END_DATE,
-            interval="1D"
-        )
-        df = df.rename(columns={"time": "date"})
-        df["date"] = pd.to_datetime(df["date"])
-        df = df[["date", "open", "high", "low", "close", "volume"]]
-        
-        # FIXED: Chỉ giữ lại ngày giao dịch thực tế, không ffill
-        df = df[df["volume"] > 0].copy()
-        
-        # FIX duplicate last date: giữ dòng cuối cùng (data mới nhất)
-        df = df.drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
-        
-        # Đánh dấu là ngày giao dịch
-        df["is_trading_day"] = 1
-        
-    except Exception as e:
-        print(f"⚠️ {ticker} error:", e)
-        df = pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume", "is_trading_day"])
+        with temporary.open("wb") as handle:
+            handle.write(original)
+            if not original.endswith(b"\n"):
+                handle.write(b"\n")
+            handle.write(rows.to_csv(index=False, header=False).encode("utf-8"))
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
-    df.to_csv(f"{OUTPUT_DIR}/{ticker}.csv", index=False)
 
-    time.sleep(5)  # Giữ khoảng cách giữa các request để tránh bị rate limit
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", type=Path, default=Path("data/raw"))
+    parser.add_argument("--dry-run", action="store_true", help="Fetch and validate without writing")
+    args = parser.parse_args()
+    paths = sorted(args.data_dir.glob("*.csv"))
+    if not paths:
+        parser.error(f"No stock CSVs in {args.data_dir}")
 
-# =========================
-# MARKET INDEX - FIXED
-# =========================
-market_ticker = str(MARKET_INDEX_TICKER).strip().upper() if MARKET_INDEX_TICKER else ""
+    os.environ["VNAI_DISABLE_PROMO"] = "1"
+    from vnstock import Vnstock
 
-if market_ticker:
-    print(f"📥 Loading {market_ticker}")
+    vn = Vnstock(source="KBS")
+    now = datetime.now(VIETNAM_TZ)
+    end = pd.Timestamp(now.date() - timedelta(days=now.time() < clock_time(16)))
 
-    stock = vn.stock(symbol=market_ticker)
-    df = stock.quote.history(
-        start=START_DATE,
-        end=END_DATE,
-        interval="1D"
-    )
-    df = df.rename(columns={"time": "date"})
-    df["date"] = pd.to_datetime(df["date"])
-    df = df[["date", "open", "high", "low", "close", "volume"]]
+    def fetch(symbol, start_date, end_date):
+        return vn.stock(symbol=symbol).quote.history(start=start_date, end=end_date, interval="1D")
 
-    # FIXED: Chỉ giữ ngày giao dịch
-    df = df[df["volume"] > 0].copy()
+    pending = []
+    failures = []
+    for number, path in enumerate(paths, start=1):
+        print(f"[{number}/{len(paths)}] {path.stem}: checking through {end.date()}", flush=True)
+        try:
+            rows, last = prepare_append(path, fetch, end)
+            latest = rows["date"].iloc[-1][:10] if not rows.empty else last
+            print(f"  {last} -> {latest}: +{len(rows)} sessions", flush=True)
+            if not rows.empty:
+                pending.append((path, rows))
+        except Exception as exc:
+            print(f"  ERROR: {exc}", flush=True)
+            failures.append(path.stem)
+        if number < len(paths):
+            sleep(5)
 
-    # FIX duplicate last date
-    df = df.drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
+    if failures:
+        print(f"No CSVs changed. Failed: {', '.join(failures)}", flush=True)
+        return 1
+    if not args.dry_run:
+        for path, rows in pending:
+            append_atomic(path, rows)
+    print(f"{'Validated' if args.dry_run else 'Updated'} {len(pending)} CSVs.", flush=True)
+    return 0
 
-    df["is_trading_day"] = 1
 
-    df.to_csv(f"{OUTPUT_DIR}/{market_ticker}.csv", index=False)
-
-print("✅ DONE - Only trading days saved")
+if __name__ == "__main__":
+    raise SystemExit(main())

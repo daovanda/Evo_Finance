@@ -55,6 +55,7 @@ from crypto.data import (
     CryptoFold,
     add_binary_labels,
     attach_mfe_entry_m2_inputs,
+    make_walk_forward_folds,
     split_labeled_by_dates,
 )
 from crypto.evolution import CryptoArchive, CryptoIndividual, CryptoMutator
@@ -101,6 +102,28 @@ from crypto.prod.train_model import SCORE_BAND_FRACTIONS, _score_band_cutoffs
 
 
 class CryptoPipelineTests(unittest.TestCase):
+    def test_walk_forward_normalizes_first_local_timestamp_to_midnight(self):
+        index = pd.DatetimeIndex(
+            [pd.Timestamp("2018-01-01 07:00")]
+        ).append(
+            pd.date_range("2018-01-02", "2023-12-31", freq="D")
+        )
+        labeled = pd.DataFrame({"label_h5": 0}, index=index)
+
+        folds = make_walk_forward_folds(
+            labeled,
+            wf_end="2024-01-01",
+            min_train_months=36,
+            val_months=6,
+            step_months=6,
+            purge_bars=0,
+        )
+
+        self.assertEqual(len(folds), 6)
+        self.assertEqual(folds[0].val_start, pd.Timestamp("2021-01-01"))
+        self.assertEqual(folds[-1].val_start, pd.Timestamp("2023-07-01"))
+        self.assertEqual(folds[-1].val_end, pd.Timestamp("2024-01-01"))
+
     def test_mfe_entry_m2_uses_second_minute_open_and_excludes_first_minute(self):
         target_index = pd.date_range("2024-01-01", periods=4, freq="5min")
         minute_index = pd.date_range("2024-01-01", periods=25, freq="1min")
@@ -2952,6 +2975,78 @@ class CryptoPipelineTests(unittest.TestCase):
         self.assertIsInstance(evaluator, CryptoFitnessEvaluator)
         self.assertTrue(evaluator.precision_only)
 
+    def test_mfe_mae_direction_labels_are_strict_directional_and_precision_only(self):
+        index = pd.date_range("2024-01-01", periods=4, freq="5min")
+        frame = pd.DataFrame(
+            {
+                "open": [100.0] * 4,
+                "high": [100.0, 102.0, 101.0, 101.0],
+                "low": [100.0, 99.0, 97.0, 99.0],
+            },
+            index=index,
+        )
+        long_labeled = add_binary_labels(
+            frame, horizons=[1, 3], label_mode="mfe_mae_direction",
+            label_direction="Long",
+        )
+        short_labeled = add_binary_labels(
+            frame, horizons=[1, 3], label_mode="mfe_mae_direction",
+            label_direction="Short",
+        )
+        pd.testing.assert_series_equal(
+            long_labeled["label_h1"],
+            pd.Series([1.0, 0.0, 0.0, np.nan], index=index),
+            check_names=False,
+        )
+        pd.testing.assert_series_equal(
+            short_labeled["label_h1"],
+            pd.Series([0.0, 1.0, 0.0, np.nan], index=index),
+            check_names=False,
+        )
+        self.assertEqual(long_labeled["label_h3"].iloc[0], 0.0)
+        self.assertEqual(short_labeled["label_h3"].iloc[0], 1.0)
+        self.assertTrue(long_labeled["label_h3"].iloc[1:].isna().all())
+        self.assertTrue((long_labeled["future_return_h1"].dropna() == 0).all())
+        self.assertTrue((short_labeled["future_return_h3"].dropna() == 0).all())
+
+        missing = frame.copy()
+        missing.loc[index[2], "high"] = np.nan
+        missing_labels = add_binary_labels(
+            missing, horizons=[3], label_mode="mfe_mae_direction",
+            label_direction="Long",
+        )
+        self.assertTrue(missing_labels["label_h3"].isna().all())
+        self.assertIs(
+            config.get_label_return_fn("mfe_mae_direction"),
+            config.mfe_mae_direction_future_return,
+        )
+        self.assertEqual(config.default_label_threshold("mfe_mae_direction"), 0.0)
+        self.assertTrue(config.is_precision_only_label_mode("mfe_mae_direction"))
+        self.assertFalse(config.is_direction_neutral_label_mode("mfe_mae_direction"))
+        self.assertTrue(_make_fitness_evaluator("mfe_mae_direction", [3]).precision_only)
+
+    def test_mfe_or_mae_labels_either_side_over_complete_future_horizon(self):
+        index = pd.date_range("2024-01-01", periods=6, freq="15min")
+        frame = pd.DataFrame(
+            {"open": [100.0] * 6, "high": [110, 101, 102, 101, 102, 100],
+             "low": [90, 99, 99, 98, 98, 100]}, index=index,
+        )
+        kwargs = dict(horizons=[1, 3], threshold=0.01, label_mode="mfe_or_mae")
+        long = add_binary_labels(frame, label_direction="Long", **kwargs)
+        short = add_binary_labels(frame, label_direction="Short", **kwargs)
+        pd.testing.assert_frame_equal(long, short)
+        pd.testing.assert_series_equal(
+            long.label_h1, pd.Series([0., 1., 1., 1., 0., np.nan], index=index),
+            check_names=False,
+        )
+        self.assertEqual(long.label_h3.iloc[0], 1.)
+        self.assertTrue(long.label_h3.iloc[3:].isna().all())
+        self.assertTrue(long.future_return_h3.dropna().eq(0).all())
+        frame.loc[index[2], "low"] = np.nan
+        self.assertTrue(pd.isna(add_binary_labels(frame, **kwargs).label_h3.iloc[0]))
+        self.assertTrue(config.is_direction_neutral_label_mode("mfe_or_mae"))
+        self.assertTrue(_make_fitness_evaluator("mfe_or_mae", [3]).precision_only)
+
     def test_precision_only_metrics_do_not_charge_trade_cost_on_zero_return(self):
         y = pd.Series([1, 0, 1, 0])
         pred = pd.Series([0.9, 0.8, 0.7, 0.6])
@@ -3316,6 +3411,45 @@ class CryptoPipelineTests(unittest.TestCase):
                 horizons=[1],
                 label_mode="two_sided_tp",
                 threshold=0.0,
+            )
+
+    def test_two_sided_tp_max_excursion_caps_both_sides_across_horizon(self):
+        idx = pd.date_range("2024-01-01", periods=6, freq="5min")
+        df = pd.DataFrame(
+            {
+                "open": [100.0] * 6,
+                "high": [100.0, 100.2, 100.2, 100.4, 100.2, 100.2],
+                "low": [100.0, 99.8, 99.8, 99.8, 99.6, 99.8],
+                "close": [100.0] * 6,
+            },
+            index=idx,
+        )
+        capped = add_binary_labels(
+            df,
+            horizons=[1, 3],
+            label_mode="two_sided_tp",
+            threshold=0.001,
+            two_sided_max_excursion=0.003,
+        )
+        uncapped = add_binary_labels(
+            df, horizons=[1, 3], label_mode="two_sided_tp", threshold=0.001,
+        )
+        self.assertEqual(capped.loc[idx[0], "label_h1"], 1.0)
+        self.assertEqual(capped.loc[idx[2], "label_h1"], 0.0)
+        self.assertEqual(capped.loc[idx[3], "label_h1"], 0.0)
+        self.assertEqual(capped.loc[idx[0], "label_h3"], 0.0)
+        self.assertEqual(uncapped.loc[idx[0], "label_h3"], 1.0)
+        self.assertTrue(np.isnan(capped.loc[idx[-1], "label_h3"]))
+        pd.testing.assert_series_equal(
+            capped["future_return_h3"], uncapped["future_return_h3"]
+        )
+        with self.assertRaisesRegex(ValueError, "greater than the TP threshold"):
+            add_binary_labels(
+                df,
+                horizons=[1],
+                label_mode="two_sided_tp",
+                threshold=0.001,
+                two_sided_max_excursion=0.001,
             )
 
     def test_two_sided_tp_is_registered_as_direction_neutral_payoff_mode(self):
@@ -4439,7 +4573,9 @@ def _synthetic_crypto_frame(n: int) -> pd.DataFrame:
     trade_count = rng.integers(100, 800, size=n)
     buy_ratio = np.clip(0.5 + rng.normal(0.0, 0.08, size=n), 0.05, 0.95)
     taker_base = volume * buy_ratio
-    taker_quote = close * taker_base
+    typical_price = (high + low + close) / 3.0
+    quote_volume = typical_price * volume
+    taker_quote = typical_price * taker_base
     return pd.DataFrame(
         {
             "open": open_,
@@ -4447,6 +4583,7 @@ def _synthetic_crypto_frame(n: int) -> pd.DataFrame:
             "low": low,
             "close": close,
             "volume": volume,
+            "quote_volume": quote_volume,
             "trade_count": trade_count,
             "taker_buy_base_volume": taker_base,
             "taker_buy_quote_volume": taker_quote,

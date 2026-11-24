@@ -62,7 +62,7 @@ MINIMAL_CONTEXT_FEATURES = [
     "buy_pressure_mean_10",
     "signed_volume_sum_ratio_50",
     "taker_buy_base_volume_ratio_14",
-    "quote_volume_proxy_log_delta_40",
+    "quote_volume_log_delta_40",
     "ret_close_20",
 ]
 

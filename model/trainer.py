@@ -14,6 +14,7 @@ The caller (main loop) is responsible for supplying pre-split DataFrames:
 """
 
 from __future__ import annotations
+from collections import OrderedDict
 from typing import Hashable, List, Tuple
 
 import numpy as np
@@ -27,6 +28,8 @@ from config.settings import (
     LGBM_WF_EARLY_STOPPING,
     LGBM_WF_NUM_BOOST_ROUND,
     LGBM_WF_PARAMS,
+    TRAINER_FEATURE_CACHE_MAX_ITEMS,
+    TRAINER_SPLIT_CACHE_MAX_ITEMS,
     WF_EARLY_STOP_MIN_VALID_DATES,
     WF_EARLY_STOP_VALID_FRACTION,
 )
@@ -35,6 +38,29 @@ from mutator.evaluator import evaluate
 
 # Number of integer relevance grades for lambdarank (0 = worst, N-1 = best)
 N_RELEVANCE_BINS: int = 5
+
+
+class _LRUCache(OrderedDict):
+    """Small mapping-compatible LRU used for large Series and split metadata."""
+
+    def __init__(self, max_items: int):
+        super().__init__()
+        self.max_items = int(max_items)
+
+    def get(self, key, default=None):
+        if key not in self:
+            return default
+        value = super().pop(key)
+        super().__setitem__(key, value)
+        return value
+
+    def __setitem__(self, key, value) -> None:
+        if key in self:
+            super().__delitem__(key)
+        super().__setitem__(key, value)
+        if self.max_items > 0:
+            while len(self) > self.max_items:
+                self.popitem(last=False)
 
 
 # ─── Label binner ─────────────────────────────────────────────────────────────
@@ -277,11 +303,13 @@ class Trainer:
         self,
         enable_feature_cache: bool = True,
         enable_split_cache: bool = True,
+        feature_cache_max_items: int = TRAINER_FEATURE_CACHE_MAX_ITEMS,
+        split_cache_max_items: int = TRAINER_SPLIT_CACHE_MAX_ITEMS,
     ):
         self.enable_feature_cache = enable_feature_cache
         self.enable_split_cache = enable_split_cache
-        self._feature_cache: dict[tuple[Hashable, str], pd.Series] = {}
-        self._split_cache: dict[tuple, tuple[pd.Series, List[int]]] = {}
+        self._feature_cache = _LRUCache(feature_cache_max_items)
+        self._split_cache = _LRUCache(split_cache_max_items)
 
     def clear_caches(self) -> None:
         """Drop cached feature values and split metadata."""
